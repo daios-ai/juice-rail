@@ -1,22 +1,22 @@
 # juice-rail
 
-juice-rail moves real money — **USDT0**, a dollar-pegged token — between
-accounts on an Ethereum-style network. It is three things: a **vault**, a
-program deployed on the network that holds the tokens and keeps one balance
-per account; a **Go library** that drives the vault; and a small command-line
-tool, **`railctl`**, for using it by hand.
+juice-rail moves real money between accounts on an Ethereum-style network.
+The money is **USDT0**, a token pegged to the dollar. juice-rail is three
+things: a **vault**, a program deployed on the network that holds the tokens
+and keeps one balance per account; a **Go library** that drives the vault;
+and a small command-line tool, **`railctl`**, for using it by hand.
 
-**One vault, many participants.** Independent installations — different
-companies, different machines, no trust between them — each hold an account
+**One vault, many participants.** Independent installations (different
+companies, different machines, no trust between them) each hold an account
 in the same vault and pay each other through it. A payment one side made and
 the other side received cannot be denied by either, because the referee is
 the network itself, not anyone's server.
 
 Your money is always in one of two pockets: tokens sitting **at your own
-address** — cash in hand — or a balance **inside the vault** — money on
-account. It moves three ways: **deposit** (your hand → your vault balance),
-**settle** (your vault balance → another participant's), **withdraw** (vault
-→ any address's hand).
+address**, like cash in hand, or a balance **inside the vault**, like money
+on account. It moves three ways: **deposit** (your hand → your vault
+balance), **settle** (your vault balance → another participant's),
+**withdraw** (vault → any address's hand).
 
 Every operation carries an identifier the vault remembers: repeating an
 operation is a safe no-op, and reusing its identifier for different terms is
@@ -24,15 +24,15 @@ refused. No money can ever move twice.
 
 A running vault has one **operator** and any number of **participants**. The
 operator deploys the vault once and pays everyone's network fees through a
-sponsor contract, the **paymaster** — so participants never need ETH, the
-network's fuel; only the operator holds it. A participant joins with one key
-they make themselves and two things the operator gives them.
+sponsor contract called the **paymaster**. Participants therefore never need
+ETH, the network's fuel; only the operator holds it. A participant joins
+with one key they make themselves and two things the operator gives them.
 
 `requirements.md` is the specification. This file is how to run it.
 
 ## Install
 
-Everyone — operator and participants — installs the same way.
+Everyone installs the same way, operator and participants alike.
 
 | | |
 |---|---|
@@ -52,9 +52,9 @@ Already cloned without submodules? `git submodule update --init --recursive`.
 You need no real network, no real money, no account with any provider. This
 command creates a pretend network on your machine, puts the vault and
 paymaster on it, and acts out six scenarios between accounts with fake
-money — a deposit, a payment from one account to another, a withdrawal, a
+money: a deposit, a payment from one account to another, a withdrawal, a
 repeated operation, a reused identifier with different terms, and a crash
-halfway through:
+halfway through.
 
 ```sh
 go test -tags integration ./integration-tests/
@@ -62,14 +62,14 @@ go test -tags integration ./integration-tests/
 
 Everything runs and checks itself in about a minute. Nothing leaves your
 machine. The scenario code, `integration-tests/stories_test.go`, shows
-`railctl` doing everything it can do — worth a skim once you reach
+`railctl` doing everything it can do. It is worth a skim once you reach
 "Use railctl" below.
 
 ## Run a domain (you are the operator)
 
 A **domain** is one deployed vault, named by (network, vault address).
 Domains are independent: separate balances, separate identifiers, nothing
-crosses between them. Each domain has exactly one operator — if someone
+crosses between them. Each domain has exactly one operator. If someone
 already operates the vault you want to use, skip to "Join a domain".
 
 The vault runs on one of two networks: **Arbitrum Sepolia**, a test network
@@ -89,7 +89,7 @@ Call the first the **operator key**: it deploys everything and is the only
 key that ever holds ETH. Call the second the **sponsorship key**: the
 paymaster will pay fees only for operations approved by it, and you will
 hand it to every participant you sponsor. Handing it out is a bounded risk
-by design: the worst this key can do is spend your fee tank — it can never
+by design: the worst this key can do is spend your fee tank; it can never
 touch anyone's money.
 
 ```sh
@@ -99,9 +99,9 @@ export PAYMASTER_SIGNER=<sponsorship key's ADDRESS>
 
 ### 2. Get your two endpoints
 
-- An **RPC endpoint** — your window onto the network. Free from
+- An **RPC endpoint**: your window onto the network. Free from
   [Alchemy](https://alchemy.com) or any node provider.
-- A **bundler endpoint** — the mail service that carries fee-free operations
+- A **bundler endpoint**: the mail service that carries fee-free operations
   to the network. Free on the test network from [Pimlico](https://pimlico.io)
   or Alchemy.
 
@@ -117,7 +117,7 @@ plenty. Real network: transfer it there.
 
 ### 4. Test network only: create a play token
 
-There is no real USDT0 on the test network, so deploy the mock — a play
+There is no real USDT0 on the test network, so deploy the mock, a play
 version of the token that anyone may mint:
 
 ```sh
@@ -141,8 +141,8 @@ forge script script/Deploy.s.sol --rpc-url $RPC --private-key $OPERATOR_KEY --br
 ```
 
 `ENTRY_POINT` and `MULTI_SEND` are public infrastructure contracts, the same
-addresses on every network — take them as given. The script prints two new
-addresses — the vault (called `rail` from here on) and the paymaster — and
+addresses on every network; take them as given. The script prints two new
+addresses, the vault (called `rail` from here on) and the paymaster, and
 fills the paymaster's fee tank with the deposit.
 
 ### 6. Publish the domain file
@@ -150,8 +150,7 @@ fills the paymaster's fee tank with the deposit.
 Copy `deployments/arbitrum-sepolia.json` (or `arbitrum-one.json`) and fill
 the blanks with what you now have: `rpc` and `bundler` from step 2, `token`
 from step 4, `rail` and `paymaster` from step 5. The remaining addresses are
-already correct — public infrastructure, never deployed from this
-repository.
+already correct: public infrastructure, never deployed from this repository.
 
 Leave `finality` as `"finalized"`. It means a fact is reported only once the
 network can never take it back; weaker settings are refused at startup.
@@ -164,7 +163,7 @@ contains only public information) and **the sponsorship key**.
 You deploy nothing and never touch ETH. You need:
 
 1. **From the operator:** the domain file and the sponsorship key.
-2. **Made by you, kept by you:** your account key —
+2. **Made by you, kept by you:** your account key.
 
 ```sh
 cast wallet new   # your account key; the operator never sees it
@@ -174,7 +173,7 @@ That's all. Continue below.
 
 ## Use railctl
 
-Operator and participants use it identically — the operator is just a
+Operator and participants use it identically; the operator is just a
 participant who also holds the other keys.
 
 ```sh
@@ -196,12 +195,12 @@ railctl account
 ```
 
 It prints your address on this domain. The address exists before anything is
-deployed there — tokens sent to it are safe from day one. Bob tells Alice
+deployed there, so tokens sent to it are safe from day one. Bob tells Alice
 his address; that is all Alice ever needs to know about Bob.
 
-**Alice puts tokens in her hand** — at her address. Test network: mint play
-money (this uses the operator's setup from "Run a domain", since anyone may
-mint the mock):
+**Alice puts tokens in her hand**, meaning at her address. Test network:
+mint play money (this uses the operator's setup from "Run a domain", since
+anyone may mint the mock):
 
 ```sh
 cast send $TOKEN "mint(address,uint256)" <Alice's railctl address> 1000000000 \
@@ -210,8 +209,8 @@ cast send $TOKEN "mint(address,uint256)" <Alice's railctl address> 1000000000 \
 
 Real network: transfer USDT0 to her address as to any other.
 
-**Alice deposits** — hand → vault. She makes a fresh identifier (32 random
-bytes) for the operation and moves ten dollars:
+**Alice deposits**, moving tokens from hand to vault. She makes a fresh
+identifier (32 random bytes) for the operation and moves ten dollars:
 
 ```sh
 ID=$(openssl rand -hex 32)
@@ -219,11 +218,12 @@ railctl deposit $ID <Alice's railctl address> 10000000
 railctl status $ID
 ```
 
-`status` says `pending` until the network finalizes the operation — about
+`status` says `pending` until the network finalizes the operation, about
 20 minutes on a real network. That is the safety model working, not a hang.
 Then it says `confirmed`.
 
-**Alice pays Bob** — her vault balance to his, one dollar, fresh identifier:
+**Alice pays Bob.** One dollar moves from her vault balance to his, under a
+fresh identifier:
 
 ```sh
 ID=$(openssl rand -hex 32)
@@ -258,8 +258,8 @@ Worth knowing:
 
 - **Amounts are token base units.** USDT0 has six decimals: `1000000` is one
   dollar.
-- **Identifiers must be fresh and unguessable** — generate each one as
-  above, never reuse one.
+- **Identifiers must be fresh and unguessable.** Generate each one as above;
+  never reuse one.
 - **One store per domain.** The store file records its domain on first use
   and refuses to open for another. Second domain, second file.
 - `-json` gives machine-readable output.
@@ -271,15 +271,15 @@ Every identifier is always in exactly one of four states:
 | | |
 |---|---|
 | `unknown` | no record of this identifier |
-| `pending` | it may still execute — keep waiting or retry |
+| `pending` | it may still execute; keep waiting or retry |
 | `confirmed` | it executed and the result can never be reversed |
 | `failed` | it can never execute: the identifier is taken under other terms, or it was abandoned and every attempt is provably dead |
 
 **Retrying is always safe.** Re-running the same command re-presents the
 same signed operation; the vault refuses a second execution regardless.
 
-**A stuck operation.** Re-run it. If it must be given up on, `abandon` it —
-but that alone releases nothing: it stops future signing without killing
+**A stuck operation.** Re-run it. If it must be given up on, `abandon` it.
+But that alone releases nothing: it stops future signing without killing
 what is already signed. Wait for `failed`, which arrives once every attempt
 is provably dead.
 
@@ -288,12 +288,12 @@ is taken under different terms, that identifier is spent. Generate a fresh
 one and retry; no funds are ever at risk from this.
 
 **Operators: watch the fee tank.** When the paymaster's deposit runs out,
-the whole domain stops until it is topped up. Nothing is lost — operations
-wait — but nothing moves either.
+the whole domain stops until it is topped up. Nothing is lost (operations
+wait), but nothing moves either.
 
-**If you embed the library in your own application** — a *host*; Juice is
-one — two rules: change your own ledger only on `confirmed`, and release
-anything you reserved only on `failed`.
+**If you embed the library in your own application**, making it a *host*
+(Juice is one), two rules apply: change your own ledger only on `confirmed`,
+and release anything you reserved only on `failed`.
 
 ## Verify the build
 
