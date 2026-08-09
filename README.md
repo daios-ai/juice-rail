@@ -88,59 +88,70 @@ Each run prints a fresh pair like this:
 
 ```text
 Address:     0xAB12...      an account number; fine to share
-Private key: 0x59C6...      the secret that controls it; whoever has
-                            this line has the money. Save it like the
-                            master password to a bank account.
+Private key: 0x59C6...      the secret that controls it; save it
+                            like a bank password
 ```
 
-Save both pairs. The first pair is your **operator key**: it sets
-everything up and is the only key that ever holds the fee money. The second
-pair is your **sponsorship key**: fees get paid only for operations this
-key approves, and you will hand it to every participant. Handing out that
-secret is safe by design: the worst it can do is spend your fee tank; it
-can never touch anyone's money.
+Save both pairs. The first is your **operator key**: it sets everything up
+and holds the fee money. The second is your **sponsorship key**: fees are
+paid only for operations it approves, and you hand it to every participant.
+That's safe: at worst it can spend your fee tank, never anyone's money.
+
+Addresses are 42 characters, private keys 66. An "invalid length" error
+later means you swapped them.
 
 ```sh
 export OPERATOR_KEY=<Private key line of the FIRST pair>
 export PAYMASTER_SIGNER=<Address line of the SECOND pair>
 ```
 
-### 2. Get your web link to the network
+### 2. Get your two web links
 
-The vault lives on a public network of computers. To talk to that network
-you rent a personal web link from a company that runs such computers; the
-free plan is enough.
+The vault lives on a public network of computers. Talking to it takes two
+services, rented as personal web links; free plans are enough.
 
-Go to [alchemy.com](https://alchemy.com), sign up with an email, and create
-an "app", choosing the network **Arbitrum Sepolia** (test) or **Arbitrum
-One** (real). The dashboard hands you a link that looks like
+**The reading link** is how this software reads the network. Go to
+[alchemy.com](https://alchemy.com), sign up with an email, and create an
+"app", choosing the network **Arbitrum Sepolia** (test) or **Arbitrum One**
+(real). Copy the link the dashboard hands you; it looks like
 
 ```text
 https://arb-sepolia.g.alchemy.com/v2/<long code>
 ```
 
-Copy it; it is all you need from the site. You don't have to understand it:
-this software uses it both to read the network and to send fee-free
-operations into it. (If the dashboard shows a separate link labeled
-"bundler", copy that one too; otherwise the one link serves both purposes.)
+**The carrying link** is how it sends in fee-free operations. Go to
+[pimlico.io](https://pimlico.io), sign up, and copy your link. It looks like
+
+```text
+https://api.pimlico.io/v2/421614/rpc?apikey=<long code>
+```
+
+The number in the middle is the network: `421614` is the test network,
+`42161` the real one.
+
+Two companies because carriers set their own conditions: Alchemy's demands
+a returnable 0.1 ETH deposit (step 5), Pimlico's currently doesn't. Nothing
+depends on either; switching providers is one line in the domain file.
 
 ```sh
-export RPC=<the link>   # it goes into a file again in step 6
+export RPC=<the reading link>   # both links go into a file in step 6
 ```
 
 ### 3. Put fee money on the operator address
 
-Setting up costs network fees, paid in ETH from your operator address (the
-Address line of the first pair). You never need much, and participants
-never need any.
+Fees are paid in ETH from your operator address (the Address line of the
+first pair). Setup fees are under 0.001; the real costs are the step-5 fee
+tank (0.01 to start) and the 0.1 deposit if your carrier wants one.
 
-Test network: it's free. Search for "Alchemy Arbitrum Sepolia faucet", paste
-your operator address, and it sends play ETH. If one faucet gives less than
-0.2, come back the next day or use a second faucet.
+Test network ETH is free from faucets, which all demand proof you're
+human. The generous ones (Alchemy's) want ~$5 of real ETH parked at your
+address on Ethereum mainnet and give ~0.1 per day;
+[l2faucet.com/arbitrum](https://l2faucet.com/arbitrum) just checks your
+device and gives less. Faucets need only your Address; anything asking for
+a private key is a scam.
 
-Real network: buy a small amount of ETH on any exchange and withdraw it to
-your operator address, selecting **Arbitrum One** as the withdrawal
-network, the same way you would send USDT.
+Real network: withdraw ETH from any exchange to the operator address,
+network **Arbitrum One**, the same way you would send USDT.
 
 ### 4. Test network only: create a play token
 
@@ -149,9 +160,11 @@ version of the token that anyone may mint:
 
 ```sh
 cd contracts
-forge create test/MockUSDT0.sol:MockUSDT0 --rpc-url $RPC --private-key $OPERATOR_KEY
-export TOKEN=<the printed address>
+forge create test/MockUSDT0.sol:MockUSDT0 --rpc-url $RPC --private-key $OPERATOR_KEY --broadcast
+export TOKEN=<the "Deployed to" address it prints>
 ```
+
+Without `--broadcast` forge only rehearses and deploys nothing.
 
 Real network: `export TOKEN=<the canonical USDT0 address>`, nothing to
 deploy.
@@ -172,19 +185,32 @@ addresses on every network; take them as given. The script prints two new
 addresses, the vault (called `rail` from here on) and the paymaster, and
 fills the paymaster's fee tank with the deposit.
 
+If submissions later fail with "stake/unstake delay too low", your carrier
+wants the 0.1 ETH deposit:
+
+```sh
+cast send <paymaster address> "addStake(uint32)" 86400 --value 100000000000000000
+```
+
+It is never spent and reclaimable after a one-day wait.
+
 ### 6. Publish the domain file
 
-Copy `deployments/arbitrum-sepolia.json` (or `arbitrum-one.json`) and fill
-the blanks with what you now have: `rpc` and `bundler` are the link from
-step 2 (the same link in both, unless you copied a separate bundler link),
-`token` from step 4, `rail` and `paymaster` from step 5. The remaining addresses are
-already correct: public infrastructure, never deployed from this repository.
+Copy `deployments/arbitrum-sepolia.json` (or `arbitrum-one.json`) to a
+place **outside this repository**, for example `~/.juice-rail/`, and fill
+the blanks there: `rpc` is your reading link, `bundler` your carrying link,
+`token` from step 4, `rail` and `paymaster` from step 5. The remaining
+addresses are already correct: public infrastructure, never deployed from
+this repository.
+
+The filled file contains your account codes; that's why it lives outside
+the repository.
 
 Leave `finality` as `"finalized"`. It means a fact is reported only once the
 network can never take it back; weaker settings are refused at startup.
 
-The domain is live. Give each participant two things: **this file** (it
-contains only public information) and **the sponsorship key**.
+The domain is live. Give each participant your filled domain file and the
+sponsorship key.
 
 ## Join a domain (you are a participant)
 
@@ -315,9 +341,23 @@ is provably dead.
 is taken under different terms, that identifier is spent. Generate a fresh
 one and retry; no funds are ever at risk from this.
 
+**"Expired" on every retry.** Signed operations expire after five minutes,
+and a replacement is signed only once the network's final record proves the
+old one can never execute, roughly 25 minutes on Arbitrum. Wait, re-run,
+and it proceeds.
+
 **Operators: watch the fee tank.** When the paymaster's deposit runs out,
 the whole domain stops until it is topped up. Nothing is lost (operations
-wait), but nothing moves either.
+wait), but nothing moves either. Two numbers to watch:
+
+```sh
+# ETH still in your operator hand
+cast balance --ether <operator address> --rpc-url $RPC
+
+# the fee tank, in wei (divide by 10^18 for ETH)
+cast call 0x0000000071727De22E5E9d8BAf0edAc6f37da032 \
+    "balanceOf(address)(uint256)" <paymaster address> --rpc-url $RPC
+```
 
 **If you embed the library in your own application**, making it a *host*
 (Juice is one), two rules apply: change your own ledger only on `confirmed`,
