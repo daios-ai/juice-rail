@@ -6,22 +6,33 @@ program deployed on the network that holds the tokens and keeps one balance
 per account; a **Go library** that drives the vault; and a small command-line
 tool, **`railctl`**, for using it by hand.
 
+**One vault, many participants.** Independent installations — different
+companies, different machines, no trust between them — each hold an account
+in the same vault and pay each other through it. A payment one side made and
+the other side received cannot be denied by either, because the referee is
+the network itself, not anyone's server.
+
 Your money is always in one of two pockets: tokens sitting **at your own
 address** — cash in hand — or a balance **inside the vault** — money on
-account. It moves three ways: **deposit** (hand → vault), **settle** (your
-vault balance → someone else's), **withdraw** (vault → any address's hand).
+account. It moves three ways: **deposit** (your hand → your vault balance),
+**settle** (your vault balance → another participant's), **withdraw** (vault
+→ any address's hand).
 
 Every operation carries an identifier the vault remembers: repeating an
 operation is a safe no-op, and reusing its identifier for different terms is
 refused. No money can ever move twice.
 
-Account holders never need ETH, the network's fuel. A sponsor contract — the
-**paymaster** — pays the network fees for them; only the operator who runs
-the paymaster holds ETH.
+A running vault has one **operator** and any number of **participants**. The
+operator deploys the vault once and pays everyone's network fees through a
+sponsor contract, the **paymaster** — so participants never need ETH, the
+network's fuel; only the operator holds it. A participant joins with one key
+they make themselves and two things the operator gives them.
 
 `requirements.md` is the specification. This file is how to run it.
 
 ## Install
+
+Everyone — operator and participants — installs the same way.
 
 | | |
 |---|---|
@@ -40,9 +51,10 @@ Already cloned without submodules? `git submodule update --init --recursive`.
 
 You need no real network, no real money, no account with any provider. This
 command creates a pretend network on your machine, puts the vault and
-paymaster on it, and acts out six scenarios with fake money — a deposit, a
-payment between two accounts, a withdrawal, a repeated operation, a reused
-identifier with different terms, and a crash halfway through:
+paymaster on it, and acts out six scenarios between accounts with fake
+money — a deposit, a payment from one account to another, a withdrawal, a
+repeated operation, a reused identifier with different terms, and a crash
+halfway through:
 
 ```sh
 go test -tags integration ./integration-tests/
@@ -53,12 +65,16 @@ machine. The scenario code, `integration-tests/stories_test.go`, shows
 `railctl` doing everything it can do — worth a skim once you reach
 "Use railctl" below.
 
-## Deploy for real
+## Run a domain (you are the operator)
+
+A **domain** is one deployed vault, named by (network, vault address).
+Domains are independent: separate balances, separate identifiers, nothing
+crosses between them. Each domain has exactly one operator — if someone
+already operates the vault you want to use, skip to "Join a domain".
 
 The vault runs on one of two networks: **Arbitrum Sepolia**, a test network
 where everything is free and fake, or **Arbitrum One**, the real one. The
-steps are the same on both; the differences are marked. Do them once per
-network you use.
+steps are the same on both; the differences are marked.
 
 ### 1. Create the two operator keys
 
@@ -69,14 +85,16 @@ Foundry makes them:
 cast wallet new   # run it twice, save both outputs somewhere safe
 ```
 
-Call the first one the **operator key**: it deploys everything and is the
-only key that will ever hold ETH. Call the second the **paymaster key**: the
-paymaster will pay fees only for operations approved by it. You use its
-*address* now and its *private key* later, in "Use railctl".
+Call the first the **operator key**: it deploys everything and is the only
+key that ever holds ETH. Call the second the **sponsorship key**: the
+paymaster will pay fees only for operations approved by it, and you will
+hand it to every participant you sponsor. Handing it out is a bounded risk
+by design: the worst this key can do is spend your fee tank — it can never
+touch anyone's money.
 
 ```sh
 export OPERATOR_KEY=<operator private key>
-export PAYMASTER_SIGNER=<paymaster address>
+export PAYMASTER_SIGNER=<sponsorship key's ADDRESS>
 ```
 
 ### 2. Get your two endpoints
@@ -127,11 +145,7 @@ addresses on every network — take them as given. The script prints two new
 addresses — the vault (called `rail` from here on) and the paymaster — and
 fills the paymaster's fee tank with the deposit.
 
-### 6. Write the domain file
-
-A **domain** is one deployed vault, named by (network, vault address).
-Domains are independent: separate balances, separate identifiers, nothing
-crosses between them.
+### 6. Publish the domain file
 
 Copy `deployments/arbitrum-sepolia.json` (or `arbitrum-one.json`) and fill
 the blanks with what you now have: `rpc` and `bundler` from step 2, `token`
@@ -142,58 +156,91 @@ repository.
 Leave `finality` as `"finalized"`. It means a fact is reported only once the
 network can never take it back; weaker settings are refused at startup.
 
-The domain is live.
+The domain is live. Give each participant two things: **this file** (it
+contains only public information) and **the sponsorship key**.
+
+## Join a domain (you are a participant)
+
+You deploy nothing and never touch ETH. You need:
+
+1. **From the operator:** the domain file and the sponsorship key.
+2. **Made by you, kept by you:** your account key —
+
+```sh
+cast wallet new   # your account key; the operator never sees it
+```
+
+That's all. Continue below.
 
 ## Use railctl
 
-Build the tool and make yourself an account key — this one needs no ETH,
-ever:
+Operator and participants use it identically — the operator is just a
+participant who also holds the other keys.
 
 ```sh
 go build -o railctl ./cmd/railctl
-cast wallet new   # your account key
 
-export RAILCTL_CONFIG=deployments/arbitrum-sepolia.json   # your domain file
-export RAILCTL_STORE=~/.juice-rail/arbitrum-sepolia.db    # its records; one file per domain
+export RAILCTL_CONFIG=<path to the domain file>
+export RAILCTL_STORE=~/.juice-rail/<domain name>.db   # its records; one file per domain
 export RAILCTL_KEY=<your account private key>
-export RAILCTL_PAYMASTER_KEY=<the paymaster PRIVATE key from deploy step 1>
+export RAILCTL_PAYMASTER_KEY=<the sponsorship key>
 ```
 
-The last line is the wire that makes operations free: it must be the private
-key of the `PAYMASTER_SIGNER` address you deployed with.
+A first session between two participants, **Alice** and **Bob**, each on
+their own machine with their own setup as above.
 
-A first session, in order:
+Both start the same way:
 
 ```sh
 railctl account
 ```
 
-Prints your address on this domain. It exists before anything is deployed
-there — tokens sent to it are safe from day one.
+It prints your address on this domain. The address exists before anything is
+deployed there — tokens sent to it are safe from day one. Bob tells Alice
+his address; that is all Alice ever needs to know about Bob.
 
-Put tokens in your hand, meaning at that address. Test network — mint
-yourself play money (a billion base units is a thousand play dollars):
+**Alice puts tokens in her hand** — at her address. Test network: mint play
+money (this uses the operator's setup from "Run a domain", since anyone may
+mint the mock):
 
 ```sh
-cast send $TOKEN "mint(address,uint256)" <your railctl address> 1000000000 \
+cast send $TOKEN "mint(address,uint256)" <Alice's railctl address> 1000000000 \
     --rpc-url $RPC --private-key $OPERATOR_KEY
 ```
 
-Real network: transfer USDT0 to the address as to any other.
+Real network: transfer USDT0 to her address as to any other.
 
-Make an identifier — 32 random bytes — and move one dollar from hand to
-vault:
+**Alice deposits** — hand → vault. She makes a fresh identifier (32 random
+bytes) for the operation and moves ten dollars:
 
 ```sh
 ID=$(openssl rand -hex 32)
-railctl deposit $ID <your railctl address> 1000000
+railctl deposit $ID <Alice's railctl address> 10000000
 railctl status $ID
 ```
 
 `status` says `pending` until the network finalizes the operation — about
 20 minutes on a real network. That is the safety model working, not a hang.
-Then it says `confirmed`, and `railctl balance` shows both pockets: your
-vault balance and the tokens still in hand.
+Then it says `confirmed`.
+
+**Alice pays Bob** — her vault balance to his, one dollar, fresh identifier:
+
+```sh
+ID=$(openssl rand -hex 32)
+railctl settle $ID <Bob's address> 1000000
+```
+
+**Bob checks and cashes out.** Once Alice's payment is `confirmed`, on his
+machine:
+
+```sh
+railctl balance                            # his vault balance: 1000000
+ID=$(openssl rand -hex 32)
+railctl withdraw $ID <any address Bob likes> 1000000
+```
+
+Alice and Bob never shared anything but addresses. The vault enforced that
+Alice could only spend her own balance, and Bob can prove he was paid.
 
 All commands:
 
@@ -202,7 +249,7 @@ All commands:
 | `railctl account` | your address on this domain |
 | `railctl balance [address]` | vault balance and tokens in hand |
 | `railctl deposit <id> <account> <amount>` | pull tokens from your hand, credit an account's vault balance |
-| `railctl settle <id> <creditor> <amount>` | move vault balance to another account |
+| `railctl settle <id> <creditor> <amount>` | move vault balance to another participant |
 | `railctl withdraw <id> <to> <amount>` | send tokens from the vault out to any address |
 | `railctl status <id>` | what became of an identifier |
 | `railctl abandon <id>` | stop signing for an identifier |
@@ -240,9 +287,9 @@ is provably dead.
 is taken under different terms, that identifier is spent. Generate a fresh
 one and retry; no funds are ever at risk from this.
 
-**Watch the paymaster's fee tank.** When its deposit runs out, everything
-stops until it is topped up. Nothing is lost — operations wait — but nothing
-moves either.
+**Operators: watch the fee tank.** When the paymaster's deposit runs out,
+the whole domain stops until it is topped up. Nothing is lost — operations
+wait — but nothing moves either.
 
 **If you embed the library in your own application** — a *host*; Juice is
 one — two rules: change your own ledger only on `confirmed`, and release
