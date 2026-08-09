@@ -76,6 +76,14 @@ The vault runs on one of two networks: **Arbitrum Sepolia**, a test network
 where everything is free and fake, or **Arbitrum One**, the real one. The
 steps are the same on both; the differences are marked.
 
+One rule for every step: an `export`ed value dies with its terminal. Save
+each one to a file as you go, and start every new terminal by loading it:
+
+```sh
+echo 'export TOKEN=0x...' >> ~/.juice-rail/sepolia.env   # save as you go
+source ~/.juice-rail/sepolia.env                         # reload later
+```
+
 ### 1. Create the two operator keys
 
 Run this command twice:
@@ -238,6 +246,10 @@ export RAILCTL_STORE=~/.juice-rail/<domain name>.db   # its records; one file pe
 export RAILCTL_KEY=<your account private key>
 export RAILCTL_PAYMASTER_KEY=<the sponsorship key>
 ```
+
+Save these four in a file (e.g. `~/.juice-rail/sepolia.env`) and `source` it
+in every new terminal; exports die with the terminal that ran them. Errors
+like `no -config given` mean you forgot.
 
 A first session between two participants, **Alice** and **Bob**, each on
 their own machine with their own setup as above.
