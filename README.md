@@ -78,42 +78,69 @@ steps are the same on both; the differences are marked.
 
 ### 1. Create the two operator keys
 
-A key is a long secret number; whoever holds it controls one address.
-Foundry makes them:
+Run this command twice:
 
 ```sh
-cast wallet new   # run it twice, save both outputs somewhere safe
+cast wallet new
 ```
 
-Call the first the **operator key**: it deploys everything and is the only
-key that ever holds ETH. Call the second the **sponsorship key**: the
-paymaster will pay fees only for operations approved by it, and you will
-hand it to every participant you sponsor. Handing it out is a bounded risk
-by design: the worst this key can do is spend your fee tank; it can never
-touch anyone's money.
+Each run prints a fresh pair like this:
+
+```text
+Address:     0xAB12...      an account number; fine to share
+Private key: 0x59C6...      the secret that controls it; whoever has
+                            this line has the money. Save it like the
+                            master password to a bank account.
+```
+
+Save both pairs. The first pair is your **operator key**: it sets
+everything up and is the only key that ever holds the fee money. The second
+pair is your **sponsorship key**: fees get paid only for operations this
+key approves, and you will hand it to every participant. Handing out that
+secret is safe by design: the worst it can do is spend your fee tank; it
+can never touch anyone's money.
 
 ```sh
-export OPERATOR_KEY=<operator private key>
-export PAYMASTER_SIGNER=<sponsorship key's ADDRESS>
+export OPERATOR_KEY=<Private key line of the FIRST pair>
+export PAYMASTER_SIGNER=<Address line of the SECOND pair>
 ```
 
-### 2. Get your two endpoints
+### 2. Get your web link to the network
 
-- An **RPC endpoint**: your window onto the network. Free from
-  [Alchemy](https://alchemy.com) or any node provider.
-- A **bundler endpoint**: the mail service that carries fee-free operations
-  to the network. Free on the test network from [Pimlico](https://pimlico.io)
-  or Alchemy.
+The vault lives on a public network of computers. To talk to that network
+you rent a personal web link from a company that runs such computers; the
+free plan is enough.
+
+Go to [alchemy.com](https://alchemy.com), sign up with an email, and create
+an "app", choosing the network **Arbitrum Sepolia** (test) or **Arbitrum
+One** (real). The dashboard hands you a link that looks like
+
+```text
+https://arb-sepolia.g.alchemy.com/v2/<long code>
+```
+
+Copy it; it is all you need from the site. You don't have to understand it:
+this software uses it both to read the network and to send fee-free
+operations into it. (If the dashboard shows a separate link labeled
+"bundler", copy that one too; otherwise the one link serves both purposes.)
 
 ```sh
-export RPC=<your RPC endpoint URL>   # the bundler URL is used in step 5
+export RPC=<the link>   # it goes into a file again in step 6
 ```
 
-### 3. Put ETH on the operator address
+### 3. Put fee money on the operator address
 
-Deploying costs fees, paid in ETH from the operator address (printed when
-you created the key). Test network: a faucet gives it away free; 0.2 is
-plenty. Real network: transfer it there.
+Setting up costs network fees, paid in ETH from your operator address (the
+Address line of the first pair). You never need much, and participants
+never need any.
+
+Test network: it's free. Search for "Alchemy Arbitrum Sepolia faucet", paste
+your operator address, and it sends play ETH. If one faucet gives less than
+0.2, come back the next day or use a second faucet.
+
+Real network: buy a small amount of ETH on any exchange and withdraw it to
+your operator address, selecting **Arbitrum One** as the withdrawal
+network, the same way you would send USDT.
 
 ### 4. Test network only: create a play token
 
@@ -148,8 +175,9 @@ fills the paymaster's fee tank with the deposit.
 ### 6. Publish the domain file
 
 Copy `deployments/arbitrum-sepolia.json` (or `arbitrum-one.json`) and fill
-the blanks with what you now have: `rpc` and `bundler` from step 2, `token`
-from step 4, `rail` and `paymaster` from step 5. The remaining addresses are
+the blanks with what you now have: `rpc` and `bundler` are the link from
+step 2 (the same link in both, unless you copied a separate bundler link),
+`token` from step 4, `rail` and `paymaster` from step 5. The remaining addresses are
 already correct: public infrastructure, never deployed from this repository.
 
 Leave `finality` as `"finalized"`. It means a fact is reported only once the
