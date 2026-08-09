@@ -1,0 +1,9 @@
+# Build output
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# Local state
+*.db
+*.db-wal
+*.db-shm
