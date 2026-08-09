@@ -1,109 +1,123 @@
 # juice-rail
 
 A settlement rail for micropayments: an on-chain vault that holds USDT0 and
-keeps one balance per account, plus a Go library that drives it. Juice is one
-host among others.
+keeps one balance per account, plus a Go library that drives it, plus a small
+CLI (`railctl`) to run it standalone. Juice is one host among others.
 
 Money moves three ways — **deposit** in, **settle** between two accounts,
-**withdraw** out. Every operation carries an identifier the vault remembers, so
-a repeat is a no-op and a reused identifier with different terms is refused.
-The host stays authoritative for its own ledger; the rail moves external money
-and reports finalized facts.
+**withdraw** out. Every operation carries an identifier the vault remembers:
+repeating an operation is a safe no-op, and reusing its identifier for
+different terms is refused. The host stays authoritative for its own ledger;
+the rail moves external money and reports finalized facts.
+
+Account holders never need ETH. A sponsor contract (the *paymaster*) pays the
+chain's fees; only the operator who runs it holds ETH.
 
 `requirements.md` is the specification. This file is how to run it.
 
-## Requirements
+## Install
 
 | | |
 |---|---|
 | Go | 1.22 or later |
-| [Foundry](https://getfoundry.sh) | `forge`, `anvil` — contracts and the story tests |
-| [Halmos](https://github.com/a16z/halmos) | optional, for the proofs |
+| [Foundry](https://getfoundry.sh) | `forge` builds the contracts, `anvil` runs a local chain |
+| [Halmos](https://github.com/a16z/halmos) | optional, only for the formal proofs |
 
 ```sh
 git clone --recurse-submodules https://github.com/daios-ai/juice-rail
 cd juice-rail && go build ./...
 ```
 
-Already cloned without submodules: `git submodule update --init --recursive`.
+Already cloned without submodules? `git submodule update --init --recursive`.
 
-## Verifying a build
+## Try it locally first
 
-```sh
-go test ./...                                  # library, offline
-go test -race ./...                            # same, under the race detector
-cd contracts && forge test                     # 53 unit, fuzz and invariant tests
-go test -tags integration ./integration-tests/ # the six user stories, needs anvil
-```
-
-The stories build `railctl` and drive it against a real EntryPoint and Safe on
-a local chain. They are opt-in: without `-tags integration` they do not run,
-and if `anvil` is missing they fail rather than pass quietly.
-
-The proofs need Halmos in its own environment, so it cannot disturb the rest of
-your Python setup:
+You don't need a real network, real money, or any account with any provider.
+The six user stories stand up a complete local chain — vault, paymaster,
+accounts — and drive the real `railctl` binary through every flow:
 
 ```sh
-python3 -m venv ~/.venvs/halmos && ~/.venvs/halmos/bin/pip install halmos
-cd contracts && ~/.venvs/halmos/bin/halmos --contract JuiceRailSymbolicTest
+go test -tags integration ./integration-tests/
 ```
 
-## Deploying a domain
+You'll see deposits, settlements, withdrawals, retries, conflicting
+identifiers, and crash recovery run end to end in about a minute.
+`integration-tests/stories_test.go` is a worked example of every command; read
+it before your first real deployment.
 
-A **domain** is one `JuiceRail` deployment, named by `(chain id, contract
-address)`. Every project deploys its own per network. Domains are independent:
-separate balances, separate identifiers, no bridging between them.
+## Deploy a real domain
 
-The Safe contracts and the EntryPoint are the canonical deployments already on
-the network; this repository never deploys or recompiles them.
+A **domain** is one vault deployment, named by `(chain id, contract address)`.
+Every project deploys its own per network. Domains are independent: separate
+balances, separate identifiers, no bridging between them.
+
+Do this once per domain. Testnet (Arbitrum Sepolia) and mainnet (Arbitrum One)
+are the same steps; differences are marked.
+
+### 1. What you need
+
+- **An RPC endpoint** — your window onto the chain. Free from
+  [Alchemy](https://alchemy.com) or any node provider.
+- **A bundler endpoint** — the service that carries gasless operations to the
+  chain. Free on testnet from [Pimlico](https://pimlico.io) or Alchemy.
+- **One operator key with a little ETH** — the only ETH in the whole system.
+  It deploys the contracts and fills the paymaster's gas tank. On testnet,
+  get it free from a faucet; 0.2 ETH is plenty.
+
+### 2. Testnet only: deploy a test token
+
+There is no real USDT0 on Sepolia, so deploy the mock (anyone can mint it):
 
 ```sh
 cd contracts
-export TOKEN=<USDT0 on this network>
+forge create test/MockUSDT0.sol:MockUSDT0 --rpc-url $RPC --private-key $OPERATOR_KEY
+```
+
+Note the printed address — it is your `TOKEN` below. On mainnet, `TOKEN` is
+the canonical USDT0 address; you deploy nothing.
+
+### 3. Deploy the vault and paymaster
+
+```sh
+cd contracts
+export TOKEN=<token address from step 2, or canonical USDT0>
 export ENTRY_POINT=0x0000000071727De22E5E9d8BAf0edAc6f37da032
 export MULTI_SEND=0x9641d764fc13c8B624c04430C7356C1C7C8102e2
 export PAYMASTER_SIGNER=<address that authorises sponsorship>
-export PAYMASTER_DEPOSIT=100000000000000000   # optional, wei to stake
+export PAYMASTER_DEPOSIT=100000000000000000   # 0.1 ETH into the gas tank
 
-forge script script/Deploy.s.sol --rpc-url $RPC --broadcast
+forge script script/Deploy.s.sol --rpc-url $RPC --private-key $OPERATOR_KEY --broadcast
 ```
 
-Copy the printed rail and paymaster addresses into a domain file. Start from
-`deployments/arbitrum-one.json` or `deployments/arbitrum-sepolia.json`; `rpc`
-and `bundler` are your own endpoints.
+The script prints the rail and paymaster addresses and, with
+`PAYMASTER_DEPOSIT` set, funds the paymaster in the same run.
 
-```json
-{
-  "name": "arbitrum-one",
-  "chainId": 42161,
-  "rpc": "https://…",
-  "bundler": "https://…",
-  "rail": "0x…",
-  "token": "0x…",
-  "paymaster": "0x…",
-  "entryPoint": "0x…",
-  "safeSingleton": "0x…",
-  "safeProxyFactory": "0x…",
-  "safeModule": "0x…",
-  "safeModuleSetup": "0x…",
-  "multiSendCallOnly": "0x…",
-  "finality": "finalized"
-}
-```
+### 4. Write the domain file
 
-Only true finality is accepted. A confirmed fact must never be reversible, so
-confirmation-count policies are refused at startup.
+Start from `deployments/arbitrum-sepolia.json` (or `arbitrum-one.json`) and
+fill the blanks: `rpc` and `bundler` are your endpoints from step 1, `token`
+from step 2, `rail` and `paymaster` from step 3. The Safe and EntryPoint
+addresses are already correct — they are the canonical deployments on that
+network; this repository never deploys or recompiles them.
 
-## railctl
+`finality` stays `"finalized"`. Only true finality is accepted: a confirmed
+fact must never be reversible, so confirmation-count policies are refused at
+startup.
+
+That's it. The domain is live.
+
+## Use railctl
 
 ```sh
 go build -o railctl ./cmd/railctl
 
-export RAILCTL_CONFIG=deployments/arbitrum-one.json
-export RAILCTL_STORE=~/.juice-rail/arbitrum-one.db
+export RAILCTL_CONFIG=deployments/arbitrum-sepolia.json
+export RAILCTL_STORE=~/.juice-rail/arbitrum-sepolia.db
 export RAILCTL_KEY=<hex key owning this rail's account>
 export RAILCTL_PAYMASTER_KEY=<hex paymaster signing key>
 ```
+
+`RAILCTL_KEY` can be a fresh key with zero ETH — that is the point.
 
 | Command | What it does |
 |---|---|
@@ -115,25 +129,26 @@ export RAILCTL_PAYMASTER_KEY=<hex paymaster signing key>
 | `railctl status <id>` | what became of an identifier |
 | `railctl abandon <id>` | stop signing for an identifier |
 
-`-json` gives machine-readable output. Amounts are token base units: USDT0 has
-six decimals, so `1000000` is one dollar. Identifiers are 32-byte hex and must
-be unguessable until submission — the host mints them.
+A first session: `railctl account` prints your address — it exists before the
+account does, so send tokens there right away; the account is created on its
+first operation. Then `deposit`, then `balance`, then `status <id>`.
 
-**One store per domain.** The store records its domain the first time it is
-used and refuses to open for another, because identifiers only mean one thing
-within a domain. Run a second domain with a second store file.
+Worth knowing:
 
-## Operating it
+- **`pending` is honest.** On a real network an operation stays `pending`
+  until the chain finalizes it — about 20 minutes on Arbitrum. That is the
+  safety model working, not a hang.
+- **Amounts are token base units.** USDT0 has six decimals: `1000000` is one
+  dollar.
+- **Identifiers are 32-byte hex** and must be unguessable until submission —
+  the host mints them.
+- **One store per domain.** The store records its domain on first use and
+  refuses to open for another. Run a second domain with a second store file.
+- `-json` gives machine-readable output.
 
-**Fund the paymaster.** It pays the chain's fees so account holders never need
-to hold the chain's currency. When its stake runs out, everything stops until
-it is topped up. Watch it.
+## Operate it
 
-**Account addresses exist before the accounts do.** `railctl account` prints
-the address immediately; tokens sent there before it is deployed are safe, and
-the account is created on its first operation.
-
-**What the four statuses mean:**
+**The four statuses:**
 
 | | |
 |---|---|
@@ -149,14 +164,38 @@ reserved only on `failed`.
 signed operation; a fresh one is signed only once the previous can no longer
 execute. The vault refuses a second execution regardless.
 
-**A stuck operation.** Re-run the command. If it must be given up on, `abandon`
-it — but that alone does not release anything: it stops future signing without
-killing what is already signed. Wait for `failed`, which arrives once every
-attempt has expired past finality.
+**A stuck operation.** Re-run the command. If it must be given up on,
+`abandon` it — but that alone releases nothing: it stops future signing
+without killing what is already signed. Wait for `failed`, which arrives once
+every attempt has expired past finality.
 
-**A refused identifier.** If a `deposit`/`settle`/`withdraw` is rejected for
-different terms, that identifier is spent. Mint a fresh one and retry; no funds
-are ever at risk from this.
+**A refused identifier.** If an operation is rejected for different terms,
+that identifier is spent. Mint a fresh one and retry; no funds are ever at
+risk from this.
+
+**Watch the paymaster's gas tank.** When its deposit runs out, everything
+stops until it is topped up. Nothing is lost — operations wait — but nothing
+moves either.
+
+## Verify the build
+
+```sh
+go test ./...                                  # library, offline
+go test -race ./...                            # same, under the race detector
+cd contracts && forge test                     # 53 unit, fuzz and invariant tests
+go test -tags integration ./integration-tests/ # the six user stories, needs anvil
+```
+
+The stories are opt-in: without `-tags integration` they do not run, and if
+`anvil` is missing they fail rather than pass quietly.
+
+The formal proofs need Halmos in its own environment, so it cannot disturb
+the rest of your Python setup:
+
+```sh
+python3 -m venv ~/.venvs/halmos && ~/.venvs/halmos/bin/pip install halmos
+cd contracts && ~/.venvs/halmos/bin/halmos --contract JuiceRailSymbolicTest
+```
 
 ## Layout
 

@@ -16,6 +16,9 @@ contracts that move USDT0 on EVM networks for a host application, plus a
 tiny standalone app using the library as its test and operations harness.
 Juice is one host among others.
 
+- The users' persona: not crypto-savvy. They know how to move USTD from
+  one account to the other on Ethereum, but that's it. They should NEVER
+  be thinking about ETH.
 - The host is authoritative for its own ledger; the rail moves external
   money and reports finalized facts.
 - If there is state, transitions are minimal so they can be verified.
