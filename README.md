@@ -76,13 +76,17 @@ The vault runs on one of two networks: **Arbitrum Sepolia**, a test network
 where everything is free and fake, or **Arbitrum One**, the real one. The
 steps are the same on both; the differences are marked.
 
-One rule for every step: an `export`ed value dies with its terminal. Save
-each one to a file as you go, and start every new terminal by loading it:
+These steps drive `forge` and `cast`, which read the environment, and an
+`export`ed value dies with its terminal. Save each one as you go and reload it
+in a new terminal:
 
 ```sh
-echo 'export TOKEN=0x...' >> ~/.juice-rail/sepolia.env   # save as you go
-source ~/.juice-rail/sepolia.env                         # reload later
+echo 'export TOKEN=0x...' >> ~/deploy.env   # save as you go
+source ~/deploy.env                         # reload later
 ```
+
+This is for deployment only. `railctl` itself needs no exports; see
+"Use railctl".
 
 ### 1. Create the two operator keys
 
@@ -225,31 +229,39 @@ sponsorship key.
 You deploy nothing and never touch ETH. You need:
 
 1. **From the operator:** the domain file and the sponsorship key.
-2. **Made by you, kept by you:** your account key.
-
-```sh
-cast wallet new   # your account key; the operator never sees it
-```
-
-That's all. Continue below.
+2. **Made by you, kept by you:** nothing. `railctl init` below makes your key.
 
 ## Use railctl
 
 Operator and participants use it identically; the operator is just a
 participant who also holds the other keys.
 
+Set up once. Put the sponsorship key in a file first, because a key passed as
+a flag value would be visible to every user on the machine:
+
 ```sh
 go build -o railctl ./cmd/railctl
 
-export RAILCTL_CONFIG=<path to the domain file>
-export RAILCTL_STORE=~/.juice-rail/<domain name>.db   # its records; one file per domain
-export RAILCTL_KEY=<your account private key>
-export RAILCTL_PAYMASTER_KEY=<the sponsorship key>
+$EDITOR sponsor.key   # paste the sponsorship key the operator gave you
+railctl -sponsor-key-file sponsor.key init alice arbitrum-sepolia.json
 ```
 
-Save these four in a file (e.g. `~/.juice-rail/sepolia.env`) and `source` it
-in every new terminal; exports die with the terminal that ran them. Errors
-like `no -config given` mean you forgot.
+That generates your account key, installs the domain, and records `alice` as
+the profile to use. From then on, in any terminal, with nothing exported:
+
+```sh
+railctl balance
+```
+
+It all lives in `~/.juice-rail/`: `config.json` holds domains and profiles,
+`credentials.json` holds keys and nothing else at mode `0600`, and each
+profile gets its own `<profile>.db` of records. Add a second person with
+another `init` (the domain is already installed, so no sponsorship key is
+needed) and pick them with `-profile bob`.
+
+Two conventions worth knowing: flags come before the command, as in
+`railctl -profile bob balance`; and to import an existing key instead of
+generating one, `init` takes `-key-file`.
 
 A first session between two participants, **Alice** and **Bob**, each on
 their own machine with their own setup as above.
@@ -312,6 +324,7 @@ All commands:
 
 | Command | What it does |
 |---|---|
+| `railctl init <profile> <domain-file>` | set up a profile once |
 | `railctl account` | your address on this domain |
 | `railctl balance [address]` | vault balance and tokens in hand |
 | `railctl deposit <id> <account> <amount>` | pull tokens from your hand, credit an account's vault balance |
@@ -326,9 +339,12 @@ Worth knowing:
   dollar.
 - **Identifiers must be fresh and unguessable.** Generate each one as above;
   never reuse one.
-- **One store per domain.** The store file records its domain on first use
-  and refuses to open for another. Second domain, second file.
-- `-json` gives machine-readable output.
+- **Re-running a command is safe** and reports the same status. Money moves
+  once whatever you do.
+- **One store per profile.** The store file records its domain on first use
+  and refuses to open for another.
+- `-json` gives machine-readable output. `-config`, `-store`, `RAILCTL_KEY`
+  and `RAILCTL_PAYMASTER_KEY` still override the profile, for automation.
 
 ## Operate it
 

@@ -190,6 +190,57 @@ func TestAttemptIsDurableBeforeSubmission(t *testing.T) {
 	}
 }
 
+// A retry during the finality gap must report the intent's status, not the
+// bundler's complaint: once the attempt's nonce is consumed, that operation can
+// never execute again, so its rejection says nothing. Any other rejection is
+// still an error.
+func TestRejectionIsSwallowedOnlyWhenTheNonceIsSpent(t *testing.T) {
+	r, chain, bundler := newTestRail(t)
+	ctx := context.Background()
+	id := testID(15)
+
+	if err := r.Prepare(ctx, id, depositTerms(100)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Submit(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	ops, _ := r.store.SignedOps(id)
+	if len(ops) != 1 {
+		t.Fatalf("want one attempt, got %d", len(ops))
+	}
+
+	// The attempt is live and its nonce is unspent, so a rejection stands.
+	bundler.err = errors.New("AA25 invalid account nonce")
+	if err := r.Send(ctx, id); err == nil {
+		t.Fatal("a rejection must stand while the attempt could still execute")
+	}
+
+	// The operation was included: its nonce is now spent, so the same
+	// rejection carries no information.
+	chain.nonce = new(big.Int).Add(ops[0].Nonce, big.NewInt(1))
+	if err := r.Send(ctx, id); err != nil {
+		t.Fatalf("want the rejection swallowed, got %v", err)
+	}
+
+	// Status still follows finality, so the intent stays pending until the
+	// event is finalized.
+	status, err := r.Status(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusPending {
+		t.Fatalf("status = %s, want pending", status)
+	}
+	// Nothing was signed to replace it, and no fact was cached.
+	if ops, _ = r.store.SignedOps(id); len(ops) != 1 {
+		t.Fatalf("no replacement may be signed, got %d attempts", len(ops))
+	}
+	if _, cached, _ := r.store.Fact(id); cached {
+		t.Fatal("an unfinalized observation must never be cached")
+	}
+}
+
 func TestSigningIsRefusedAfterAbandonment(t *testing.T) {
 	r, _, _ := newTestRail(t)
 	ctx := context.Background()

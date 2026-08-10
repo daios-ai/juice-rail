@@ -182,6 +182,9 @@ locating events, never status. Storage is an interface over exactly the
 four records above; a SQLite implementation ships; hosts may substitute
 their own store.
 
+The library reads no file, environment variable or home directory: every
+input arrives at construction. Configuration discovery is the app's.
+
 6. Confirmation
 
 Bundler acceptance is not confirmation. `confirmed` means: a finalized

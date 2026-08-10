@@ -303,9 +303,35 @@ func (r *Rail) Send(ctx context.Context, id ID) error {
 		return fmt.Errorf("decode stored operation: %w", err)
 	}
 	if _, err := r.bundler.SendUserOperation(ctx, &op, r.domain.Contracts.EntryPoint); err != nil {
+		// A rejection carries no information once the attempt's nonce is
+		// consumed: that exact operation can never execute again, so no
+		// submission of it could have succeeded either. The test runs after
+		// the failure rather than before it, leaving no window in which
+		// inclusion races the check.
+		if spent, spentErr := r.nonceSpent(ctx, id, live); spentErr == nil && spent {
+			return nil
+		}
 		return fmt.Errorf("submit operation: %w", err)
 	}
 	return nil
+}
+
+// nonceSpent reports whether the attempt's nonce has already been used. The
+// read is transient and nothing durable derives from it: signing a replacement
+// still requires finalized evidence.
+func (r *Rail) nonceSpent(ctx context.Context, id ID, attempt *SignedOp) (bool, error) {
+	if attempt.Nonce == nil {
+		return false, nil
+	}
+	addr, err := r.Account(ctx)
+	if err != nil {
+		return false, err
+	}
+	nonce, err := r.account.Nonce(ctx, r.chain, addr, nonceKey(id))
+	if err != nil {
+		return false, err
+	}
+	return nonce.Cmp(attempt.Nonce) > 0, nil
 }
 
 // settled reports whether the intent has reached a terminal status, in which
