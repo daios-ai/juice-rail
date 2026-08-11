@@ -1,353 +1,678 @@
 package rail
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"errors"
 	"math/big"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-
-	"github.com/daios-ai/juice-rail/go/erc4337"
+	"reflect"
 )
 
-// fakeBundler records what was presented to it.
-type fakeBundler struct {
-	sent [][]byte
-	err  error
+// fakeChain answers exactly what the rail asks a node, and records what it
+// submits. Nothing here reaches a network.
+type fakeChain struct {
+	headTime      uint64
+	headNumber    uint64
+	finalizedTime uint64
+	finalizedNum  uint64
+	baseFee       *big.Int
+
+	railBalances  map[common.Address]*big.Int
+	tokenBalances map[common.Address]*big.Int
+	bindings      map[Ref]common.Hash
+	tokenDomain   common.Hash
+	noAuthState   bool
+
+	mu        sync.Mutex
+	logs      []types.Log
+	sent      []*types.Transaction
+	simulate  error
+	estimated uint64
+	nonce     uint64
 }
 
-func (b *fakeBundler) SendUserOperation(_ context.Context, op *erc4337.UserOperation, _ common.Address) (common.Hash, error) {
-	if b.err != nil {
-		return common.Hash{}, b.err
+func newFakeChain() *fakeChain {
+	return &fakeChain{
+		headTime:      1_000_000,
+		headNumber:    100,
+		finalizedTime: 1_000_000,
+		finalizedNum:  98,
+		baseFee:       big.NewInt(1_000_000_000),
+		railBalances:  map[common.Address]*big.Int{},
+		tokenBalances: map[common.Address]*big.Int{},
+		bindings:      map[Ref]common.Hash{},
+		tokenDomain:   common.HexToHash("0xd0d0"),
+		estimated:     120_000,
 	}
-	b.sent = append(b.sent, op.CallData)
-	return op.Hash(common.Address{}, big.NewInt(1)), nil
 }
 
-func testKey(t *testing.T, n int64) *ecdsa.PrivateKey {
+func sel(sig string) string { return string(crypto.Keccak256([]byte(sig))[:4]) }
+
+var (
+	selBalanceOf   = sel("balanceOf(address)")
+	selOperations  = sel("operations(address,bytes32)")
+	selTokenDomain = sel("DOMAIN_SEPARATOR()")
+	selAuthState   = sel("authorizationState(address,bytes32)")
+)
+
+func (f *fakeChain) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
+	if number != nil && number.Cmp(finalizedBlockArg) == 0 {
+		return &types.Header{Number: new(big.Int).SetUint64(f.finalizedNum), Time: f.finalizedTime}, nil
+	}
+	return &types.Header{Number: new(big.Int).SetUint64(f.headNumber), Time: f.headTime, BaseFee: f.baseFee}, nil
+}
+
+func (f *fakeChain) BlockNumber(context.Context) (uint64, error) { return f.headNumber, nil }
+
+func (f *fakeChain) FilterLogs(context.Context, ethereum.FilterQuery) ([]types.Log, error) {
+	return f.logs, nil
+}
+
+func (f *fakeChain) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {
+	if len(call.Data) < 4 {
+		return nil, errors.New("short call")
+	}
+	switch string(call.Data[:4]) {
+	case selBalanceOf:
+		who := common.BytesToAddress(call.Data[4:36])
+		set := f.railBalances
+		if call.To != nil && *call.To == testDomain().Token {
+			set = f.tokenBalances
+		}
+		v, ok := set[who]
+		if !ok {
+			v = new(big.Int)
+		}
+		return common.LeftPadBytes(v.Bytes(), 32), nil
+	case selOperations:
+		ref := Ref{
+			Account: common.BytesToAddress(call.Data[4:36]),
+			ID:      ID(common.BytesToHash(call.Data[36:68])),
+		}
+		return f.bindings[ref].Bytes(), nil
+	case selTokenDomain:
+		return f.tokenDomain.Bytes(), nil
+	case selAuthState:
+		if f.noAuthState {
+			return nil, errors.New("execution reverted")
+		}
+		return make([]byte, 32), nil
+	default:
+		// A money call: this is the relayer's simulation.
+		return nil, f.simulate
+	}
+}
+
+// PendingNonceAt counts what this fake has already accepted, the way a node
+// counts its pending pool. Two relays that select a nonce without serialising
+// therefore collide, exactly as they would on a real chain.
+func (f *fakeChain) PendingNonceAt(context.Context, common.Address) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nonce + uint64(len(f.sent)), nil
+}
+
+func (f *fakeChain) SuggestGasTipCap(context.Context) (*big.Int, error) { return big.NewInt(0), nil }
+
+func (f *fakeChain) EstimateGas(context.Context, ethereum.CallMsg) (uint64, error) {
+	return f.estimated, nil
+}
+
+func (f *fakeChain) SendTransaction(_ context.Context, tx *types.Transaction) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = append(f.sent, tx)
+	return nil
+}
+
+func (f *fakeChain) submitted() []*types.Transaction {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*types.Transaction(nil), f.sent...)
+}
+
+// --- fixtures ---
+
+func testKey(t *testing.T, n byte) *ecdsa.PrivateKey {
 	t.Helper()
-	key, err := crypto.ToECDSA(common.BigToHash(big.NewInt(n)).Bytes())
+	b := make([]byte, 32)
+	b[31] = n
+	key, err := crypto.ToECDSA(b)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return key
 }
 
-func newTestRail(t *testing.T) (*Rail, *fakeChain, *fakeBundler) {
+func testDomain() Domain {
+	return Domain{
+		Name:     "test",
+		ChainID:  big.NewInt(31337),
+		Rail:     common.HexToAddress("0x00000000000000000000000000000000000000A1"),
+		Token:    common.HexToAddress("0x00000000000000000000000000000000000000B2"),
+		Finality: "finalized",
+	}
+}
+
+func newTestRail(t *testing.T) (*Rail, *memStore, *fakeChain) {
 	t.Helper()
-	chain, bundler := newFakeChain(), &fakeBundler{}
-	d := testDomain()
-	sponsor := LocalSponsor{
-		Paymaster:  d.Paymaster,
-		EntryPoint: d.Contracts.EntryPoint,
-		ChainID:    d.ChainID,
-		Key:        testKey(t, 2),
-	}
-	r, err := New(d, newMemStore(), chain, bundler, sponsor, testKey(t, 1))
+	store, chain := newMemStore(), newFakeChain()
+	r, err := New(testDomain(), store, chain, testKey(t, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return r, chain, bundler
+	return r, store, chain
 }
 
-func TestDomainRejectsIncompleteOrUnsafeConfiguration(t *testing.T) {
-	base := testDomain()
+// --- construction ---
 
-	missing := base
-	missing.Rail = common.Address{}
-	if err := missing.Validate(); err == nil {
-		t.Error("a missing rail address must be rejected")
+func TestNewRefusesAnIncompleteDomain(t *testing.T) {
+	store, chain := newMemStore(), newFakeChain()
+	key := testKey(t, 1)
+
+	bad := testDomain()
+	bad.Finality = "12-confirmations"
+	if _, err := New(bad, store, chain, key); err == nil {
+		t.Fatal("a confirmation-count policy must be refused: confirmed may never revert")
 	}
-
-	// Only true finality is admissible: a confirmed fact must never revert.
-	for _, mechanism := range []string{"", "latest", "safe", "12-confirmations"} {
-		weak := base
-		weak.Finality = mechanism
-		if err := weak.Validate(); err == nil {
-			t.Errorf("finality %q must be rejected", mechanism)
-		}
+	bad = testDomain()
+	bad.Token = common.Address{}
+	if _, err := New(bad, store, chain, key); err == nil {
+		t.Fatal("a domain without a token must be refused")
+	}
+	if _, err := New(testDomain(), nil, chain, key); err == nil {
+		t.Fatal("a rail without a store must be refused")
 	}
 }
 
-func TestPrepareIsWriteAheadOnly(t *testing.T) {
-	r, _, bundler := newTestRail(t)
+func TestAccountIsTheKeysOwnAddress(t *testing.T) {
+	r, _, _ := newTestRail(t)
+	if want := crypto.PubkeyToAddress(testKey(t, 1).PublicKey); r.Account() != want {
+		t.Fatalf("account %s, want %s", r.Account(), want)
+	}
+}
+
+// --- intents ---
+
+func TestPrepareRefusesAnIntentDebitingAnotherAccount(t *testing.T) {
+	r, _, _ := newTestRail(t)
+	err := r.Prepare(context.Background(), testID(1),
+		testTerms(KindTransfer, addr(9), addr(2), 10))
+	if err == nil {
+		t.Fatal("a rail must not record an intent that debits someone else")
+	}
+}
+
+func TestSignIsDurableBeforeItReturns(t *testing.T) {
 	ctx := context.Background()
+	r, store, _ := newTestRail(t)
+	if err := r.PrepareTransfer(ctx, testID(1), addr(2), big.NewInt(10)); err != nil {
+		t.Fatal(err)
+	}
+	v, err := r.Sign(ctx, testID(1), big.NewInt(1), addr(3), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := store.Variants(r.ref(testID(1)))
+	if len(stored) != 1 {
+		t.Fatalf("the variant must be durable before it is returned, got %d records", len(stored))
+	}
+	if stored[0].ValidBefore != v.ValidBefore || stored[0].Relayer != v.Relayer {
+		t.Fatalf("stored %+v, returned %+v", stored[0], v)
+	}
+}
+
+func TestSignReusesALiveVariantAndReplacesADeadOne(t *testing.T) {
+	ctx := context.Background()
+	r, store, chain := newTestRail(t)
 	id := testID(1)
-
-	if err := r.Prepare(ctx, id, depositTerms(100)); err != nil {
+	if err := r.PrepareTransfer(ctx, id, addr(2), big.NewInt(10)); err != nil {
 		t.Fatal(err)
 	}
-	if ops, _ := r.store.SignedOps(id); len(ops) != 0 {
-		t.Fatalf("nothing may be signed yet, got %d attempts", len(ops))
-	}
-	if len(bundler.sent) != 0 {
-		t.Fatal("nothing may be submitted yet")
-	}
-	in, ok, _ := r.store.Intent(id)
-	if !ok || in.FromBlock == 0 {
-		t.Fatalf("the intent must record where to start looking, got %+v", in)
-	}
-}
 
-func TestPrepareRejectsDifferentTermsForTheSameIdentifier(t *testing.T) {
-	r, _, _ := newTestRail(t)
-	ctx := context.Background()
-	id := testID(2)
-
-	if err := r.Prepare(ctx, id, depositTerms(100)); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Prepare(ctx, id, depositTerms(100)); err != nil {
-		t.Fatalf("identical terms must be accepted: %v", err)
-	}
-	if err := r.Prepare(ctx, id, depositTerms(200)); !errors.Is(err, ErrIntentConflict) {
-		t.Fatalf("want ErrIntentConflict, got %v", err)
-	}
-}
-
-// Signing is guarded: while an attempt may still execute, no second one is
-// created. Only expiry at finality releases the guard.
-func TestSignsAgainOnlyOnceTheAttemptIsProvablyDead(t *testing.T) {
-	r, chain, _ := newTestRail(t)
-	ctx := context.Background()
-	id := testID(3)
-
-	if err := r.Prepare(ctx, id, depositTerms(100)); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Sign(ctx, id); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Sign(ctx, id); err != nil {
-		t.Fatal(err)
-	}
-	ops, _ := r.store.SignedOps(id)
-	if len(ops) != 1 {
-		t.Fatalf("a live attempt must not be replaced, got %d", len(ops))
-	}
-
-	// Time moves past the sponsorship expiry, at the head and at finality.
-	chain.finalizedTime = ops[0].ValidUntil + 1
-	chain.headTime = chain.finalizedTime
-	if err := r.Sign(ctx, id); err != nil {
-		t.Fatal(err)
-	}
-	ops, _ = r.store.SignedOps(id)
-	if len(ops) != 2 {
-		t.Fatalf("a dead attempt must be replaced, got %d", len(ops))
-	}
-	if bytes.Equal(ops[0].Op, ops[1].Op) {
-		t.Fatal("the replacement must be a fresh operation")
-	}
-}
-
-func TestSubmitReSendsTheSameSignedOperation(t *testing.T) {
-	r, _, bundler := newTestRail(t)
-	ctx := context.Background()
-	id := testID(4)
-
-	if err := r.Prepare(ctx, id, depositTerms(100)); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 3; i++ {
-		if err := r.Submit(ctx, id); err != nil {
-			t.Fatalf("submit %d: %v", i, err)
-		}
-	}
-	if ops, _ := r.store.SignedOps(id); len(ops) != 1 {
-		t.Fatalf("resubmission must not sign again, got %d attempts", len(ops))
-	}
-	if len(bundler.sent) != 3 {
-		t.Fatalf("want 3 submissions, got %d", len(bundler.sent))
-	}
-	for i := 1; i < len(bundler.sent); i++ {
-		if !bytes.Equal(bundler.sent[0], bundler.sent[i]) {
-			t.Fatal("every resubmission must present identical bytes")
-		}
-	}
-}
-
-// The attempt is durable before it is presented: if submission fails, the
-// record of what we signed survives.
-func TestAttemptIsDurableBeforeSubmission(t *testing.T) {
-	r, _, bundler := newTestRail(t)
-	ctx := context.Background()
-	id := testID(5)
-	bundler.err = errors.New("bundler unreachable")
-
-	if err := r.Prepare(ctx, id, depositTerms(100)); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Submit(ctx, id); err == nil {
-		t.Fatal("want a submission error")
-	}
-	if ops, _ := r.store.SignedOps(id); len(ops) != 1 {
-		t.Fatalf("the signed attempt must survive a failed submission, got %d", len(ops))
-	}
-}
-
-// A retry during the finality gap must report the intent's status, not the
-// bundler's complaint: once the attempt's nonce is consumed, that operation can
-// never execute again, so its rejection says nothing. Any other rejection is
-// still an error.
-func TestRejectionIsSwallowedOnlyWhenTheNonceIsSpent(t *testing.T) {
-	r, chain, bundler := newTestRail(t)
-	ctx := context.Background()
-	id := testID(15)
-
-	if err := r.Prepare(ctx, id, depositTerms(100)); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Submit(ctx, id); err != nil {
-		t.Fatal(err)
-	}
-	ops, _ := r.store.SignedOps(id)
-	if len(ops) != 1 {
-		t.Fatalf("want one attempt, got %d", len(ops))
-	}
-
-	// The attempt is live and its nonce is unspent, so a rejection stands.
-	bundler.err = errors.New("AA25 invalid account nonce")
-	if err := r.Send(ctx, id); err == nil {
-		t.Fatal("a rejection must stand while the attempt could still execute")
-	}
-
-	// The operation was included: its nonce is now spent, so the same
-	// rejection carries no information.
-	chain.nonce = new(big.Int).Add(ops[0].Nonce, big.NewInt(1))
-	if err := r.Send(ctx, id); err != nil {
-		t.Fatalf("want the rejection swallowed, got %v", err)
-	}
-
-	// Status still follows finality, so the intent stays pending until the
-	// event is finalized.
-	status, err := r.Status(ctx, id)
+	first, err := r.Sign(ctx, id, big.NewInt(1), addr(3), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status != StatusPending {
-		t.Fatalf("status = %s, want pending", status)
+	again, err := r.Sign(ctx, id, big.NewInt(1), addr(3), time.Hour)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Nothing was signed to replace it, and no fact was cached.
-	if ops, _ = r.store.SignedOps(id); len(ops) != 1 {
-		t.Fatalf("no replacement may be signed, got %d attempts", len(ops))
+	if again.ValidBefore != first.ValidBefore {
+		t.Fatal("a live variant with the same relayer and fee must be reused")
 	}
-	if _, cached, _ := r.store.Fact(id); cached {
-		t.Fatal("an unfinalized observation must never be cached")
+
+	// A different relayer is a different variant, signed at once: replacing an
+	// unresponsive relayer never waits.
+	other, err := r.Sign(ctx, id, big.NewInt(2), addr(4), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Relayer != addr(4) || other.Fee.Int64() != 2 {
+		t.Fatalf("wanted a fresh variant, got %+v", other)
+	}
+	if stored, _ := store.Variants(r.ref(id)); len(stored) != 2 {
+		t.Fatalf("want 2 recorded variants, got %d", len(stored))
+	}
+
+	// Once the deadline passes, the same request signs a fresh variant.
+	chain.headTime = first.ValidBefore + 1
+	fresh, err := r.Sign(ctx, id, big.NewInt(1), addr(3), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.ValidBefore <= first.ValidBefore {
+		t.Fatal("a dead variant must not be reused")
 	}
 }
 
-func TestSigningIsRefusedAfterAbandonment(t *testing.T) {
-	r, _, _ := newTestRail(t)
+func TestSignRefusesWithoutAnIntentOrAfterAbandonment(t *testing.T) {
 	ctx := context.Background()
-	id := testID(6)
-
-	if err := r.Prepare(ctx, id, depositTerms(100)); err != nil {
+	r, _, _ := newTestRail(t)
+	if _, err := r.Sign(ctx, testID(7), nil, addr(3), time.Hour); !errors.Is(err, ErrNoIntent) {
+		t.Fatalf("want ErrNoIntent, got %v", err)
+	}
+	if err := r.PrepareTransfer(ctx, testID(1), addr(2), big.NewInt(10)); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Abandon(ctx, id); err != nil {
+	if err := r.Abandon(ctx, testID(1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Sign(ctx, id); !errors.Is(err, ErrAbandoned) {
+	if _, err := r.Sign(ctx, testID(1), nil, addr(3), time.Hour); !errors.Is(err, ErrAbandoned) {
 		t.Fatalf("want ErrAbandoned, got %v", err)
 	}
 }
 
-func TestSubmitStopsOnceSettled(t *testing.T) {
-	r, chain, bundler := newTestRail(t)
+func TestSignedVariantsRecoverToTheAccount(t *testing.T) {
 	ctx := context.Background()
-	id, terms := testID(7), depositTerms(100)
+	r, _, _ := newTestRail(t)
 
-	if err := r.Prepare(ctx, id, terms); err != nil {
+	for _, tc := range []struct {
+		name    string
+		prepare func() error
+	}{
+		{"transfer", func() error { return r.PrepareTransfer(ctx, testID(1), addr(2), big.NewInt(10)) }},
+		{"withdraw", func() error { return r.PrepareWithdrawal(ctx, testID(2), addr(5), big.NewInt(10)) }},
+		{"deposit", func() error { return r.PrepareDeposit(ctx, testID(3), addr(6), big.NewInt(10)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.prepare(); err != nil {
+				t.Fatal(err)
+			}
+			id := testID(map[string]byte{"transfer": 1, "withdraw": 2, "deposit": 3}[tc.name])
+			v, err := r.Sign(ctx, id, big.NewInt(3), addr(4), time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h, err := TermsHash(v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			signer, err := RecoverSigner(digest(DomainSeparator(testDomain().ChainID, testDomain().Rail), h), v.TermsSig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if signer != r.Account() {
+				t.Fatalf("terms recover to %s, want %s", signer, r.Account())
+			}
+			if tc.name != "deposit" {
+				if len(v.AuthSig) != 0 {
+					t.Fatal("only a deposit carries a token authorisation")
+				}
+				return
+			}
+			// The token authorisation is for amount + fee, payable to the rail
+			// only, and its nonce is the terms hash.
+			d, err := authDigest(common.HexToHash("0xd0d0"), v.Account, testDomain().Rail, v.Total(), v.ValidBefore, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authSigner, err := RecoverSigner(d, v.AuthSig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if authSigner != r.Account() {
+				t.Fatalf("authorisation recovers to %s, want %s", authSigner, r.Account())
+			}
+		})
+	}
+}
+
+// --- relaying ---
+
+// signedFor builds a variant signed by one rail and naming another as relayer.
+func signedFor(t *testing.T, signer *Rail, kind Kind, party common.Address, amount, fee int64, relayer common.Address) Variant {
+	t.Helper()
+	ctx := context.Background()
+	id := testID(1)
+	if err := signer.Prepare(ctx, id, Terms{
+		Kind: kind, Account: signer.Account(), Party: party, Amount: big.NewInt(amount),
+	}); err != nil {
 		t.Fatal(err)
 	}
-	chain.logs = append(chain.logs, railLog(r.domain.Rail, id, terms, chain.head+1))
-	chain.finalized = chain.head + 2
-
-	if err := r.Submit(ctx, id); err != nil {
-		t.Fatal(err)
-	}
-	if len(bundler.sent) != 0 {
-		t.Fatal("a confirmed intent must not be submitted again")
-	}
-}
-
-func TestSubmitWithoutAnIntentIsRefused(t *testing.T) {
-	r, _, _ := newTestRail(t)
-	if err := r.Submit(context.Background(), testID(8)); !errors.Is(err, ErrNoIntent) {
-		t.Fatalf("want ErrNoIntent, got %v", err)
-	}
-}
-
-// Each intent owns a nonce key, so one stuck attempt never blocks another.
-func TestNonceKeysAreDistinctPerIdentifier(t *testing.T) {
-	if nonceKey(testID(1)).Cmp(nonceKey(testID(2))) == 0 {
-		t.Fatal("different identifiers must use different nonce keys")
-	}
-	if got := nonceKey(testID(1)).BitLen(); got > 192 {
-		t.Fatalf("nonce key must fit uint192, got %d bits", got)
-	}
-}
-
-func TestNamedOperationsRejectTheWrongKind(t *testing.T) {
-	r, _, _ := newTestRail(t)
-	ctx := context.Background()
-	id := testID(9)
-
-	if err := r.Prepare(ctx, id, depositTerms(100)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.SettlementStatus(ctx, id); err == nil {
-		t.Fatal("a deposit must not report as a settlement")
-	}
-	if _, err := r.DepositStatus(ctx, id); err != nil {
-		t.Fatalf("a deposit must report as a deposit: %v", err)
-	}
-}
-
-func TestAccountAddressIsStable(t *testing.T) {
-	r, _, _ := newTestRail(t)
-	ctx := context.Background()
-
-	first, err := r.Account(ctx)
+	v, err := signer.Sign(ctx, id, big.NewInt(fee), relayer, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := r.Account(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first != second || first == (common.Address{}) {
-		t.Fatalf("account address must be stable and non-zero: %s %s", first, second)
+	return v
+}
+
+func TestRelayRefusesAVariantNamingAnotherRelayer(t *testing.T) {
+	r, _, _ := newTestRail(t)
+	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, addr(9))
+	if _, err := r.Relay(context.Background(), v); !errors.Is(err, ErrNotRelayer) {
+		t.Fatalf("want ErrNotRelayer, got %v", err)
 	}
 }
 
-func TestSettleAndWithdrawBindTheRailAsDebtor(t *testing.T) {
+func TestRelayRefusesATamperedVariant(t *testing.T) {
 	r, _, _ := newTestRail(t)
-	ctx := context.Background()
-	self, err := r.Account(ctx)
+	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
+	v.Amount = big.NewInt(11) // the signature no longer covers the terms
+	if _, err := r.Relay(context.Background(), v); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("want ErrBadSignature, got %v", err)
+	}
+}
+
+func TestRelayRefusesADepositAuthorisedByAnotherAccount(t *testing.T) {
+	r, _, chain := newTestRail(t)
+	v := signedFor(t, r, KindDeposit, addr(2), 10, 1, r.Account())
+
+	// A well-formed authorisation for exactly these terms, signed by someone
+	// else: the tokens are not the payer's to move.
+	h, err := TermsHash(v)
 	if err != nil {
 		t.Fatal(err)
 	}
-	creditor := common.BigToAddress(big.NewInt(0xC1))
-
-	if err := r.Settle(ctx, testID(10), creditor, big.NewInt(40)); err != nil {
+	d, err := authDigest(chain.tokenDomain, v.Account, testDomain().Rail, v.Total(), v.ValidBefore, h)
+	if err != nil {
 		t.Fatal(err)
 	}
-	in, _, _ := r.store.Intent(testID(10))
-	if in.Terms.Account != self || in.Terms.Party != creditor || in.Terms.Kind != KindSettle {
-		t.Fatalf("settle terms = %s, want debtor %s", in.Terms, self)
-	}
-
-	if err := r.Withdraw(ctx, testID(11), creditor, big.NewInt(25)); err != nil {
+	if v.AuthSig, err = signDigest(testKey(t, 2), d); err != nil {
 		t.Fatal(err)
 	}
-	in, _, _ = r.store.Intent(testID(11))
-	if in.Terms.Account != self || in.Terms.Party != creditor || in.Terms.Kind != KindWithdraw {
-		t.Fatalf("withdraw terms = %s, want debtor %s", in.Terms, self)
+	if _, err := r.Relay(context.Background(), v); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("want ErrBadSignature, got %v", err)
+	}
+}
+
+func TestRelayTellsExecutedApartFromConflicting(t *testing.T) {
+	ctx := context.Background()
+	r, _, chain := newTestRail(t)
+	chain.railBalances[r.Account()] = big.NewInt(1000)
+	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
+	h, err := TermsHash(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	chain.bindings[v.Ref()] = h
+	if _, err := r.Relay(ctx, v); !errors.Is(err, ErrExecuted) {
+		t.Fatalf("want ErrExecuted, got %v", err)
+	}
+	if len(chain.submitted()) != 0 {
+		t.Fatal("an executed operation must cost no gas")
+	}
+
+	chain.bindings[v.Ref()] = common.HexToHash("0xbeef")
+	if _, err := r.Relay(ctx, v); !errors.Is(err, ErrConflict) {
+		t.Fatalf("want ErrConflict, got %v", err)
+	}
+	if len(chain.submitted()) != 0 {
+		t.Fatal("a conflicting binding must cost no gas")
+	}
+}
+
+func TestRelayRefusesAnExpiredVariant(t *testing.T) {
+	ctx := context.Background()
+	r, _, chain := newTestRail(t)
+	chain.railBalances[r.Account()] = big.NewInt(1000)
+	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
+
+	chain.headTime = v.ValidBefore // the contract's test is strict: >= is dead
+	if _, err := r.Relay(ctx, v); !errors.Is(err, ErrExpired) {
+		t.Fatalf("want ErrExpired, got %v", err)
+	}
+}
+
+func TestRelayRefusesAnUnfundedOperation(t *testing.T) {
+	ctx := context.Background()
+	r, _, chain := newTestRail(t)
+	chain.railBalances[r.Account()] = big.NewInt(10) // the fee tips it over
+	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
+	if _, err := r.Relay(ctx, v); err == nil {
+		t.Fatal("the balance must cover amount + fee")
+	}
+	if len(chain.submitted()) != 0 {
+		t.Fatal("an unfunded operation must cost no gas")
+	}
+}
+
+func TestRelaySimulatesBeforeSpendingGas(t *testing.T) {
+	ctx := context.Background()
+	r, _, chain := newTestRail(t)
+	chain.railBalances[r.Account()] = big.NewInt(1000)
+	chain.simulate = errors.New("execution reverted")
+	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
+
+	if _, err := r.Relay(ctx, v); err == nil {
+		t.Fatal("a failing simulation must stop the submission")
+	}
+	if len(chain.submitted()) != 0 {
+		t.Fatal("gas was spent on an operation that cannot execute")
+	}
+}
+
+func TestRelaySubmitsTheExactSignedCall(t *testing.T) {
+	ctx := context.Background()
+	r, _, chain := newTestRail(t)
+	chain.railBalances[r.Account()] = big.NewInt(1000)
+	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
+
+	hash, err := r.Relay(ctx, v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chain.submitted()) != 1 {
+		t.Fatalf("want 1 transaction, got %d", len(chain.submitted()))
+	}
+	tx := chain.submitted()[0]
+	if tx.Hash() != hash {
+		t.Fatal("the reported hash is not the transaction's")
+	}
+	if *tx.To() != testDomain().Rail {
+		t.Fatalf("submitted to %s, want the rail", tx.To())
+	}
+	method, err := railABI.MethodById(tx.Data()[:4])
+	if err != nil || method.Name != "transfer" {
+		t.Fatalf("wrong method %v (%v)", method, err)
+	}
+	args, err := method.Inputs.Unpack(tx.Data()[4:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	terms := reflect.ValueOf(args[0])
+	field := func(name string) any { return terms.FieldByName(name).Interface() }
+	if field("Account") != v.Account || field("Party") != v.Party ||
+		field("Relayer") != v.Relayer ||
+		field("Amount").(*big.Int).Cmp(v.Amount) != 0 ||
+		field("Fee").(*big.Int).Cmp(v.Fee) != 0 ||
+		field("ValidBefore").(*big.Int).Uint64() != v.ValidBefore ||
+		field("Id").([32]byte) != [32]byte(v.ID) {
+		t.Fatalf("the submitted terms are not the signed terms: %+v", args[0])
+	}
+	if got := args[1].([]byte); string(got) != string(v.TermsSig) {
+		t.Fatal("the submitted signature is not the signed one")
+	}
+	if tx.Gas() <= chain.estimated {
+		t.Fatal("the gas limit must leave room above the estimate")
+	}
+	if tx.GasTipCap().Sign() == 0 {
+		t.Fatal("a zero tip can stall on a busy chain")
+	}
+}
+
+func TestSubmitSignsAndRelaysForItself(t *testing.T) {
+	ctx := context.Background()
+	r, _, chain := newTestRail(t)
+	chain.railBalances[r.Account()] = big.NewInt(1000)
+	if err := r.PrepareTransfer(ctx, testID(1), addr(2), big.NewInt(10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Submit(ctx, testID(1), big.NewInt(1), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if len(chain.submitted()) != 1 {
+		t.Fatalf("want 1 transaction, got %d", len(chain.submitted()))
+	}
+	variants, _ := r.Variants(testID(1))
+	if len(variants) != 1 || variants[0].Relayer != r.Account() {
+		t.Fatalf("submit must name itself as relayer: %+v", variants)
+	}
+}
+
+// The selectors are the contract's, computed from the canonical signatures.
+func TestCallDataSelectorsMatchTheContract(t *testing.T) {
+	const tuple = "(bytes32,address,address,uint256,uint256,address,uint256)"
+	for name, signature := range map[string]string{
+		"deposit":  "deposit(" + tuple + ",bytes,bytes)",
+		"transfer": "transfer(" + tuple + ",bytes)",
+		"withdraw": "withdraw(" + tuple + ",bytes)",
+	} {
+		want := crypto.Keccak256([]byte(signature))[:4]
+		method, ok := railABI.Methods[name]
+		if !ok {
+			t.Fatalf("no method %s", name)
+		}
+		if string(method.ID) != string(want) {
+			t.Fatalf("%s selector %x, want %x (signature %s)", name, method.ID, want, signature)
+		}
+	}
+}
+
+func TestAcceptRefusesAForeignDomain(t *testing.T) {
+	r, _, _ := newTestRail(t)
+	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
+
+	other := testDomain()
+	other.ChainID = big.NewInt(1)
+	if _, err := r.Accept(Envelope{ChainID: other.ChainID, Rail: other.Rail, Variant: v}); !errors.Is(err, ErrForeignDomain) {
+		t.Fatalf("want ErrForeignDomain for another chain, got %v", err)
+	}
+	if _, err := r.Accept(Envelope{ChainID: testDomain().ChainID, Rail: addr(8), Variant: v}); !errors.Is(err, ErrForeignDomain) {
+		t.Fatalf("want ErrForeignDomain for another deployment, got %v", err)
+	}
+	if _, err := r.Accept(Envelope{ChainID: testDomain().ChainID, Rail: testDomain().Rail, Variant: v}); err != nil {
+		t.Fatalf("own domain refused: %v", err)
+	}
+}
+
+func TestCheckTokenRequiresTheDepositSurface(t *testing.T) {
+	ctx := context.Background()
+	r, _, _ := newTestRail(t)
+	if err := r.CheckToken(ctx); err != nil {
+		t.Fatalf("a token with the EIP-3009 surface must pass: %v", err)
+	}
+
+	r2, _, chain2 := newTestRail(t)
+	chain2.noAuthState = true
+	if err := r2.CheckToken(ctx); err == nil {
+		t.Fatal("a token without EIP-3009 must be refused: it can never take a deposit")
+	}
+
+	r3, _, chain3 := newTestRail(t)
+	chain3.tokenDomain = common.Hash{}
+	if err := r3.CheckToken(ctx); err == nil {
+		t.Fatal("a token with an empty EIP-712 domain must be refused")
+	}
+}
+
+// A host embeds this library and drives it from goroutines, so two relays on
+// one rail must never choose the same transaction nonce: the loser would be
+// rejected by the node or, worse, silently replace the winner.
+func TestConcurrentRelaysNeverShareANonce(t *testing.T) {
+	ctx := context.Background()
+	r, _, chain := newTestRail(t)
+	chain.railBalances[r.Account()] = big.NewInt(1_000_000)
+
+	const operations = 12
+	variants := make([]Variant, operations)
+	for i := range variants {
+		id := testID(byte(i + 1))
+		if err := r.PrepareTransfer(ctx, id, addr(2), big.NewInt(10)); err != nil {
+			t.Fatal(err)
+		}
+		v, err := r.Sign(ctx, id, big.NewInt(1), r.Account(), time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		variants[i] = v
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, operations)
+	for i, v := range variants {
+		wg.Add(1)
+		go func(i int, v Variant) {
+			defer wg.Done()
+			_, errs[i] = r.Relay(ctx, v)
+		}(i, v)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("relay %d: %v", i, err)
+		}
+	}
+	sent := chain.submitted()
+	if len(sent) != operations {
+		t.Fatalf("%d transactions submitted, want %d", len(sent), operations)
+	}
+	seen := map[uint64]bool{}
+	for _, tx := range sent {
+		if seen[tx.Nonce()] {
+			t.Fatalf("nonce %d was used twice", tx.Nonce())
+		}
+		seen[tx.Nonce()] = true
+	}
+}
+
+// Signing concurrently on one intent must not produce two variants where one
+// would do: the loser would only burn its relayer's gas.
+func TestConcurrentSigningReusesOneVariant(t *testing.T) {
+	ctx := context.Background()
+	r, store, _ := newTestRail(t)
+	id := testID(1)
+	if err := r.PrepareTransfer(ctx, id, addr(2), big.NewInt(10)); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := r.Sign(ctx, id, big.NewInt(1), addr(3), time.Hour); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	stored, err := store.Variants(r.ref(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("%d variants signed for one intent, want 1", len(stored))
 	}
 }

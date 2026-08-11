@@ -12,9 +12,7 @@ import (
 	"github.com/daios-ai/juice-rail/go/rail"
 )
 
-// testDomain is the domain every store in these tests serves.
-var testDomain = rail.DomainKey(big.NewInt(31337),
-	common.HexToAddress("0x0000000000000000000000000000000000001001"))
+const testDomain = "31337:0x00000000000000000000000000000000000000a1"
 
 func open(t *testing.T) *Store {
 	t.Helper()
@@ -26,286 +24,305 @@ func open(t *testing.T) *Store {
 	return s
 }
 
+func addr(n byte) common.Address {
+	var a common.Address
+	a[19] = n
+	return a
+}
+
 func id(n byte) rail.ID {
-	var out rail.ID
-	out[31] = n
-	return out
+	var v rail.ID
+	v[31] = n
+	return v
 }
 
-func terms(amount int64) rail.Terms {
-	return rail.Terms{
-		Kind:    rail.KindDeposit,
-		Account: common.HexToAddress("0x00000000000000000000000000000000000000a1"),
-		Amount:  big.NewInt(amount),
+func ref(account, identifier byte) rail.Ref {
+	return rail.Ref{Account: addr(account), ID: id(identifier)}
+}
+
+func terms(kind rail.Kind, account, party byte, amount int64) rail.Terms {
+	return rail.Terms{Kind: kind, Account: addr(account), Party: addr(party), Amount: big.NewInt(amount)}
+}
+
+func variant(kind rail.Kind, account, party byte, amount, fee int64, validBefore uint64) rail.Variant {
+	v := rail.Variant{
+		Terms:       terms(kind, account, party, amount),
+		ID:          id(1),
+		Fee:         big.NewInt(fee),
+		Relayer:     addr(9),
+		ValidBefore: validBefore,
+		TermsSig:    make([]byte, 65),
 	}
+	for i := range v.TermsSig {
+		v.TermsSig[i] = byte(i)
+	}
+	if kind == rail.KindDeposit {
+		v.AuthSig = make([]byte, 65)
+	}
+	return v
 }
 
-func TestIntentIsWriteOnce(t *testing.T) {
-	s := open(t)
+func TestOpenBindsOneDomain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rail.db")
 
-	if err := s.PutIntent(id(1), rail.Intent{Terms: terms(100), FromBlock: 7}); err != nil {
+	s, err := Open(path, testDomain)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PutIntent(id(1), rail.Intent{Terms: terms(100), FromBlock: 99}); err != nil {
-		t.Fatalf("identical terms must be accepted: %v", err)
+	s.Close()
+
+	again, err := Open(path, testDomain)
+	if err != nil {
+		t.Fatalf("reopening the same domain must work: %v", err)
 	}
-	if err := s.PutIntent(id(1), rail.Intent{Terms: terms(101)}); !errors.Is(err, rail.ErrIntentConflict) {
+	again.Close()
+
+	if _, err := Open(path, "1:0x00000000000000000000000000000000000000ff"); !errors.Is(err, rail.ErrWrongDomain) {
+		t.Fatalf("want ErrWrongDomain, got %v", err)
+	}
+	if _, err := Open(path, ""); err == nil {
+		t.Fatal("a store must know its domain")
+	}
+}
+
+func TestIntentsAreWriteOnce(t *testing.T) {
+	s := open(t)
+	r := ref(1, 1)
+	in := rail.Intent{Terms: terms(rail.KindTransfer, 1, 2, 10), FromBlock: 42}
+
+	if err := s.PutIntent(r, in); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutIntent(r, in); err != nil {
+		t.Fatalf("identical terms must be accepted again: %v", err)
+	}
+	other := in
+	other.Terms.Party = addr(3)
+	if err := s.PutIntent(r, other); !errors.Is(err, rail.ErrIntentConflict) {
 		t.Fatalf("want ErrIntentConflict, got %v", err)
 	}
 
-	got, ok, err := s.Intent(id(1))
+	got, ok, err := s.Intent(r)
 	if err != nil || !ok {
-		t.Fatalf("read back: %v %v", ok, err)
+		t.Fatalf("intent missing: %v %v", ok, err)
 	}
-	if !got.Terms.Equal(terms(100)) || got.FromBlock != 7 {
-		t.Fatalf("the first record must survive, got %+v", got)
+	if !got.Terms.Equal(in.Terms) || got.FromBlock != 42 {
+		t.Fatalf("read back %+v, want %+v", got, in)
 	}
-}
-
-func TestIntentRoundTripsEveryKind(t *testing.T) {
-	s := open(t)
-	party := common.HexToAddress("0x00000000000000000000000000000000000000b2")
-
-	for i, want := range []rail.Terms{
-		{Kind: rail.KindDeposit, Account: party, Amount: big.NewInt(1)},
-		{Kind: rail.KindSettle, Account: party, Party: party, Amount: big.NewInt(2)},
-		{Kind: rail.KindWithdraw, Account: party, Party: party,
-			Amount: new(big.Int).Lsh(big.NewInt(1), 200)}, // large amounts survive
-	} {
-		key := id(byte(10 + i))
-		if err := s.PutIntent(key, rail.Intent{Terms: want, FromBlock: uint64(i)}); err != nil {
-			t.Fatal(err)
-		}
-		got, ok, err := s.Intent(key)
-		if err != nil || !ok || !got.Terms.Equal(want) {
-			t.Fatalf("%s round trip: %+v %v %v", want.Kind, got.Terms, ok, err)
-		}
+	if _, ok, _ := s.Intent(ref(1, 2)); ok {
+		t.Fatal("an unrecorded identifier must be unknown")
 	}
 }
 
-func TestMissingRecordsReportAbsence(t *testing.T) {
+// The contract scopes identifiers to the account that binds them, and so does
+// the store: one store may serve several accounts on one domain.
+func TestRecordsAreScopedToTheirAccount(t *testing.T) {
 	s := open(t)
+	alice, bob := ref(1, 1), ref(2, 1)
 
-	if _, ok, err := s.Intent(id(99)); ok || err != nil {
-		t.Fatalf("absent intent: %v %v", ok, err)
+	if err := s.PutIntent(alice, rail.Intent{Terms: terms(rail.KindTransfer, 1, 3, 10)}); err != nil {
+		t.Fatal(err)
 	}
-	if _, ok, err := s.Fact(id(99)); ok || err != nil {
-		t.Fatalf("absent fact: %v %v", ok, err)
+	if err := s.PutIntent(bob, rail.Intent{Terms: terms(rail.KindWithdraw, 2, 4, 77)}); err != nil {
+		t.Fatalf("the same identifier under another account must not conflict: %v", err)
 	}
-	if ops, err := s.SignedOps(id(99)); err != nil || len(ops) != 0 {
-		t.Fatalf("absent attempts: %v %v", ops, err)
+
+	got, _, _ := s.Intent(bob)
+	if got.Terms.Amount.Int64() != 77 || got.Terms.Account != addr(2) {
+		t.Fatalf("accounts alias: %+v", got.Terms)
 	}
-	if abandoned, err := s.Abandoned(id(99)); err != nil || abandoned {
-		t.Fatalf("absent abandonment: %v %v", abandoned, err)
+	if err := s.Abandon(alice); err != nil {
+		t.Fatal(err)
+	}
+	if abandoned, _ := s.Abandoned(bob); abandoned {
+		t.Fatal("abandonment crossed accounts")
+	}
+	if err := s.PutFact(alice, rail.Fact{Executed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.Fact(bob); ok {
+		t.Fatal("facts crossed accounts")
 	}
 }
 
-func TestAttemptsAppendInOrderAndSurvive(t *testing.T) {
+func TestVariantsAppendUntilAbandoned(t *testing.T) {
 	s := open(t)
+	r := ref(1, 1)
 
-	for i := 1; i <= 3; i++ {
-		op := rail.SignedOp{
-			Op:         []byte{byte(i)},
-			Hash:       common.BigToHash(big.NewInt(int64(i))),
-			Nonce:      big.NewInt(int64(i)),
-			ValidUntil: uint64(1000 + i),
-		}
-		if err := s.AppendSignedOp(id(2), op); err != nil {
+	for _, deadline := range []uint64{100, 200, 300} {
+		if err := s.AppendVariant(r, variant(rail.KindTransfer, 1, 2, 10, 1, deadline)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ops, err := s.SignedOps(id(2))
-	if err != nil || len(ops) != 3 {
-		t.Fatalf("want 3 attempts, got %d (%v)", len(ops), err)
+	got, err := s.Variants(r)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for i, op := range ops {
-		if op.ValidUntil != uint64(1001+i) || op.Op[0] != byte(i+1) ||
-			op.Nonce.Int64() != int64(i+1) || op.Hash != common.BigToHash(big.NewInt(int64(i+1))) {
-			t.Fatalf("attempt %d round trip: %+v", i, op)
+	if len(got) != 3 {
+		t.Fatalf("want 3 variants, got %d", len(got))
+	}
+	for i, want := range []uint64{100, 200, 300} {
+		if got[i].ValidBefore != want {
+			t.Fatalf("variant %d has deadline %d, want %d: order is the record", i, got[i].ValidBefore, want)
 		}
 	}
-}
+	if string(got[0].TermsSig) != string(variant(rail.KindTransfer, 1, 2, 10, 1, 100).TermsSig) {
+		t.Fatal("the signature did not survive the round trip")
+	}
 
-// Signing must be refused once the identifier is abandoned, so that releasing
-// funds can never race a fresh signature.
-func TestAppendIsRefusedAfterAbandon(t *testing.T) {
-	s := open(t)
-
-	if err := s.AppendSignedOp(id(3), rail.SignedOp{Op: []byte{1}, ValidUntil: 10}); err != nil {
+	if err := s.Abandon(r); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Abandon(id(3)); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Abandon(id(3)); err != nil {
-		t.Fatalf("abandonment must be idempotent: %v", err)
-	}
-	if err := s.AppendSignedOp(id(3), rail.SignedOp{Op: []byte{2}, ValidUntil: 20}); !errors.Is(err, rail.ErrAbandoned) {
+	if err := s.AppendVariant(r, variant(rail.KindTransfer, 1, 2, 10, 1, 400)); !errors.Is(err, rail.ErrAbandoned) {
 		t.Fatalf("want ErrAbandoned, got %v", err)
 	}
-
-	ops, _ := s.SignedOps(id(3))
-	if len(ops) != 1 {
-		t.Fatalf("the refused attempt must not be stored, got %d", len(ops))
+	if after, _ := s.Variants(r); len(after) != 3 {
+		t.Fatalf("abandonment killed signed variants: %d remain", len(after))
 	}
 }
 
-// Whichever of the two wins, the outcome is safe: either the attempt is
-// recorded before abandonment, or it is refused.
+func TestDepositVariantsKeepTheirAuthorisation(t *testing.T) {
+	s := open(t)
+	r := ref(1, 1)
+	v := variant(rail.KindDeposit, 1, 2, 10, 1, 100)
+	for i := range v.AuthSig {
+		v.AuthSig[i] = byte(255 - i)
+	}
+	if err := s.AppendVariant(r, v); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Variants(r)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("read back %d variants (%v)", len(got), err)
+	}
+	if string(got[0].AuthSig) != string(v.AuthSig) {
+		t.Fatal("a deposit without its token authorisation can pull nothing")
+	}
+}
+
+func TestFactsAreCachedOnce(t *testing.T) {
+	s := open(t)
+	r := ref(1, 1)
+	first := rail.Fact{TxHash: common.HexToHash("0xaa"), BlockNumber: 5, Executed: true}
+	if err := s.PutFact(r, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutFact(r, rail.Fact{TxHash: common.HexToHash("0xbb"), BlockNumber: 9}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.Fact(r)
+	if err != nil || !ok {
+		t.Fatal("fact missing")
+	}
+	if got != first {
+		t.Fatalf("a finalized fact changed: %+v, want %+v", got, first)
+	}
+}
+
+func TestPendingListsWhatIsStillWatched(t *testing.T) {
+	s := open(t)
+	a, b := ref(1, 1), ref(1, 2)
+	for _, r := range []rail.Ref{a, b} {
+		if err := s.PutIntent(r, rail.Intent{Terms: terms(rail.KindTransfer, 1, 2, 1)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.PutFact(a, rail.Fact{Executed: true}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.Pending()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0] != b {
+		t.Fatalf("pending %v, want just %v", pending, b)
+	}
+}
+
+// A release must never race a fresh signature: either the variant is recorded
+// before abandonment, or it is refused.
 func TestConcurrentAppendAndAbandonStaySerialisable(t *testing.T) {
 	s := open(t)
-	var wg sync.WaitGroup
-	var appendErr error
+	r := ref(1, 1)
 
-	wg.Add(2)
+	var wg sync.WaitGroup
+	appended := make([]error, 20)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			appended[i] = s.AppendVariant(r, variant(rail.KindTransfer, 1, 2, 10, 1, uint64(100+i)))
+		}(i)
+	}
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		appendErr = s.AppendSignedOp(id(4), rail.SignedOp{Op: []byte{1}, ValidUntil: 10})
-	}()
-	go func() {
-		defer wg.Done()
-		if err := s.Abandon(id(4)); err != nil {
+		if err := s.Abandon(r); err != nil {
 			t.Error(err)
 		}
 	}()
 	wg.Wait()
 
-	ops, err := s.SignedOps(id(4))
+	stored, err := s.Variants(r)
 	if err != nil {
 		t.Fatal(err)
 	}
-	abandoned, err := s.Abandoned(id(4))
-	if err != nil || !abandoned {
-		t.Fatalf("abandonment must hold: %v %v", abandoned, err)
-	}
-	if appendErr == nil && len(ops) != 1 {
-		t.Fatalf("a successful append must be stored, got %d attempts", len(ops))
-	}
-	if appendErr != nil {
-		if !errors.Is(appendErr, rail.ErrAbandoned) {
-			t.Fatalf("a refused append must say why: %v", appendErr)
+	refused := 0
+	for _, err := range appended {
+		if errors.Is(err, rail.ErrAbandoned) {
+			refused++
+		} else if err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(ops) != 0 {
-			t.Fatalf("a refused append must store nothing, got %d", len(ops))
-		}
+	}
+	if len(stored)+refused != 20 {
+		t.Fatalf("%d recorded and %d refused, want 20 in total", len(stored), refused)
+	}
+	if abandoned, _ := s.Abandoned(r); !abandoned {
+		t.Fatal("abandonment was lost")
+	}
+	// Nothing may be recorded after the abandonment took effect.
+	if err := s.AppendVariant(r, variant(rail.KindTransfer, 1, 2, 10, 1, 999)); !errors.Is(err, rail.ErrAbandoned) {
+		t.Fatalf("want ErrAbandoned, got %v", err)
 	}
 }
 
-func TestFactsCannotChange(t *testing.T) {
+// Recording the same intent twice must always succeed, including when two
+// goroutines do it at once: retry is the recovery protocol, so a retry that
+// agrees with what is already recorded can never be an error.
+func TestConcurrentPutIntentIsIdempotent(t *testing.T) {
 	s := open(t)
-	first := rail.Fact{TxHash: common.BigToHash(big.NewInt(1)), BlockNumber: 5, Executed: true}
+	r := ref(1, 1)
+	in := rail.Intent{Terms: terms(rail.KindTransfer, 1, 2, 10), FromBlock: 42}
 
-	if err := s.PutFact(id(5), first); err != nil {
-		t.Fatal(err)
+	var wg sync.WaitGroup
+	errs := make([]error, 20)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = s.PutIntent(r, in)
+		}(i)
 	}
-	if err := s.PutFact(id(5), rail.Fact{TxHash: common.BigToHash(big.NewInt(2)), Executed: false}); err != nil {
-		t.Fatalf("a repeat write must be ignored, not fail: %v", err)
-	}
-	got, ok, err := s.Fact(id(5))
-	if err != nil || !ok || got != first {
-		t.Fatalf("a finalized fact must never change, got %+v", got)
-	}
-}
+	wg.Wait()
 
-func TestPendingListsOnlyUnsettledIntents(t *testing.T) {
-	s := open(t)
-	for i := byte(1); i <= 3; i++ {
-		if err := s.PutIntent(id(20+i), rail.Intent{Terms: terms(int64(i))}); err != nil {
-			t.Fatal(err)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("recording identical terms was refused (%d): %v", i, err)
 		}
 	}
-	if err := s.PutFact(id(22), rail.Fact{Executed: true}); err != nil {
-		t.Fatal(err)
+	got, ok, err := s.Intent(r)
+	if err != nil || !ok {
+		t.Fatalf("intent missing: %v %v", ok, err)
 	}
-
-	pending, err := s.PendingIDs()
-	if err != nil {
-		t.Fatal(err)
+	if !got.Terms.Equal(in.Terms) || got.FromBlock != 42 {
+		t.Fatalf("read back %+v, want %+v", got, in)
 	}
-	if len(pending) != 2 || pending[0] != id(21) || pending[1] != id(23) {
-		t.Fatalf("pending = %v", pending)
-	}
-}
-
-// A restart must find every decision exactly as it was left.
-func TestRecordsSurviveReopening(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "rail.db")
-	first, err := Open(path, testDomain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := first.PutIntent(id(6), rail.Intent{Terms: terms(500), FromBlock: 42}); err != nil {
-		t.Fatal(err)
-	}
-	if err := first.AppendSignedOp(id(6), rail.SignedOp{Op: []byte("signed"), Nonce: big.NewInt(3), ValidUntil: 77}); err != nil {
-		t.Fatal(err)
-	}
-	if err := first.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	second, err := Open(path, testDomain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.Close()
-
-	in, ok, err := second.Intent(id(6))
-	if err != nil || !ok || in.FromBlock != 42 || !in.Terms.Equal(terms(500)) {
-		t.Fatalf("intent did not survive: %+v %v %v", in, ok, err)
-	}
-	ops, err := second.SignedOps(id(6))
-	if err != nil || len(ops) != 1 || string(ops[0].Op) != "signed" || ops[0].ValidUntil != 77 {
-		t.Fatalf("attempt did not survive: %+v %v", ops, err)
+	// Conflicting terms are still refused, whoever asks.
+	other := in
+	other.Terms.Amount = big.NewInt(11)
+	if err := s.PutIntent(r, other); !errors.Is(err, rail.ErrIntentConflict) {
+		t.Fatalf("want ErrIntentConflict, got %v", err)
 	}
 }
-
-// A store serves one domain. Identifiers are unique only within a domain, so
-// reopening a store for another must fail rather than alias two ledgers.
-func TestStoreRefusesAnotherDomain(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "rail.db")
-
-	first, err := Open(path, testDomain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := first.PutIntent(id(1), rail.Intent{Terms: terms(100)}); err != nil {
-		t.Fatal(err)
-	}
-	if err := first.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Same chain, a second deployment on it: a different domain.
-	other := rail.DomainKey(big.NewInt(31337),
-		common.HexToAddress("0x0000000000000000000000000000000000009999"))
-	if _, err := Open(path, other); !errors.Is(err, rail.ErrWrongDomain) {
-		t.Fatalf("a different deployment: want ErrWrongDomain, got %v", err)
-	}
-
-	// Same deployment address, a different chain: also a different domain.
-	otherChain := rail.DomainKey(big.NewInt(42161),
-		common.HexToAddress("0x0000000000000000000000000000000000001001"))
-	if _, err := Open(path, otherChain); !errors.Is(err, rail.ErrWrongDomain) {
-		t.Fatalf("a different chain: want ErrWrongDomain, got %v", err)
-	}
-
-	// The original domain still opens, with its records intact.
-	again, err := Open(path, testDomain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer again.Close()
-	if _, ok, _ := again.Intent(id(1)); !ok {
-		t.Fatal("the records must survive")
-	}
-}
-
-func TestStoreRequiresADomain(t *testing.T) {
-	if _, err := Open(filepath.Join(t.TempDir(), "rail.db"), ""); err == nil {
-		t.Fatal("a store must name the domain it serves")
-	}
-}
-
-// The store satisfies the interface the rail depends on.
-var _ rail.Store = (*Store)(nil)

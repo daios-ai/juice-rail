@@ -16,7 +16,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -29,12 +28,16 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
-// anvil's first account, which funds every deployment and the shim.
 const (
-	deployerKeyHex     = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-	railKeyHex         = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
-	paymasterKeyHex    = "5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
-	otherRailKeyHex    = "7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6"
+	// anvil's first two accounts, which arrive with ether: one deploys, one
+	// relays. Everyone else is a fresh key and holds no ether at all.
+	deployerKeyHex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+	relayerKeyHex  = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+	relayer2KeyHex = "5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+
+	aliceKeyHex = "1111111111111111111111111111111111111111111111111111111111111111"
+	bobKeyHex   = "2222222222222222222222222222222222222222222222222222222222222222"
+
 	defaultChainID     = 31337
 	slotsInAnEpoch     = 1
 	blocksToFinalise   = 3 // finalized lags the head by two blocks
@@ -42,7 +45,7 @@ const (
 )
 
 // harness is one isolated fixture: its own chain, its own deployment, its own
-// store. Nothing is shared between stories.
+// stores. Nothing is shared between stories.
 type harness struct {
 	t          *testing.T
 	dir        string
@@ -50,9 +53,7 @@ type harness struct {
 	client     *ethclient.Client
 	chainID    *big.Int
 	addr       map[string]common.Address
-	shim       *shim
 	configPath string
-	txMu       sync.Mutex
 }
 
 func newHarness(t *testing.T) *harness {
@@ -60,7 +61,7 @@ func newHarness(t *testing.T) *harness {
 }
 
 // newHarnessOn builds a fixture on a named chain. A second chain is a second
-// settlement domain: separate balances, separate identifiers, no bridging.
+// domain: separate balances, separate identifiers, no bridging.
 func newHarnessOn(t *testing.T, chain int64) *harness {
 	t.Helper()
 	dir := t.TempDir()
@@ -68,7 +69,6 @@ func newHarnessOn(t *testing.T, chain int64) *harness {
 
 	h.startAnvil()
 	h.deployAll()
-	h.shim = newShim(t, h)
 	h.writeConfig()
 	// Setup is done: from here the test decides when blocks appear.
 	h.rpcCall("evm_setAutomine", false)
@@ -153,7 +153,15 @@ func (h *harness) finalise() {
 	h.mine(blocksToFinalise)
 }
 
-// advanceTime moves chain time forward, which is what expires a sponsorship.
+// settleAndFinalise mines the pending work and pushes it past finality.
+func (h *harness) settleAndFinalise() {
+	h.t.Helper()
+	h.mine(1)
+	h.finalise()
+}
+
+// advanceTime moves chain time forward, which is what expires a signed
+// operation.
 func (h *harness) advanceTime(d time.Duration) {
 	h.t.Helper()
 	h.rpcCall("evm_increaseTime", int64(d.Seconds()))
@@ -164,31 +172,20 @@ func (h *harness) advanceTime(d time.Duration) {
 
 func creationCode(t *testing.T, name string) []byte {
 	t.Helper()
-	// Our own contracts and the EntryPoint are compiled from source.
-	forgeArtifact := filepath.Join("..", "contracts", "out", name+".sol", name+".json")
-	if raw, err := os.ReadFile(forgeArtifact); err == nil {
-		var a struct {
-			Bytecode struct {
-				Object string `json:"object"`
-			} `json:"bytecode"`
-		}
-		if err := json.Unmarshal(raw, &a); err != nil {
-			t.Fatal(err)
-		}
-		return common.FromHex(a.Bytecode.Object)
-	}
-	// The Safe suite is used as published, never recompiled.
-	raw, err := os.ReadFile(filepath.Join("..", "deployments", "bytecode", name+".json"))
+	artifact := filepath.Join("..", "contracts", "out", name+".sol", name+".json")
+	raw, err := os.ReadFile(artifact)
 	if err != nil {
 		t.Fatalf("no creation code for %s: %v (run `forge build` in contracts/)", name, err)
 	}
-	var vendored struct {
-		Bytecode string `json:"bytecode"`
+	var a struct {
+		Bytecode struct {
+			Object string `json:"object"`
+		} `json:"bytecode"`
 	}
-	if err := json.Unmarshal(raw, &vendored); err != nil {
+	if err := json.Unmarshal(raw, &a); err != nil {
 		t.Fatal(err)
 	}
-	return common.FromHex(vendored.Bytecode)
+	return common.FromHex(a.Bytecode.Object)
 }
 
 func (h *harness) deploy(name string, args ...[]byte) common.Address {
@@ -205,42 +202,16 @@ func (h *harness) deploy(name string, args ...[]byte) common.Address {
 	return receipt.ContractAddress
 }
 
+// deployAll stands up one domain. There is nothing else to deploy and nobody
+// to fund: the rail is adminless and needs no operator infrastructure.
 func (h *harness) deployAll() {
 	h.t.Helper()
-	entryPoint := h.deploy("EntryPoint")
 	token := h.deploy("MockUSDT0")
-	railAddr := h.deploy("JuiceRail", wordOf(token))
-
-	h.deploy("Safe")
-	h.deploy("SafeProxyFactory")
-	h.deploy("MultiSendCallOnly")
-	h.deploy("SafeModuleSetup")
-	h.deploy("Safe4337Module", wordOf(entryPoint))
-
-	paymasterSigner := crypto.PubkeyToAddress(mustKey(h.t, paymasterKeyHex).PublicKey)
-	h.deploy("JuiceRailPaymaster",
-		wordOf(entryPoint), wordOf(railAddr), wordOf(token),
-		wordOf(h.addr["MultiSendCallOnly"]), wordOf(paymasterSigner))
-
-	// Story 1: the operator funds sponsorship. Account holders never hold ETH.
-	h.fundPaymaster(big.NewInt(5e18))
-}
-
-func (h *harness) fundPaymaster(amount *big.Int) {
-	h.t.Helper()
-	data := mustPack(h.t, entryPointABI, "depositTo", h.addr["JuiceRailPaymaster"])
-	to := h.addr["EntryPoint"]
-	h.sendTx(&to, data, amount)
-}
-
-// paymasterDeposit is the operator's remaining sponsorship budget.
-func (h *harness) paymasterDeposit() *big.Int {
-	h.t.Helper()
-	return h.callUint(h.addr["EntryPoint"], entryPointABI, "balanceOf", h.addr["JuiceRailPaymaster"])
+	h.deploy("JuiceRail", wordOf(token))
 }
 
 // mintTo funds an address with tokens, standing in for money arriving from
-// outside. It works on an account that does not exist on chain yet.
+// outside.
 func (h *harness) mintTo(account common.Address, amount *big.Int) {
 	h.t.Helper()
 	to := h.addr["MockUSDT0"]
@@ -294,43 +265,6 @@ func (h *harness) sendTx(to *common.Address, data []byte, value *big.Int) *types
 	}
 }
 
-// sendTxAsync submits without waiting: with automatic mining off, the story
-// decides when the transaction lands.
-func (h *harness) sendTxAsync(to *common.Address, data []byte) {
-	h.t.Helper()
-	ctx := context.Background()
-	key := mustKey(h.t, deployerKeyHex)
-	from := crypto.PubkeyToAddress(key.PublicKey)
-
-	h.txMu.Lock()
-	defer h.txMu.Unlock()
-
-	nonce, err := h.client.PendingNonceAt(ctx, from)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	gasPrice, err := h.client.SuggestGasPrice(ctx)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	tx := types.NewTx(&types.LegacyTx{
-		Nonce: nonce, To: to, Value: new(big.Int), Gas: 15_000_000,
-		GasPrice: new(big.Int).Mul(gasPrice, big.NewInt(2)), Data: data,
-	})
-	signed, err := types.SignTx(tx, types.NewEIP155Signer(h.chainID), key)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	if err := h.client.SendTransaction(ctx, signed); err != nil {
-		h.t.Fatalf("submit bundle: %v", err)
-	}
-}
-
-// beneficiary receives the bundler's gas refund.
-func (h *harness) beneficiary() common.Address {
-	return crypto.PubkeyToAddress(mustKey(h.t, deployerKeyHex).PublicKey)
-}
-
 // --- reads used as an independent oracle ---
 
 func (h *harness) callUint(to common.Address, parsed abi.ABI, method string, args ...any) *big.Int {
@@ -357,19 +291,38 @@ func (h *harness) heldByRail() *big.Int {
 	return h.tokenBalance(h.addr["JuiceRail"])
 }
 
-// railEvents counts the rail events carrying an identifier, so a story can
-// assert that money moved exactly once.
-func (h *harness) railEvents(id string) int {
+func (h *harness) etherBalance(account common.Address) *big.Int {
+	h.t.Helper()
+	balance, err := h.client.BalanceAt(context.Background(), account, nil)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return balance
+}
+
+// assertNoEther is the persona requirement, checked rather than assumed:
+// ordinary participants never hold the chain's native currency.
+func (h *harness) assertNoEther(who string, account common.Address) {
+	h.t.Helper()
+	if balance := h.etherBalance(account); balance.Sign() != 0 {
+		h.t.Fatalf("%s holds %s wei: participants must never need gas", who, balance)
+	}
+}
+
+// railEvents counts the rail events an account emitted under an identifier, so
+// a story can assert that money moved exactly once.
+func (h *harness) railEvents(account common.Address, id string) int {
 	h.t.Helper()
 	logs, err := h.client.FilterLogs(context.Background(), ethereum.FilterQuery{
 		FromBlock: big.NewInt(0),
 		Addresses: []common.Address{h.addr["JuiceRail"]},
 		Topics: [][]common.Hash{
 			{
-				crypto.Keccak256Hash([]byte("Deposited(bytes32,address,uint256)")),
-				crypto.Keccak256Hash([]byte("Settled(bytes32,address,address,uint256)")),
-				crypto.Keccak256Hash([]byte("Withdrawn(bytes32,address,address,uint256)")),
+				crypto.Keccak256Hash([]byte("Deposited(address,bytes32,address,uint256,uint256,address,uint256)")),
+				crypto.Keccak256Hash([]byte("Transferred(address,bytes32,address,uint256,uint256,address,uint256)")),
+				crypto.Keccak256Hash([]byte("Withdrawn(address,bytes32,address,uint256,uint256,address,uint256)")),
 			},
+			{common.BytesToHash(account.Bytes())},
 			{common.HexToHash(id)},
 		},
 	})
@@ -379,25 +332,29 @@ func (h *harness) railEvents(id string) int {
 	return len(logs)
 }
 
+// assertSolvent is the invariant every story ends on: every balance is backed.
+func (h *harness) assertSolvent(accounts ...common.Address) {
+	h.t.Helper()
+	sum := new(big.Int)
+	for _, a := range accounts {
+		sum.Add(sum, h.railBalance(a))
+	}
+	if held := h.heldByRail(); held.Cmp(sum) < 0 {
+		h.t.Fatalf("held %s < sum of balances %s", held, sum)
+	}
+}
+
 // --- the railctl binary ---
 
 func (h *harness) writeConfig() {
 	h.t.Helper()
 	cfg := map[string]any{
-		"name":              "local",
-		"chainId":           h.chainID.Uint64(),
-		"rpc":               h.rpcURL,
-		"bundler":           h.shim.url,
-		"rail":              h.addr["JuiceRail"].Hex(),
-		"token":             h.addr["MockUSDT0"].Hex(),
-		"paymaster":         h.addr["JuiceRailPaymaster"].Hex(),
-		"entryPoint":        h.addr["EntryPoint"].Hex(),
-		"safeSingleton":     h.addr["Safe"].Hex(),
-		"safeProxyFactory":  h.addr["SafeProxyFactory"].Hex(),
-		"safeModule":        h.addr["Safe4337Module"].Hex(),
-		"safeModuleSetup":   h.addr["SafeModuleSetup"].Hex(),
-		"multiSendCallOnly": h.addr["MultiSendCallOnly"].Hex(),
-		"finality":          "finalized",
+		"name":     "local",
+		"chainId":  h.chainID.Uint64(),
+		"rpc":      h.rpcURL,
+		"rail":     h.addr["JuiceRail"].Hex(),
+		"token":    h.addr["MockUSDT0"].Hex(),
+		"finality": "finalized",
 	}
 	raw, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -425,7 +382,7 @@ func TestMain(m *testing.M) {
 	build.Dir = ".."
 	if out, err := build.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "build railctl: %v\n%s", err, out)
-		os.Remove(dir)
+		os.RemoveAll(dir)
 		os.Exit(1)
 	}
 
@@ -434,32 +391,24 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func buildRailctl(t *testing.T) string {
-	t.Helper()
-	return railctlBinary
-}
-
-// operator is one railctl user: its own key and its own store.
-type operator struct {
+// participant is one railctl user: its own key and its own store.
+type participant struct {
 	h     *harness
 	name  string
 	key   string
 	store string
 }
 
-func (h *harness) operator(name, key string) *operator {
-	return &operator{h: h, name: name, key: key, store: filepath.Join(h.dir, name+".db")}
+func (h *harness) participant(name, key string) *participant {
+	return &participant{h: h, name: name, key: key, store: filepath.Join(h.dir, name+".db")}
 }
 
 // run drives the binary and returns its stdout. Diagnostics stay on stderr.
-func (o *operator) run(args ...string) (string, error) {
-	o.h.t.Helper()
-	cmd := exec.Command(buildRailctl(o.h.t),
-		append([]string{"-config", o.h.configPath, "-store", o.store}, args...)...)
-	cmd.Env = append(os.Environ(),
-		"RAILCTL_KEY="+o.key,
-		"RAILCTL_PAYMASTER_KEY="+paymasterKeyHex,
-	)
+func (p *participant) run(args ...string) (string, error) {
+	p.h.t.Helper()
+	cmd := exec.Command(railctlBinary,
+		append([]string{"-config", p.h.configPath, "-store", p.store}, args...)...)
+	cmd.Env = append(os.Environ(), "RAILCTL_KEY="+p.key)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -469,64 +418,69 @@ func (o *operator) run(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func (o *operator) mustRun(args ...string) string {
-	o.h.t.Helper()
-	out, err := o.run(args...)
+func (p *participant) mustRun(args ...string) string {
+	p.h.t.Helper()
+	out, err := p.run(args...)
 	if err != nil {
-		o.h.t.Fatalf("%v", err)
+		p.h.t.Fatalf("%v", err)
 	}
 	return out
 }
 
-// account is the operator's counterfactual address on this domain.
-func (o *operator) account() common.Address {
-	o.h.t.Helper()
-	return common.HexToAddress(o.mustRun("account"))
+// mustFail runs a command that must be refused, and returns the refusal.
+func (p *participant) mustFail(args ...string) string {
+	p.h.t.Helper()
+	out, err := p.run(args...)
+	if err == nil {
+		p.h.t.Fatalf("railctl %s was expected to fail, got %q", strings.Join(args, " "), out)
+	}
+	return err.Error()
 }
 
-// status reads the identifier's status through the binary.
-func (o *operator) status(id string) string {
-	o.h.t.Helper()
+// account is the participant's address: an ordinary Ethereum address.
+func (p *participant) account() common.Address {
+	p.h.t.Helper()
+	return common.HexToAddress(p.mustRun("account"))
+}
+
+// status reads the intent's status through the binary.
+func (p *participant) status(id string) string {
+	p.h.t.Helper()
 	var reply struct {
 		Status string `json:"status"`
 	}
-	out := o.mustRun("-json", "status", id)
+	out := p.mustRun("-json", "status", id)
 	if err := json.Unmarshal([]byte(out), &reply); err != nil {
-		o.h.t.Fatalf("status output %q: %v", out, err)
+		p.h.t.Fatalf("status output %q: %v", out, err)
 	}
 	return reply.Status
 }
 
-// settleAndFinalise mines the pending work and pushes it past finality.
-func (h *harness) settleAndFinalise() {
-	h.t.Helper()
-	h.mine(1)
-	h.finalise()
+// sign writes a signed operation for a relayer to carry, and returns its path.
+func (p *participant) sign(kind, id string, party common.Address, amount, fee int64, relayer common.Address, extra ...string) string {
+	p.h.t.Helper()
+	// One file per (signer, kind, intent, relayer): re-signing for the same
+	// relayer must land on the same file, so a story can see that the variant
+	// was reused rather than replaced.
+	path := filepath.Join(p.h.dir, fmt.Sprintf("%s-%s-%s-%s.json", p.name, kind, id[:10], relayer.Hex()[:10]))
+	args := append([]string{
+		"-fee", fmt.Sprint(fee),
+		"-relayer", relayer.Hex(),
+		"-out", path,
+	}, extra...)
+	args = append(args, kind, id, party.Hex(), fmt.Sprint(amount))
+	p.mustRun(args...)
+	return path
 }
 
 // --- shared ABIs ---
 
 var (
-	entryPointABI = mustABI(`[
-      {"type":"function","name":"depositTo","inputs":[{"name":"account","type":"address"}],"stateMutability":"payable"},
-      {"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address"}],"outputs":[{"type":"uint256"}],"stateMutability":"view"},
-      {"type":"function","name":"handleOps","inputs":[
-        {"name":"ops","type":"tuple[]","components":[
-          {"name":"sender","type":"address"},{"name":"nonce","type":"uint256"},
-          {"name":"initCode","type":"bytes"},{"name":"callData","type":"bytes"},
-          {"name":"accountGasLimits","type":"bytes32"},{"name":"preVerificationGas","type":"uint256"},
-          {"name":"gasFees","type":"bytes32"},{"name":"paymasterAndData","type":"bytes"},
-          {"name":"signature","type":"bytes"}]},
-        {"name":"beneficiary","type":"address"}]}]`)
-
 	railABI = mustABI(`[
-      {"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address"}],"outputs":[{"type":"uint256"}],"stateMutability":"view"},
-      {"type":"function","name":"deposit","inputs":[
-        {"name":"id","type":"bytes32"},{"name":"account","type":"address"},{"name":"amount","type":"uint256"}]}]`)
+      {"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address"}],"outputs":[{"type":"uint256"}],"stateMutability":"view"}]`)
 
 	tokenABI = mustABI(`[
       {"type":"function","name":"mint","inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]},
-      {"type":"function","name":"approve","inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[{"type":"bool"}]},
       {"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address"}],"outputs":[{"type":"uint256"}],"stateMutability":"view"}]`)
 )
 
@@ -556,6 +510,11 @@ func mustKey(t *testing.T, hex string) *ecdsa.PrivateKey {
 	return key
 }
 
+func addressOf(t *testing.T, hexKey string) common.Address {
+	t.Helper()
+	return crypto.PubkeyToAddress(mustKey(t, hexKey).PublicKey)
+}
+
 // wordOf encodes an address as one ABI word, for constructor arguments.
 func wordOf(a common.Address) []byte {
 	var w [32]byte
@@ -565,4 +524,16 @@ func wordOf(a common.Address) []byte {
 
 func tokens(n int64) *big.Int {
 	return big.NewInt(n * tokenDecimalsScale)
+}
+
+// freshID is an unguessable identifier, which is what a host would issue.
+func freshID(t *testing.T) string {
+	t.Helper()
+	var b [32]byte
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(b[:], crypto.Keccak256(crypto.FromECDSA(key)))
+	return "0x" + common.Bytes2Hex(b[:])
 }

@@ -9,25 +9,13 @@ import (
 )
 
 // Intent is the write-ahead record: the decision to pursue an operation,
-// durable before any signature exists.
+// durable before any signature exists. It fixes the core terms, so every
+// variant of the intent moves the same money between the same parties.
 type Intent struct {
 	Terms Terms
 	// FromBlock bounds the log search for this intent's event. It is the chain
 	// head observed when the intent was recorded.
 	FromBlock uint64
-}
-
-// SignedOp is one signed attempt. Attempts are appended, never edited: a new
-// one may be signed only once the previous can never execute.
-type SignedOp struct {
-	// Op is the marshalled user operation, opaque to the store.
-	Op []byte
-	// Hash identifies the operation to the bundler.
-	Hash common.Hash
-	// Nonce is the EntryPoint nonce this attempt consumes.
-	Nonce *big.Int
-	// ValidUntil is when its gas sponsorship expires.
-	ValidUntil uint64
 }
 
 // Fact records a finalized chain outcome. Finalized facts cannot change, so
@@ -41,7 +29,7 @@ type Fact struct {
 
 var (
 	// ErrIntentConflict is returned when an identifier is already recorded
-	// with different terms.
+	// with different core terms.
 	ErrIntentConflict = errors.New("rail: identifier already recorded with different terms")
 	// ErrAbandoned is returned when signing is attempted after abandonment.
 	ErrAbandoned = errors.New("rail: identifier abandoned")
@@ -63,40 +51,43 @@ func DomainKey(chainID *big.Int, railAddr common.Address) string {
 	return chain + ":" + strings.ToLower(railAddr.Hex())
 }
 
-// Store holds the rail's durable state: four records per identifier, each
+// Store holds the rail's durable state: four records per intent, each
 // write-once or append-only. Nothing is ever edited in place.
 //
-// The rail's own decisions — intent, signed ops, abandonment — are
+// The rail's own decisions — intent, signed variants, abandonment — are
 // authoritative. Facts are cached observations of a chain that has finalized.
+//
+// Records are keyed by (account, identifier), exactly as the contract keys its
+// bindings, so one store may serve several accounts on one domain.
 //
 // A store serves exactly one domain. Identifiers are only unique within a
 // domain, so a store shared between two would alias their intents and their
 // finalized facts. An implementation must bind itself to a domain and refuse
 // to be reopened under another; see DomainKey.
 type Store interface {
-	// PutIntent records an intent. Recording the same terms twice succeeds;
-	// different terms return ErrIntentConflict.
-	PutIntent(id ID, in Intent) error
-	Intent(id ID) (Intent, bool, error)
+	// PutIntent records an intent. Recording the same core terms twice
+	// succeeds; different terms return ErrIntentConflict.
+	PutIntent(ref Ref, in Intent) error
+	Intent(ref Ref) (Intent, bool, error)
 
-	// AppendSignedOp appends an attempt. It must fail with ErrAbandoned if the
-	// identifier is abandoned, atomically with respect to Abandon, so that a
+	// AppendVariant appends a signed variant. It must fail with ErrAbandoned if
+	// the intent is abandoned, atomically with respect to Abandon, so that a
 	// release can never race a fresh signature.
-	AppendSignedOp(id ID, op SignedOp) error
-	SignedOps(id ID) ([]SignedOp, error)
+	AppendVariant(ref Ref, v Variant) error
+	Variants(ref Ref) ([]Variant, error)
 
-	// Abandon records "never sign this identifier again". It is idempotent and
+	// Abandon records "never sign this intent again". It is idempotent and
 	// stops future signing; it kills nothing already signed.
-	Abandon(id ID) error
-	Abandoned(id ID) (bool, error)
+	Abandon(ref Ref) error
+	Abandoned(ref Ref) (bool, error)
 
 	// PutFact caches a finalized outcome. Idempotent: facts cannot change.
-	PutFact(id ID, f Fact) error
-	Fact(id ID) (Fact, bool, error)
+	PutFact(ref Ref, f Fact) error
+	Fact(ref Ref) (Fact, bool, error)
 
-	// PendingIDs lists identifiers with no cached fact, so a restart can
-	// resume watching them.
-	PendingIDs() ([]ID, error)
+	// Pending lists intents with no cached fact, so a restart can resume
+	// watching them.
+	Pending() ([]Ref, error)
 
 	Close() error
 }

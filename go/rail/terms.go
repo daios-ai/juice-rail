@@ -1,16 +1,16 @@
-// Package rail is the domain-bound money rail: intents, their durable
-// records, and status derived from finalized chain facts.
+// Package rail is the domain-bound money rail: intents, the signed variants
+// that may carry them, and status derived from finalized chain facts.
 package rail
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // Kind is the operation kind. It is part of the terms hash, so one identifier
@@ -19,7 +19,7 @@ type Kind uint8
 
 const (
 	KindDeposit  Kind = 1
-	KindSettle   Kind = 2
+	KindTransfer Kind = 2
 	KindWithdraw Kind = 3
 )
 
@@ -27,8 +27,8 @@ func (k Kind) String() string {
 	switch k {
 	case KindDeposit:
 		return "deposit"
-	case KindSettle:
-		return "settle"
+	case KindTransfer:
+		return "transfer"
 	case KindWithdraw:
 		return "withdraw"
 	default:
@@ -36,8 +36,21 @@ func (k Kind) String() string {
 	}
 }
 
-// ID identifies one intent. It is unguessable until submission and is the
-// host's idempotency key.
+// ParseKind reads a kind by name.
+func ParseKind(s string) (Kind, error) {
+	switch s {
+	case "deposit":
+		return KindDeposit, nil
+	case "transfer":
+		return KindTransfer, nil
+	case "withdraw":
+		return KindWithdraw, nil
+	default:
+		return 0, fmt.Errorf("%w: unknown kind %q", errBadTerms, s)
+	}
+}
+
+// ID identifies one intent of one account. It is the host's idempotency key.
 type ID [32]byte
 
 func (id ID) String() string { return "0x" + hex.EncodeToString(id[:]) }
@@ -56,12 +69,23 @@ func ParseID(s string) (ID, error) {
 	return ID(b), nil
 }
 
-// Terms are everything that identifies an intent besides its ID. Account and
-// Party carry the parties of each kind:
+// Ref identifies one intent: the authorising account and its identifier.
+// Identifiers are scoped to the account that binds them, on chain and here, so
+// no account can burn another's.
+type Ref struct {
+	Account common.Address
+	ID      ID
+}
+
+func (r Ref) String() string { return r.Account.Hex() + "/" + r.ID.String() }
+
+// Terms are the core of an intent: what money moves, and between whom. They
+// are fixed by the write-ahead record and shared by every variant of the
+// intent, which differ only in relayer, fee and deadline.
 //
-//	deposit   Account is credited;      Party is unused
-//	settle    Account is the debtor;    Party is the creditor
-//	withdraw  Account is the debtor;    Party receives the tokens
+//	deposit   Account pays;    Party is credited
+//	transfer  Account pays;    Party is credited
+//	withdraw  Account pays;    Party receives the tokens outside the rail
 type Terms struct {
 	Kind    Kind
 	Account common.Address
@@ -74,7 +98,7 @@ var errBadTerms = errors.New("terms: invalid")
 // Validate reports whether the terms are well formed.
 func (t Terms) Validate() error {
 	switch t.Kind {
-	case KindDeposit, KindSettle, KindWithdraw:
+	case KindDeposit, KindTransfer, KindWithdraw:
 	default:
 		return fmt.Errorf("%w: unknown kind %d", errBadTerms, uint8(t.Kind))
 	}
@@ -87,11 +111,8 @@ func (t Terms) Validate() error {
 	if t.Account == (common.Address{}) {
 		return fmt.Errorf("%w: account must be set", errBadTerms)
 	}
-	if t.Kind != KindDeposit && t.Party == (common.Address{}) {
+	if t.Party == (common.Address{}) {
 		return fmt.Errorf("%w: party must be set", errBadTerms)
-	}
-	if t.Kind == KindDeposit && t.Party != (common.Address{}) {
-		return fmt.Errorf("%w: deposit has no party", errBadTerms)
 	}
 	return nil
 }
@@ -103,110 +124,211 @@ func (t Terms) Equal(o Terms) bool {
 }
 
 func (t Terms) String() string {
-	if t.Kind == KindDeposit {
-		return fmt.Sprintf("%s %s -> %s", t.Kind, t.Amount, t.Account.Hex())
-	}
 	return fmt.Sprintf("%s %s %s -> %s", t.Kind, t.Amount, t.Account.Hex(), t.Party.Hex())
 }
 
-// Hash is the terms hash the contract binds an identifier to. The preimages
-// are fixed by the specification:
+// Variant is one signed way to carry an intent: its core terms plus the
+// relayer that may submit it, the fee that relayer earns, and the deadline
+// past which it can never execute.
 //
-//	deposit   abi.encode(1, chainid, rail, account, amount)
-//	settle    abi.encode(2, chainid, rail, debtor, creditor, amount)
-//	withdraw  abi.encode(3, chainid, rail, account, to, amount)
-func (t Terms) Hash(chainID *big.Int, railAddr common.Address) common.Hash {
-	words := [][]byte{
-		word(big.NewInt(int64(t.Kind))),
-		word(chainID),
-		word(new(big.Int).SetBytes(railAddr.Bytes())),
-		word(new(big.Int).SetBytes(t.Account.Bytes())),
-	}
-	if t.Kind != KindDeposit {
-		words = append(words, word(new(big.Int).SetBytes(t.Party.Bytes())))
-	}
-	words = append(words, word(t.Amount))
-
-	var buf []byte
-	for _, w := range words {
-		buf = append(buf, w...)
-	}
-	return crypto.Keccak256Hash(buf)
+// An intent may have several variants. The contract executes at most one, so
+// replacing an unresponsive relayer needs no waiting: sign another.
+type Variant struct {
+	Terms
+	ID          ID
+	Fee         *big.Int
+	Relayer     common.Address
+	ValidBefore uint64
+	// TermsSig is the account holder's EIP-712 signature over the terms.
+	TermsSig []byte
+	// AuthSig is the payer's EIP-3009 authorisation, deposits only.
+	AuthSig []byte
 }
 
-// word left-pads a non-negative integer into one 32-byte ABI word.
-func word(v *big.Int) []byte {
-	var w [32]byte
-	if v != nil {
-		v.FillBytes(w[:])
+// Ref is the intent this variant carries.
+func (v Variant) Ref() Ref { return Ref{Account: v.Account, ID: v.ID} }
+
+// Total is what the account pays: the amount plus the relay fee.
+func (v Variant) Total() *big.Int { return new(big.Int).Add(v.Amount, v.Fee) }
+
+// Validate reports whether the variant is well formed and signed.
+func (v Variant) Validate() error {
+	if err := v.Terms.Validate(); err != nil {
+		return err
 	}
-	return w[:]
+	if v.Fee == nil || v.Fee.Sign() < 0 {
+		return fmt.Errorf("%w: fee must be non-negative", errBadTerms)
+	}
+	if v.Relayer == (common.Address{}) {
+		return fmt.Errorf("%w: relayer must be set", errBadTerms)
+	}
+	if v.ValidBefore == 0 {
+		return fmt.Errorf("%w: deadline must be set", errBadTerms)
+	}
+	if len(v.TermsSig) != 65 {
+		return fmt.Errorf("%w: terms signature is %d bytes, want 65", errBadTerms, len(v.TermsSig))
+	}
+	if v.Kind == KindDeposit && len(v.AuthSig) != 65 {
+		return fmt.Errorf("%w: deposit authorisation is %d bytes, want 65", errBadTerms, len(v.AuthSig))
+	}
+	if v.Kind != KindDeposit && len(v.AuthSig) != 0 {
+		return fmt.Errorf("%w: only a deposit carries a token authorisation", errBadTerms)
+	}
+	return nil
 }
 
-// CallData builds the account call for this intent. There are exactly three
-// shapes, and the paymaster sponsors exactly these: a plain call to the rail
-// for settle and withdraw, and the approve+deposit pair delegatecalled into
-// MultiSendCallOnly so the approval originates from the account.
-func (t Terms) CallData(id ID, d Domain) ([]byte, error) {
-	if err := t.Validate(); err != nil {
+// Envelope is the wire form of a signed variant: the variant and the domain it
+// was signed for. The domain is already inside the signature, so this only
+// lets a relayer refuse the wrong domain by name instead of reporting an
+// unexplained bad signature.
+type Envelope struct {
+	ChainID *big.Int
+	Rail    common.Address
+	Variant Variant
+}
+
+// wireVariant is the canonical form of a signed variant: the same bytes go to
+// a relayer and into the durable record, so there is one format to be right
+// about.
+type wireVariant struct {
+	Kind        string `json:"kind"`
+	ID          string `json:"id"`
+	Account     string `json:"account"`
+	Party       string `json:"party"`
+	Amount      string `json:"amount"`
+	Fee         string `json:"fee"`
+	Relayer     string `json:"relayer"`
+	ValidBefore uint64 `json:"validBefore"`
+	TermsSig    string `json:"termsSig"`
+	AuthSig     string `json:"authSig,omitempty"`
+}
+
+type wireEnvelope struct {
+	ChainID string `json:"chainId"`
+	Rail    string `json:"rail"`
+	wireVariant
+}
+
+func toWire(v Variant) wireVariant {
+	w := wireVariant{
+		Kind:        v.Kind.String(),
+		ID:          v.ID.String(),
+		Account:     v.Account.Hex(),
+		Party:       v.Party.Hex(),
+		Amount:      v.Amount.String(),
+		Fee:         v.Fee.String(),
+		Relayer:     v.Relayer.Hex(),
+		ValidBefore: v.ValidBefore,
+		TermsSig:    hexutilBytes(v.TermsSig),
+	}
+	if len(v.AuthSig) != 0 {
+		w.AuthSig = hexutilBytes(v.AuthSig)
+	}
+	return w
+}
+
+// MarshalVariant writes the durable record of a signed variant. A Store keeps
+// these bytes opaque.
+func MarshalVariant(v Variant) ([]byte, error) {
+	if err := v.Validate(); err != nil {
 		return nil, err
 	}
-	switch t.Kind {
-	case KindSettle:
-		inner, err := railABI.Pack("settle", id, t.Party, t.Amount)
-		if err != nil {
-			return nil, err
-		}
-		return execute(d.Rail, inner, 0)
+	return json.Marshal(toWire(v))
+}
 
-	case KindWithdraw:
-		inner, err := railABI.Pack("withdraw", id, t.Party, t.Amount)
-		if err != nil {
-			return nil, err
-		}
-		return execute(d.Rail, inner, 0)
-
-	case KindDeposit:
-		approve, err := erc20ABI.Pack("approve", d.Rail, t.Amount)
-		if err != nil {
-			return nil, err
-		}
-		deposit, err := railABI.Pack("deposit", id, t.Account, t.Amount)
-		if err != nil {
-			return nil, err
-		}
-		batch, err := multiSendABI.Pack("multiSend", concat(
-			subCall(d.Token, approve),
-			subCall(d.Rail, deposit),
-		))
-		if err != nil {
-			return nil, err
-		}
-		return execute(d.Contracts.MultiSendCallOnly, batch, 1)
-
-	default:
-		return nil, fmt.Errorf("%w: unknown kind", errBadTerms)
+// UnmarshalVariant reads back a durable record.
+func UnmarshalVariant(raw []byte) (Variant, error) {
+	var w wireVariant
+	if err := json.Unmarshal(raw, &w); err != nil {
+		return Variant{}, fmt.Errorf("decode variant: %w", err)
 	}
+	return fromWire(w)
 }
 
-func execute(to common.Address, data []byte, operation uint8) ([]byte, error) {
-	return moduleABI.Pack("executeUserOp", to, big.NewInt(0), data, operation)
-}
-
-// subCall is one MultiSend record: plain call, no value.
-func subCall(to common.Address, data []byte) []byte {
-	out := make([]byte, 0, 85+len(data))
-	out = append(out, 0) // operation: call
-	out = append(out, to.Bytes()...)
-	out = append(out, word(big.NewInt(0))...)
-	out = append(out, word(big.NewInt(int64(len(data))))...)
-	return append(out, data...)
-}
-
-func concat(parts ...[]byte) []byte {
-	var out []byte
-	for _, p := range parts {
-		out = append(out, p...)
+// EncodeVariant writes a signed variant for a relayer to carry.
+func EncodeVariant(d Domain, v Variant) ([]byte, error) {
+	if err := v.Validate(); err != nil {
+		return nil, err
 	}
-	return out
+	return json.MarshalIndent(wireEnvelope{
+		ChainID:     d.ChainID.String(),
+		Rail:        d.Rail.Hex(),
+		wireVariant: toWire(v),
+	}, "", "  ")
+}
+
+// DecodeVariant reads a signed variant. Nothing is trusted: the caller must
+// still check the domain and recover the signature.
+func DecodeVariant(raw []byte) (Envelope, error) {
+	var w wireEnvelope
+	if err := json.Unmarshal(raw, &w); err != nil {
+		return Envelope{}, fmt.Errorf("decode variant: %w", err)
+	}
+	chainID, ok := new(big.Int).SetString(w.ChainID, 10)
+	if !ok {
+		return Envelope{}, fmt.Errorf("decode variant: bad chain id %q", w.ChainID)
+	}
+	v, err := fromWire(w.wireVariant)
+	if err != nil {
+		return Envelope{}, err
+	}
+	return Envelope{ChainID: chainID, Rail: common.HexToAddress(w.Rail), Variant: v}, nil
+}
+
+func fromWire(w wireVariant) (Variant, error) {
+	kind, err := ParseKind(w.Kind)
+	if err != nil {
+		return Variant{}, err
+	}
+	id, err := ParseID(w.ID)
+	if err != nil {
+		return Variant{}, err
+	}
+	amount, ok := new(big.Int).SetString(w.Amount, 10)
+	if !ok {
+		return Variant{}, fmt.Errorf("decode variant: bad amount %q", w.Amount)
+	}
+	fee, ok := new(big.Int).SetString(w.Fee, 10)
+	if !ok {
+		return Variant{}, fmt.Errorf("decode variant: bad fee %q", w.Fee)
+	}
+	termsSig, err := parseHexBytes(w.TermsSig)
+	if err != nil {
+		return Variant{}, err
+	}
+	authSig, err := parseHexBytes(w.AuthSig)
+	if err != nil {
+		return Variant{}, err
+	}
+	v := Variant{
+		Terms: Terms{
+			Kind:    kind,
+			Account: common.HexToAddress(w.Account),
+			Party:   common.HexToAddress(w.Party),
+			Amount:  amount,
+		},
+		ID:          id,
+		Fee:         fee,
+		Relayer:     common.HexToAddress(w.Relayer),
+		ValidBefore: w.ValidBefore,
+		TermsSig:    termsSig,
+		AuthSig:     authSig,
+	}
+	if err := v.Validate(); err != nil {
+		return Variant{}, err
+	}
+	return v, nil
+}
+
+func hexutilBytes(b []byte) string { return "0x" + hex.EncodeToString(b) }
+
+func parseHexBytes(s string) ([]byte, error) {
+	if s == "" {
+		return nil, nil
+	}
+	b, err := hex.DecodeString(strings.TrimPrefix(s, "0x"))
+	if err != nil {
+		return nil, fmt.Errorf("decode variant: bad signature: %w", err)
+	}
+	return b, nil
 }

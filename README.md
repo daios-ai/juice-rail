@@ -1,7 +1,7 @@
 # juice-rail
 
 juice-rail moves real money between accounts on an Ethereum-style network.
-The money is **USDT0**, a token pegged to the dollar. juice-rail is three
+The money is a dollar-pegged token such as **USDT0**. juice-rail is three
 things: a **vault**, a program deployed on the network that holds the tokens
 and keeps one balance per account; a **Go library** that drives the vault;
 and a small command-line tool, **`railctl`**, for using it by hand.
@@ -15,24 +15,43 @@ the network itself, not anyone's server.
 Your money is always in one of two pockets: tokens sitting **at your own
 address**, like cash in hand, or a balance **inside the vault**, like money
 on account. It moves three ways: **deposit** (your hand → your vault
-balance), **settle** (your vault balance → another participant's),
-**withdraw** (vault → any address's hand).
+balance), **transfer** (your vault balance → another participant's),
+**withdraw** (vault → any address you name).
+
+Your account is just an ordinary Ethereum address. You sign what you want to
+happen; someone else delivers it.
+
+**Nobody is in charge.** Every movement of money needs the account holder's
+signature and nothing else. The vault has no owner, no administrator and no
+off switch. Whoever deployed it has no more power over your balance than a
+stranger does.
+
+**You never need ETH.** Delivering a signed instruction to the network costs
+the network's own fuel, ETH, which ordinary participants should never have to
+think about. So a **relayer** pays that cost and is paid back in the token
+itself, out of the same operation. You name your relayer and agree its fee
+before you sign; nobody else can carry your instruction, and nobody can
+change what it says. Being a relayer takes no permission and no contract: it
+is anyone holding ETH who is willing to be named.
+
+```text
+you sign        amount, who gets it, the fee, and which relayer may deliver it
+relayer pays    the network fee, in ETH, up front
+the vault pays  the relayer its fee, in tokens, out of your balance
+```
 
 Every operation carries an identifier the vault remembers: repeating an
 operation is a safe no-op, and reusing its identifier for different terms is
 refused. No money can ever move twice.
 
-A running vault has one **operator** and any number of **participants**. The
-operator deploys the vault once and pays everyone's network fees through a
-sponsor contract called the **paymaster**. Participants therefore never need
-ETH, the network's fuel; only the operator holds it. A participant joins
-with one key they make themselves and two things the operator gives them.
-
 `requirements.md` is the specification. This file is how to run it.
 
 ## Install
 
-Everyone installs the same way, operator and participants alike.
+```sh
+git clone --recurse-submodules https://github.com/daios-ai/juice-rail
+cd juice-rail && go build ./...
+```
 
 | | |
 |---|---|
@@ -40,384 +59,206 @@ Everyone installs the same way, operator and participants alike.
 | [Foundry](https://getfoundry.sh) | contract tools: `forge`, `cast`, `anvil` |
 | [Halmos](https://github.com/a16z/halmos) | optional, only for the formal proofs |
 
-```sh
-git clone --recurse-submodules https://github.com/daios-ai/juice-rail
-cd juice-rail && go build ./...
-```
-
 Already cloned without submodules? `git submodule update --init --recursive`.
 
 ## Try it locally first
 
-You need no real network, no real money, no account with any provider. This
-command creates a pretend network on your machine, puts the vault and
-paymaster on it, and acts out six scenarios between accounts with fake
-money: a deposit, a payment from one account to another, a withdrawal, a
+You need no real network, no real money and no account with any provider.
+This command creates a pretend network on your machine, puts the vault on it,
+and acts out the six scenarios: a deposit, a payment, a withdrawal, a
 repeated operation, a reused identifier with different terms, and a crash
 halfway through.
 
 ```sh
+cd contracts && forge build && cd ..
 go test -tags integration ./integration-tests/
 ```
 
-Everything runs and checks itself in about a minute. Nothing leaves your
-machine. The scenario code, `integration-tests/stories_test.go`, shows
-`railctl` doing everything it can do. It is worth a skim once you reach
-"Use railctl" below.
+It finishes in seconds and checks itself. Nothing leaves your machine. The
+scenario code, `integration-tests/stories_test.go`, shows `railctl` doing
+everything it can do.
 
-## Run a domain (you are the operator)
+## A local playground
 
-A **domain** is one deployed vault, named by (network, vault address).
-Domains are independent: separate balances, separate identifiers, nothing
-crosses between them. Each domain has exactly one operator. If someone
-already operates the vault you want to use, skip to "Join a domain".
-
-The vault runs on one of two networks: **Arbitrum Sepolia**, a test network
-where everything is free and fake, or **Arbitrum One**, the real one. The
-steps are the same on both; the differences are marked.
-
-These steps drive `forge` and `cast`, which read the environment, and an
-`export`ed value dies with its terminal. Save each one as you go and reload it
-in a new terminal:
+To drive it by hand, start a pretend network and leave it running:
 
 ```sh
-echo 'export TOKEN=0x...' >> ~/deploy.env   # save as you go
-source ~/deploy.env                         # reload later
+anvil
 ```
 
-This is for deployment only. `railctl` itself needs no exports; see
-"Use railctl".
-
-### 1. Create the two operator keys
-
-Run this command twice:
-
-```sh
-cast wallet new
-```
-
-Each run prints a fresh pair like this:
-
-```text
-Address:     0xAB12...      an account number; fine to share
-Private key: 0x59C6...      the secret that controls it; save it
-                            like a bank password
-```
-
-Save both pairs. The first is your **operator key**: it sets everything up
-and holds the fee money. The second is your **sponsorship key**: fees are
-paid only for operations it approves, and you hand it to every participant.
-That's safe: at worst it can spend your fee tank, never anyone's money.
-
-Addresses are 42 characters, private keys 66. An "invalid length" error
-later means you swapped them.
-
-```sh
-export OPERATOR_KEY=<Private key line of the FIRST pair>
-export PAYMASTER_SIGNER=<Address line of the SECOND pair>
-```
-
-### 2. Get your two web links
-
-The vault lives on a public network of computers. Talking to it takes two
-services, rented as personal web links; free plans are enough.
-
-**The reading link** is how this software reads the network. Go to
-[alchemy.com](https://alchemy.com), sign up with an email, and create an
-"app", choosing the network **Arbitrum Sepolia** (test) or **Arbitrum One**
-(real). Copy the link the dashboard hands you; it looks like
-
-```text
-https://arb-sepolia.g.alchemy.com/v2/<long code>
-```
-
-**The carrying link** is how it sends in fee-free operations. Go to
-[pimlico.io](https://pimlico.io), sign up, and copy your link. It looks like
-
-```text
-https://api.pimlico.io/v2/421614/rpc?apikey=<long code>
-```
-
-The number in the middle is the network: `421614` is the test network,
-`42161` the real one.
-
-Two companies because carriers set their own conditions: Alchemy's demands
-a returnable 0.1 ETH deposit (step 5), Pimlico's currently doesn't. Nothing
-depends on either; switching providers is one line in the domain file.
-
-```sh
-export RPC=<the reading link>   # both links go into a file in step 6
-```
-
-### 3. Put fee money on the operator address
-
-Fees are paid in ETH from your operator address (the Address line of the
-first pair). Setup fees are under 0.001; the real costs are the step-5 fee
-tank (0.01 to start) and the 0.1 deposit if your carrier wants one.
-
-Test network ETH is free from faucets, which all demand proof you're
-human. The generous ones (Alchemy's) want ~$5 of real ETH parked at your
-address on Ethereum mainnet and give ~0.1 per day;
-[l2faucet.com/arbitrum](https://l2faucet.com/arbitrum) just checks your
-device and gives less. Faucets need only your Address; anything asking for
-a private key is a scam.
-
-Real network: withdraw ETH from any exchange to the operator address,
-network **Arbitrum One**, the same way you would send USDT.
-
-### 4. Test network only: create a play token
-
-There is no real USDT0 on the test network, so deploy the mock, a play
-version of the token that anyone may mint:
+In another terminal, deploy a play token and the vault. `anvil` prints ten
+funded test keys; use the first as `$DEPLOYER_KEY`.
 
 ```sh
 cd contracts
-forge create test/MockUSDT0.sol:MockUSDT0 --rpc-url $RPC --private-key $OPERATOR_KEY --broadcast
-export TOKEN=<the "Deployed to" address it prints>
+export RPC=http://127.0.0.1:8545
+forge create test/MockUSDT0.sol:MockUSDT0 --rpc-url $RPC --private-key $DEPLOYER_KEY --broadcast
+export TOKEN=<address it printed>
+forge script script/Deploy.s.sol --rpc-url $RPC --private-key $DEPLOYER_KEY --broadcast
 ```
 
-Without `--broadcast` forge only rehearses and deploys nothing.
+Write the domain file, which is all anyone needs to join:
 
-Real network: `export TOKEN=<the canonical USDT0 address>`, nothing to
-deploy.
+```json
+{
+  "name": "local",
+  "chainId": 31337,
+  "rpc": "http://127.0.0.1:8545",
+  "rail": "<the JuiceRail address>",
+  "token": "<the MockUSDT0 address>",
+  "finality": "finalized"
+}
+```
 
-### 5. Deploy the vault and paymaster
+Create two participants and one relayer. `init` makes a fresh key, checks the
+token can carry signed authorisations, and remembers everything under
+`~/.juice-rail`:
+
+```sh
+railctl init alice local.json
+railctl init bob   local.json
+railctl -key-file anvil-second-key.txt init relayer local.json
+```
+
+Flags go before the command, always.
+
+The relayer is the only one that needs ETH, because it is the only one that
+talks to the network directly. Alice and Bob need none, ever.
+
+Give Alice some play money and put it in the vault. She signs; the relayer
+delivers:
+
+```sh
+cast send $TOKEN "mint(address,uint256)" $(railctl -profile alice account) 100000000 \
+  --rpc-url $RPC --private-key $DEPLOYER_KEY
+
+ID=0x$(openssl rand -hex 32)
+railctl -profile alice -fee 20000 -relayer $(railctl -profile relayer account) \
+        -out deposit.json deposit $ID $(railctl -profile alice account) 60000000
+railctl -profile relayer relay deposit.json
+```
+
+Amounts are in the token's smallest unit; USDT0 has six decimals, so
+`60000000` is 60.00 and the fee above is 0.02.
+
+`deposit.json` is the signed instruction. It is worth reading: it says exactly
+what will happen and who may make it happen.
+
+Check on it, pay Bob, and let Bob take his money out to any address:
+
+```sh
+railctl -profile alice status $ID          # pending until the network finalises it
+railctl -profile alice balance
+
+PAY=0x$(openssl rand -hex 32)
+railctl -profile alice -fee 10000 -relayer $(railctl -profile relayer account) \
+        -out pay.json transfer $PAY $(railctl -profile bob account) 10000000
+railctl -profile relayer relay pay.json
+
+OUT=0x$(openssl rand -hex 32)
+railctl -profile bob -fee 10000 -relayer $(railctl -profile relayer account) \
+        -out out.json withdraw $OUT 0xSomeExchangeDepositAddress 5000000
+railctl -profile relayer relay out.json
+```
+
+On a real network, `pending` turns into `confirmed` by itself once the
+network finalises the block, which on Arbitrum takes about twenty minutes.
+That wait is the safety model working, not a hang: money that is only
+probably yours is not yours.
+
+## Going live
+
+The same steps, minus the play token. Deploy the vault against the real
+stablecoin:
 
 ```sh
 cd contracts
-export ENTRY_POINT=0x0000000071727De22E5E9d8BAf0edAc6f37da032
-export MULTI_SEND=0x9641d764fc13c8B624c04430C7356C1C7C8102e2
-export PAYMASTER_DEPOSIT=100000000000000000   # 0.1 ETH into the paymaster's fee tank
-
-forge script script/Deploy.s.sol --rpc-url $RPC --private-key $OPERATOR_KEY --broadcast
+TOKEN=0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9 \
+  forge script script/Deploy.s.sol --rpc-url $RPC --private-key $YOUR_KEY --broadcast
 ```
 
-`ENTRY_POINT` and `MULTI_SEND` are public infrastructure contracts, the same
-addresses on every network; take them as given. The script prints two new
-addresses, the vault (called `rail` from here on) and the paymaster, and
-fills the paymaster's fee tank with the deposit.
+Fill `rail` into a copy of `deployments/arbitrum-one.json` and hand that file
+to whoever is joining. That is the whole of it: no operator contract, no
+sponsorship to fund, nothing to keep running. Deploying costs you gas once,
+and afterwards you have no power over anyone's money, including your own
+users'.
 
-If submissions later fail with "stake/unstake delay too low", your carrier
-wants the 0.1 ETH deposit:
-
-```sh
-cast send <paymaster address> "addStake(uint32)" 86400 --value 100000000000000000
-```
-
-It is never spent and reclaimable after a one-day wait.
-
-### 6. Publish the domain file
-
-Copy `deployments/arbitrum-sepolia.json` (or `arbitrum-one.json`) to a
-place **outside this repository**, for example `~/.juice-rail/`, and fill
-the blanks there: `rpc` is your reading link, `bundler` your carrying link,
-`token` from step 4, `rail` and `paymaster` from step 5. The remaining
-addresses are already correct: public infrastructure, never deployed from
-this repository.
-
-The filled file contains your account codes; that's why it lives outside
-the repository.
-
-Leave `finality` as `"finalized"`. It means a fact is reported only once the
-network can never take it back; weaker settings are refused at startup.
-
-The domain is live. Give each participant your filled domain file and the
-sponsorship key.
-
-## Join a domain (you are a participant)
-
-You deploy nothing and never touch ETH. You need:
-
-1. **From the operator:** the domain file and the sponsorship key.
-2. **Made by you, kept by you:** nothing. `railctl init` below makes your key.
+Someone has to relay. That can be you, a participant, or several unrelated
+parties competing; every operation names the one that may carry it. A relayer
+needs ETH at its address, and earns its quoted fee in tokens when the
+operation executes.
 
 ## Use railctl
 
-Operator and participants use it identically; the operator is just a
-participant who also holds the other keys.
-
-Set up once. Put the sponsorship key in a file first, because a key passed as
-a flag value would be visible to every user on the machine:
-
-```sh
-go build -o railctl ./cmd/railctl
-
-$EDITOR sponsor.key   # paste the sponsorship key the operator gave you
-railctl -sponsor-key-file sponsor.key init alice arbitrum-sepolia.json
-```
-
-That generates your account key, installs the domain, and records `alice` as
-the profile to use. From then on, in any terminal, with nothing exported:
-
-```sh
-railctl balance
-```
-
-It all lives in `~/.juice-rail/`: `config.json` holds domains and profiles,
-`credentials.json` holds keys and nothing else at mode `0600`, and each
-profile gets its own `<profile>.db` of records. Add a second person with
-another `init` (the domain is already installed, so no sponsorship key is
-needed) and pick them with `-profile bob`.
-
-Two conventions worth knowing: flags come before the command, as in
-`railctl -profile bob balance`; and to import an existing key instead of
-generating one, `init` takes `-key-file`.
-
-A first session between two participants, **Alice** and **Bob**, each on
-their own machine with their own setup as above.
-
-Both start the same way:
-
-```sh
-railctl account
-```
-
-It prints your address on this domain. The address exists before anything is
-deployed there, so tokens sent to it are safe from day one. Bob tells Alice
-his address; that is all Alice ever needs to know about Bob.
-
-**Alice puts tokens in her hand**, meaning at her address. Test network:
-mint play money (this uses the operator's setup from "Run a domain", since
-anyone may mint the mock):
-
-```sh
-cast send $TOKEN "mint(address,uint256)" <Alice's railctl address> 1000000000 \
-    --rpc-url $RPC --private-key $OPERATOR_KEY
-```
-
-Real network: transfer USDT0 to her address as to any other.
-
-**Alice deposits**, moving tokens from hand to vault. She makes a fresh
-identifier (32 random bytes) for the operation and moves ten dollars:
-
-```sh
-ID=$(openssl rand -hex 32)
-railctl deposit $ID <Alice's railctl address> 10000000
-railctl status $ID
-```
-
-`status` says `pending` until the network finalizes the operation, about
-20 minutes on a real network. That is the safety model working, not a hang.
-Then it says `confirmed`.
-
-**Alice pays Bob.** One dollar moves from her vault balance to his, under a
-fresh identifier:
-
-```sh
-ID=$(openssl rand -hex 32)
-railctl settle $ID <Bob's address> 1000000
-```
-
-**Bob checks and cashes out.** Once Alice's payment is `confirmed`, on his
-machine:
-
-```sh
-railctl balance                            # his vault balance: 1000000
-ID=$(openssl rand -hex 32)
-railctl withdraw $ID <any address Bob likes> 1000000
-```
-
-Alice and Bob never shared anything but addresses. The vault enforced that
-Alice could only spend her own balance, and Bob can prove he was paid.
-
-All commands:
-
-| Command | What it does |
+| command | what it does |
 |---|---|
-| `railctl init <profile> <domain-file>` | set up a profile once |
-| `railctl account` | your address on this domain |
-| `railctl balance [address]` | vault balance and tokens in hand |
-| `railctl deposit <id> <account> <amount>` | pull tokens from your hand, credit an account's vault balance |
-| `railctl settle <id> <creditor> <amount>` | move vault balance to another participant |
-| `railctl withdraw <id> <to> <amount>` | send tokens from the vault out to any address |
-| `railctl status <id>` | what became of an identifier |
-| `railctl abandon <id>` | stop signing for an identifier |
+| `init <profile> <domain-file>` | join a domain: make a key, remember the settings |
+| `account` | your address on this domain |
+| `balance [address]` | vault balance and tokens in hand |
+| `deposit <id> <account> <amount>` | put tokens into the vault, crediting any account |
+| `transfer <id> <recipient> <amount>` | pay another account inside the vault |
+| `withdraw <id> <destination> <amount>` | send tokens out to any address |
+| `relay <file>` | deliver someone's signed instruction, paying its gas |
+| `status <id>` | what happened to an operation |
+| `abandon <id>` | stop signing anything further for this operation |
 
-Worth knowing:
+Flags go **before** the command. The ones that matter:
 
-- **Amounts are token base units.** USDT0 has six decimals: `1000000` is one
-  dollar.
-- **Identifiers must be fresh and unguessable.** Generate each one as above;
-  never reuse one.
-- **Re-running a command is safe** and reports the same status. Money moves
-  once whatever you do.
-- **One store per profile.** The store file records its domain on first use
-  and refuses to open for another.
-- `-json` gives machine-readable output. `-config`, `-store`, `RAILCTL_KEY`
-  and `RAILCTL_PAYMASTER_KEY` still override the profile, for automation.
+| flag | |
+|---|---|
+| `-fee n` | what the relayer earns, in token units |
+| `-relayer addr` | who may deliver it (default: yourself, which needs ETH) |
+| `-valid-for d` | how long the signature lives (default 1h) |
+| `-out path` | write the signed instruction instead of sending it; `-` for stdout |
+| `-profile name` | act as another identity |
+| `-json` | machine-readable output |
+
+Identifiers must be fresh and unguessable: `openssl rand -hex 32`. Re-running
+any command with the same identifier and the same terms is safe.
+
+State lives in `~/.juice-rail`: `config.json` (domains and profiles),
+`credentials.json` (keys, mode 0600), and one database per profile. For
+automation, `-config`, `-store` and `RAILCTL_KEY` replace all of it, and then
+no home directory is read at all.
 
 ## Operate it
 
-Every identifier is always in exactly one of four states:
-
-| | |
+| status | meaning |
 |---|---|
-| `unknown` | no record of this identifier |
-| `pending` | it may still execute; keep waiting or retry |
-| `confirmed` | it executed and the result can never be reversed |
-| `failed` | it can never execute: the identifier is taken under other terms, or it was abandoned and every attempt is provably dead |
+| `unknown` | never heard of this identifier |
+| `pending` | may still happen; a failed attempt is not a failure |
+| `confirmed` | it happened, and the network can no longer change its mind |
+| `failed` | it can never happen; whatever you reserved can be released |
 
-**Retrying is always safe.** Re-running the same command re-presents the
-same signed operation; the vault refuses a second execution regardless.
+Only `confirmed` and `failed` are final. Retry is always safe, so retry is the
+whole recovery procedure. If a relayer takes your instruction and disappears,
+sign another one naming a different relayer and send that instead; the vault
+executes at most one of them, so there is no waiting and no risk of paying
+twice.
 
-**A stuck operation.** Re-run it. If it must be given up on, `abandon` it.
-But that alone releases nothing: it stops future signing without killing
-what is already signed. Wait for `failed`, which arrives once every attempt
-is provably dead.
-
-**A refused identifier.** If an operation is rejected because its identifier
-is taken under different terms, that identifier is spent. Generate a fresh
-one and retry; no funds are ever at risk from this.
-
-**"Expired" on every retry.** Signed operations expire after five minutes,
-and a replacement is signed only once the network's final record proves the
-old one can never execute, roughly 25 minutes on Arbitrum. Wait, re-run,
-and it proceeds.
-
-**Operators: watch the fee tank.** When the paymaster's deposit runs out,
-the whole domain stops until it is topped up. Nothing is lost (operations
-wait), but nothing moves either. Two numbers to watch:
-
-```sh
-# ETH still in your operator hand
-cast balance --ether <operator address> --rpc-url $RPC
-
-# the fee tank, in wei (divide by 10^18 for ETH)
-cast call 0x0000000071727De22E5E9d8BAf0edAc6f37da032 \
-    "balanceOf(address)(uint256)" <paymaster address> --rpc-url $RPC
-```
-
-**If you embed the library in your own application**, making it a *host*
-(Juice is one), two rules apply: change your own ledger only on `confirmed`,
-and release anything you reserved only on `failed`.
+Check a relayer's fuel with `cast balance <address> --rpc-url $RPC`.
 
 ## Verify the build
 
 ```sh
-go test ./...                                  # library, offline
-go test -race ./...                            # same, under the race detector
-cd contracts && forge test                     # 53 unit, fuzz and invariant tests
-go test -tags integration ./integration-tests/ # the six scenarios, needs anvil
+go build ./... && go test ./...            # library, records, CLI, state machine
+go test -race ./...
+cd contracts && forge test                 # unit, fuzz and invariant tests
+FOUNDRY_PROFILE=deep forge test            # the same, much harder
+halmos --contract JuiceRailSymbolicTest    # nine proofs about the vault
+go test -tags integration ./integration-tests/
 ```
 
-The scenarios are opt-in: without `-tags integration` they do not run, and
-if `anvil` is missing they fail rather than pass quietly.
-
-The formal proofs need Halmos in its own environment, so it cannot disturb
-the rest of your Python setup:
-
-```sh
-python3 -m venv ~/.venvs/halmos && ~/.venvs/halmos/bin/pip install halmos
-cd contracts && ~/.venvs/halmos/bin/halmos --contract JuiceRailSymbolicTest
-```
+The scenario tests are opt-in and fail loudly if `anvil` is missing, rather
+than passing quietly. `go test ./...` needs no network.
 
 ## Layout
 
-```
-contracts/   the vault (JuiceRail), the paymaster, tests, deploy script
-go/rail      the library: intents, terms, status, the store interface
-go/erc4337   operation packing, account derivation, sponsorship, bundler client
-go/sqlite    the shipped store
-cmd/railctl  this tool
-deployments/ per-domain configuration and published contract bytecode
+```text
+contracts/           JuiceRail, its tests, invariants and proofs
+go/rail/             the library: intents, signing, relaying, confirmation
+go/sqlite/           the durable records
+cmd/railctl/         the command-line tool
+deployments/         one file per domain
+integration-tests/   the six scenarios, on a local network
 ```

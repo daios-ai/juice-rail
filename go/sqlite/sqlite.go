@@ -15,32 +15,37 @@ import (
 	"github.com/daios-ai/juice-rail/go/rail"
 )
 
+// Records are keyed by (account, identifier), exactly as the contract keys its
+// bindings, so one store may serve several accounts on one domain.
 const schema = `
 CREATE TABLE IF NOT EXISTS intents (
-  id         BLOB PRIMARY KEY,
-  kind       INTEGER NOT NULL,
   account    BLOB    NOT NULL,
+  id         BLOB    NOT NULL,
+  kind       INTEGER NOT NULL,
   party      BLOB    NOT NULL,
   amount     TEXT    NOT NULL,
-  from_block INTEGER NOT NULL
+  from_block INTEGER NOT NULL,
+  PRIMARY KEY (account, id)
 );
-CREATE TABLE IF NOT EXISTS signed_ops (
-  id          BLOB    NOT NULL,
-  seq         INTEGER NOT NULL,
-  op          BLOB    NOT NULL,
-  hash        BLOB    NOT NULL,
-  nonce       TEXT    NOT NULL,
-  valid_until INTEGER NOT NULL,
-  PRIMARY KEY (id, seq)
+CREATE TABLE IF NOT EXISTS variants (
+  account BLOB    NOT NULL,
+  id      BLOB    NOT NULL,
+  seq     INTEGER NOT NULL,
+  blob    BLOB    NOT NULL,
+  PRIMARY KEY (account, id, seq)
 );
 CREATE TABLE IF NOT EXISTS abandoned (
-  id BLOB PRIMARY KEY
+  account BLOB NOT NULL,
+  id      BLOB NOT NULL,
+  PRIMARY KEY (account, id)
 );
 CREATE TABLE IF NOT EXISTS facts (
-  id           BLOB PRIMARY KEY,
+  account      BLOB    NOT NULL,
+  id           BLOB    NOT NULL,
   tx_hash      BLOB    NOT NULL,
   block_number INTEGER NOT NULL,
-  executed     INTEGER NOT NULL
+  executed     INTEGER NOT NULL,
+  PRIMARY KEY (account, id)
 );
 CREATE TABLE IF NOT EXISTS domain (
   only_row INTEGER PRIMARY KEY CHECK (only_row = 1),
@@ -112,41 +117,72 @@ func bindDomain(db *sql.DB, domain string) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-// PutIntent records the write-ahead intent. Re-recording identical terms is a
-// no-op; different terms are a conflict, never an overwrite.
-func (s *Store) PutIntent(id rail.ID, in rail.Intent) error {
-	existing, ok, err := s.Intent(id)
-	if err != nil {
-		return err
+func key(ref rail.Ref) (account []byte, id []byte) {
+	return ref.Account.Bytes(), ref.ID[:]
+}
+
+// PutIntent records the write-ahead intent. Re-recording identical core terms
+// is a no-op; different terms are a conflict, never an overwrite.
+//
+// The insert comes first and the comparison second, inside one transaction:
+// reading before writing would let two callers recording the same intent both
+// find it absent, and the loser would be refused for terms it agreed with.
+func (s *Store) PutIntent(ref rail.Ref, in rail.Intent) error {
+	if in.Terms.Account != ref.Account {
+		return fmt.Errorf("record intent: terms debit %s, reference is %s", in.Terms.Account, ref.Account)
 	}
-	if ok {
-		if !existing.Terms.Equal(in.Terms) {
-			return fmt.Errorf("%w: %s", rail.ErrIntentConflict, id)
-		}
-		return nil
-	}
-	_, err = s.db.Exec(
-		`INSERT INTO intents (id, kind, account, party, amount, from_block) VALUES (?, ?, ?, ?, ?, ?)`,
-		id[:], int64(in.Terms.Kind), in.Terms.Account.Bytes(), in.Terms.Party.Bytes(),
-		in.Terms.Amount.String(), int64(in.FromBlock),
-	)
+	account, id := key(ref)
+
+	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("record intent: %w", err)
 	}
-	return nil
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(
+		`INSERT OR IGNORE INTO intents (account, id, kind, party, amount, from_block) VALUES (?, ?, ?, ?, ?, ?)`,
+		account, id, int64(in.Terms.Kind), in.Terms.Party.Bytes(), in.Terms.Amount.String(), int64(in.FromBlock),
+	); err != nil {
+		return fmt.Errorf("record intent: %w", err)
+	}
+
+	var (
+		kind   int64
+		party  []byte
+		amount string
+	)
+	if err := tx.QueryRow(
+		`SELECT kind, party, amount FROM intents WHERE account = ? AND id = ?`, account, id,
+	).Scan(&kind, &party, &amount); err != nil {
+		return fmt.Errorf("record intent: %w", err)
+	}
+	value, ok := new(big.Int).SetString(amount, 10)
+	if !ok {
+		return fmt.Errorf("record intent %s: bad amount %q", ref, amount)
+	}
+	recorded := rail.Terms{
+		Kind:    rail.Kind(kind),
+		Account: ref.Account,
+		Party:   common.BytesToAddress(party),
+		Amount:  value,
+	}
+	if !recorded.Equal(in.Terms) {
+		return fmt.Errorf("%w: %s", rail.ErrIntentConflict, ref)
+	}
+	return tx.Commit()
 }
 
-func (s *Store) Intent(id rail.ID) (rail.Intent, bool, error) {
+func (s *Store) Intent(ref rail.Ref) (rail.Intent, bool, error) {
+	account, id := key(ref)
 	var (
 		kind      int64
-		account   []byte
 		party     []byte
 		amount    string
 		fromBlock int64
 	)
 	err := s.db.QueryRow(
-		`SELECT kind, account, party, amount, from_block FROM intents WHERE id = ?`, id[:],
-	).Scan(&kind, &account, &party, &amount, &fromBlock)
+		`SELECT kind, party, amount, from_block FROM intents WHERE account = ? AND id = ?`, account, id,
+	).Scan(&kind, &party, &amount, &fromBlock)
 	if errors.Is(err, sql.ErrNoRows) {
 		return rail.Intent{}, false, nil
 	}
@@ -155,12 +191,12 @@ func (s *Store) Intent(id rail.ID) (rail.Intent, bool, error) {
 	}
 	value, ok := new(big.Int).SetString(amount, 10)
 	if !ok {
-		return rail.Intent{}, false, fmt.Errorf("read intent %s: bad amount %q", id, amount)
+		return rail.Intent{}, false, fmt.Errorf("read intent %s: bad amount %q", ref, amount)
 	}
 	return rail.Intent{
 		Terms: rail.Terms{
 			Kind:    rail.Kind(kind),
-			Account: common.BytesToAddress(account),
+			Account: ref.Account,
 			Party:   common.BytesToAddress(party),
 			Amount:  value,
 		},
@@ -168,87 +204,84 @@ func (s *Store) Intent(id rail.ID) (rail.Intent, bool, error) {
 	}, true, nil
 }
 
-// AppendSignedOp appends an attempt, refusing once the identifier is
+// AppendVariant appends a signed variant, refusing once the intent is
 // abandoned. The check and the insert share one transaction, so a release can
-// never race a fresh signature: either the attempt is recorded before
+// never race a fresh signature: either the variant is recorded before
 // abandonment, or it is refused.
-func (s *Store) AppendSignedOp(id rail.ID, op rail.SignedOp) error {
+func (s *Store) AppendVariant(ref rail.Ref, v rail.Variant) error {
+	blob, err := rail.MarshalVariant(v)
+	if err != nil {
+		return err
+	}
+	account, id := key(ref)
+
 	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("append attempt: %w", err)
+		return fmt.Errorf("append variant: %w", err)
 	}
 	defer tx.Rollback()
 
 	var abandoned int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM abandoned WHERE id = ?`, id[:]).Scan(&abandoned); err != nil {
-		return fmt.Errorf("append attempt: %w", err)
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM abandoned WHERE account = ? AND id = ?`, account, id).Scan(&abandoned); err != nil {
+		return fmt.Errorf("append variant: %w", err)
 	}
 	if abandoned != 0 {
-		return fmt.Errorf("%w: %s", rail.ErrAbandoned, id)
+		return fmt.Errorf("%w: %s", rail.ErrAbandoned, ref)
 	}
 
 	var next int64
 	if err := tx.QueryRow(
-		`SELECT COALESCE(MAX(seq), -1) + 1 FROM signed_ops WHERE id = ?`, id[:],
+		`SELECT COALESCE(MAX(seq), -1) + 1 FROM variants WHERE account = ? AND id = ?`, account, id,
 	).Scan(&next); err != nil {
-		return fmt.Errorf("append attempt: %w", err)
-	}
-	nonce := "0"
-	if op.Nonce != nil {
-		nonce = op.Nonce.String()
+		return fmt.Errorf("append variant: %w", err)
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO signed_ops (id, seq, op, hash, nonce, valid_until) VALUES (?, ?, ?, ?, ?, ?)`,
-		id[:], next, op.Op, op.Hash.Bytes(), nonce, int64(op.ValidUntil),
+		`INSERT INTO variants (account, id, seq, blob) VALUES (?, ?, ?, ?)`, account, id, next, blob,
 	); err != nil {
-		return fmt.Errorf("append attempt: %w", err)
+		return fmt.Errorf("append variant: %w", err)
 	}
 	return tx.Commit()
 }
 
-func (s *Store) SignedOps(id rail.ID) ([]rail.SignedOp, error) {
+func (s *Store) Variants(ref rail.Ref) ([]rail.Variant, error) {
+	account, id := key(ref)
 	rows, err := s.db.Query(
-		`SELECT op, hash, nonce, valid_until FROM signed_ops WHERE id = ? ORDER BY seq`, id[:])
+		`SELECT blob FROM variants WHERE account = ? AND id = ? ORDER BY seq`, account, id)
 	if err != nil {
-		return nil, fmt.Errorf("read attempts: %w", err)
+		return nil, fmt.Errorf("read variants: %w", err)
 	}
 	defer rows.Close()
 
-	var ops []rail.SignedOp
+	var variants []rail.Variant
 	for rows.Next() {
-		var (
-			blob       []byte
-			hash       []byte
-			nonce      string
-			validUntil int64
-		)
-		if err := rows.Scan(&blob, &hash, &nonce, &validUntil); err != nil {
-			return nil, fmt.Errorf("read attempts: %w", err)
+		var blob []byte
+		if err := rows.Scan(&blob); err != nil {
+			return nil, fmt.Errorf("read variants: %w", err)
 		}
-		value, ok := new(big.Int).SetString(nonce, 10)
-		if !ok {
-			return nil, fmt.Errorf("read attempts: bad nonce %q", nonce)
+		v, err := rail.UnmarshalVariant(blob)
+		if err != nil {
+			return nil, fmt.Errorf("read variants: %w", err)
 		}
-		ops = append(ops, rail.SignedOp{
-			Op:         blob,
-			Hash:       common.BytesToHash(hash),
-			Nonce:      value,
-			ValidUntil: uint64(validUntil),
-		})
+		variants = append(variants, v)
 	}
-	return ops, rows.Err()
+	return variants, rows.Err()
 }
 
-func (s *Store) Abandon(id rail.ID) error {
-	if _, err := s.db.Exec(`INSERT OR IGNORE INTO abandoned (id) VALUES (?)`, id[:]); err != nil {
+func (s *Store) Abandon(ref rail.Ref) error {
+	account, id := key(ref)
+	if _, err := s.db.Exec(
+		`INSERT OR IGNORE INTO abandoned (account, id) VALUES (?, ?)`, account, id); err != nil {
 		return fmt.Errorf("abandon: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) Abandoned(id rail.ID) (bool, error) {
+func (s *Store) Abandoned(ref rail.Ref) (bool, error) {
+	account, id := key(ref)
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM abandoned WHERE id = ?`, id[:]).Scan(&n); err != nil {
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM abandoned WHERE account = ? AND id = ?`, account, id).Scan(&n); err != nil {
 		return false, fmt.Errorf("read abandonment: %w", err)
 	}
 	return n != 0, nil
@@ -256,14 +289,15 @@ func (s *Store) Abandoned(id rail.ID) (bool, error) {
 
 // PutFact caches a finalized outcome. Finalized facts cannot change, so a
 // repeat write is ignored rather than applied.
-func (s *Store) PutFact(id rail.ID, f rail.Fact) error {
+func (s *Store) PutFact(ref rail.Ref, f rail.Fact) error {
+	account, id := key(ref)
 	executed := 0
 	if f.Executed {
 		executed = 1
 	}
 	_, err := s.db.Exec(
-		`INSERT OR IGNORE INTO facts (id, tx_hash, block_number, executed) VALUES (?, ?, ?, ?)`,
-		id[:], f.TxHash.Bytes(), int64(f.BlockNumber), executed,
+		`INSERT OR IGNORE INTO facts (account, id, tx_hash, block_number, executed) VALUES (?, ?, ?, ?, ?)`,
+		account, id, f.TxHash.Bytes(), int64(f.BlockNumber), executed,
 	)
 	if err != nil {
 		return fmt.Errorf("record fact: %w", err)
@@ -271,14 +305,15 @@ func (s *Store) PutFact(id rail.ID, f rail.Fact) error {
 	return nil
 }
 
-func (s *Store) Fact(id rail.ID) (rail.Fact, bool, error) {
+func (s *Store) Fact(ref rail.Ref) (rail.Fact, bool, error) {
+	account, id := key(ref)
 	var (
 		txHash   []byte
 		block    int64
 		executed int64
 	)
 	err := s.db.QueryRow(
-		`SELECT tx_hash, block_number, executed FROM facts WHERE id = ?`, id[:],
+		`SELECT tx_hash, block_number, executed FROM facts WHERE account = ? AND id = ?`, account, id,
 	).Scan(&txHash, &block, &executed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return rail.Fact{}, false, nil
@@ -293,26 +328,28 @@ func (s *Store) Fact(id rail.ID) (rail.Fact, bool, error) {
 	}, true, nil
 }
 
-// PendingIDs lists intents with no finalized outcome yet, so a restart knows
-// what to keep watching.
-func (s *Store) PendingIDs() ([]rail.ID, error) {
+// Pending lists intents with no finalized outcome yet, so a restart knows what
+// to keep watching.
+func (s *Store) Pending() ([]rail.Ref, error) {
 	rows, err := s.db.Query(
-		`SELECT id FROM intents WHERE id NOT IN (SELECT id FROM facts) ORDER BY rowid`)
+		`SELECT i.account, i.id FROM intents i
+         WHERE NOT EXISTS (SELECT 1 FROM facts f WHERE f.account = i.account AND f.id = i.id)
+         ORDER BY i.rowid`)
 	if err != nil {
 		return nil, fmt.Errorf("read pending: %w", err)
 	}
 	defer rows.Close()
 
-	var ids []rail.ID
+	var refs []rail.Ref
 	for rows.Next() {
-		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
+		var account, id []byte
+		if err := rows.Scan(&account, &id); err != nil {
 			return nil, fmt.Errorf("read pending: %w", err)
 		}
-		if len(raw) != 32 {
-			return nil, fmt.Errorf("read pending: identifier is %d bytes", len(raw))
+		if len(id) != 32 {
+			return nil, fmt.Errorf("read pending: identifier is %d bytes", len(id))
 		}
-		ids = append(ids, rail.ID(raw))
+		refs = append(refs, rail.Ref{Account: common.BytesToAddress(account), ID: rail.ID(id)})
 	}
-	return ids, rows.Err()
+	return refs, rows.Err()
 }

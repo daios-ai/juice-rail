@@ -13,7 +13,6 @@ fs_permissions = [{ access = "read", path = "./" }]
 remappings = [
     "forge-std/=lib/forge-std/src/",
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
-    "account-abstraction/=lib/account-abstraction/contracts/",
 ]
 
 [profile.default.fuzz]

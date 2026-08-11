@@ -15,33 +15,61 @@ import (
 type Status string
 
 const (
-	// StatusUnknown means no record of the identifier.
+	// StatusUnknown means no record of the intent.
 	StatusUnknown Status = "unknown"
 	// StatusPending means the intent may still execute. A revert is not
 	// failure: a reverted intent can be retried.
 	StatusPending Status = "pending"
-	// StatusConfirmed means a finalized rail event matching the terms exists.
+	// StatusConfirmed means a finalized rail event matching the core terms
+	// exists.
 	StatusConfirmed Status = "confirmed"
 	// StatusFailed means the intent can never execute: the identifier is
 	// finalized under different terms, or it was abandoned and every signed
-	// attempt is finalized-dead.
+	// variant is finalized-dead.
 	StatusFailed Status = "failed"
 )
 
-// ChainReader is the read side of a chain node. *ethclient.Client satisfies it.
-type ChainReader interface {
-	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
-	FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error)
-	CallContract(ctx context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
+// Event signatures emitted by JuiceRail. All three carry the debited account
+// as topic 1 and the identifier as topic 2, so one query by (account,
+// identifier) covers every kind.
+var (
+	topicDeposited   = crypto.Keccak256Hash([]byte("Deposited(address,bytes32,address,uint256,uint256,address,uint256)"))
+	topicTransferred = crypto.Keccak256Hash([]byte("Transferred(address,bytes32,address,uint256,uint256,address,uint256)"))
+	topicWithdrawn   = crypto.Keccak256Hash([]byte("Withdrawn(address,bytes32,address,uint256,uint256,address,uint256)"))
+)
+
+// finalizedBlockArg selects the "finalized" tag (go-ethereum encodes the RPC
+// block tags as negative numbers).
+var finalizedBlockArg = big.NewInt(-3)
+
+// classify is the whole decision procedure, over facts the caller has already
+// gathered. Keeping it separate from how they are gathered is what lets the
+// state machine be checked exhaustively; see model_test.go.
+func classify(known bool, fact *Fact, abandoned, everyVariantDead bool) Status {
+	switch {
+	case !known:
+		return StatusUnknown
+	case fact != nil && fact.Executed:
+		return StatusConfirmed
+	case fact != nil:
+		return StatusFailed
+	case abandoned && everyVariantDead:
+		return StatusFailed
+	default:
+		return StatusPending
+	}
 }
 
-// Event signatures emitted by JuiceRail. The identifier is topic 1 on all
-// three, so one query by identifier covers every kind.
-var (
-	topicDeposited = crypto.Keccak256Hash([]byte("Deposited(bytes32,address,uint256)"))
-	topicSettled   = crypto.Keccak256Hash([]byte("Settled(bytes32,address,address,uint256)"))
-	topicWithdrawn = crypto.Keccak256Hash([]byte("Withdrawn(bytes32,address,address,uint256)"))
-)
+// variantDead reports whether a signed variant can never execute. The deadline
+// is the whole test: block timestamps only increase, so once the head is at or
+// past validBefore no block can ever include it. The contract's own check is
+// `block.timestamp < validBefore`, which is this test's mirror image.
+//
+// Callers judging death durably must pass a finalized head: an unfinalized one
+// can still be reorganised away.
+func variantDead(v Variant, headTime uint64) bool {
+	return headTime >= v.ValidBefore
+}
 
 // finalizedHeader reads the head under the domain's finality mechanism. Only
 // true finality qualifies, so a confirmed fact can never revert.
@@ -56,69 +84,60 @@ func (r *Rail) finalizedHeader(ctx context.Context) (*types.Header, error) {
 	return h, nil
 }
 
-// finalizedBlockArg selects the "finalized" tag (go-ethereum encodes the RPC
-// block tags as negative numbers).
-var finalizedBlockArg = big.NewInt(-3)
-
 // Status derives the status of an intent from finalized chain facts.
 func (r *Rail) Status(ctx context.Context, id ID) (Status, error) {
-	in, ok, err := r.store.Intent(id)
+	ref := r.ref(id)
+	in, ok, err := r.store.Intent(ref)
 	if err != nil {
 		return StatusUnknown, err
 	}
 	if !ok {
 		return StatusUnknown, nil
 	}
-	if f, ok, err := r.store.Fact(id); err != nil {
+	if f, cached, err := r.store.Fact(ref); err != nil {
 		return StatusUnknown, err
-	} else if ok {
-		return statusOfFact(f), nil
+	} else if cached {
+		return classify(true, &f, false, false), nil
 	}
 
 	head, err := r.finalizedHeader(ctx)
 	if err != nil {
 		return StatusUnknown, err
 	}
-
-	f, found, err := r.finalizedOutcome(ctx, id, in, head.Number)
+	f, found, err := r.finalizedOutcome(ctx, ref, in, head.Number)
 	if err != nil {
 		return StatusUnknown, err
 	}
 	if found {
-		if err := r.store.PutFact(id, f); err != nil {
+		if err := r.store.PutFact(ref, f); err != nil {
 			return StatusUnknown, err
 		}
-		return statusOfFact(f), nil
+		return classify(true, &f, false, false), nil
 	}
 
-	dead, err := r.terminallyDead(ctx, id, head)
+	abandoned, err := r.store.Abandoned(ref)
 	if err != nil {
 		return StatusUnknown, err
 	}
-	if dead {
-		return StatusFailed, nil
+	dead, err := r.everyVariantDead(ref, head)
+	if err != nil {
+		return StatusUnknown, err
 	}
-	return StatusPending, nil
+	return classify(true, nil, abandoned, dead), nil
 }
 
-func statusOfFact(f Fact) Status {
-	if f.Executed {
-		return StatusConfirmed
-	}
-	return StatusFailed
-}
-
-// finalizedOutcome looks for a finalized event carrying this identifier,
-// regardless of which transaction carried it: an exact replay executes
-// nothing and emits nothing, so status must follow the identifier.
-func (r *Rail) finalizedOutcome(ctx context.Context, id ID, in Intent, finalized *big.Int) (Fact, bool, error) {
+// finalizedOutcome looks for a finalized event under this (account,
+// identifier), regardless of which transaction carried it: a replay executes
+// nothing and emits nothing, and any variant of the intent confirms it.
+func (r *Rail) finalizedOutcome(ctx context.Context, ref Ref, in Intent, finalized *big.Int) (Fact, bool, error) {
 	logs, err := r.chain.FilterLogs(ctx, ethereum.FilterQuery{
 		FromBlock: new(big.Int).SetUint64(in.FromBlock),
 		ToBlock:   finalized,
 		Addresses: []common.Address{r.domain.Rail},
 		Topics: [][]common.Hash{
-			{topicDeposited, topicSettled, topicWithdrawn},
-			{id.Hash()},
+			{topicDeposited, topicTransferred, topicWithdrawn},
+			{common.BytesToHash(ref.Account.Bytes())},
+			{ref.ID.Hash()},
 		},
 	})
 	if err != nil {
@@ -132,6 +151,8 @@ func (r *Rail) finalizedOutcome(ctx context.Context, id ID, in Intent, finalized
 		if err != nil {
 			return Fact{}, false, err
 		}
+		// Variants differ in relayer, fee and deadline; only the core terms
+		// decide whether this is the intent the host is waiting for.
 		return Fact{
 			TxHash:      lg.TxHash,
 			BlockNumber: lg.BlockNumber,
@@ -141,68 +162,39 @@ func (r *Rail) finalizedOutcome(ctx context.Context, id ID, in Intent, finalized
 	return Fact{}, false, nil
 }
 
-// terminallyDead reports whether nothing can ever execute this intent: the
-// rail will never sign again and every attempt already signed is finalized-dead.
-func (r *Rail) terminallyDead(ctx context.Context, id ID, head *types.Header) (bool, error) {
-	abandoned, err := r.store.Abandoned(id)
-	if err != nil || !abandoned {
-		return false, err
-	}
-	ops, err := r.store.SignedOps(id)
+// everyVariantDead reports whether no signed variant can execute any more.
+func (r *Rail) everyVariantDead(ref Ref, head *types.Header) (bool, error) {
+	variants, err := r.store.Variants(ref)
 	if err != nil {
 		return false, err
 	}
-	for _, op := range ops {
-		if !opDead(op, head) {
+	for _, v := range variants {
+		if !variantDead(v, head.Time) {
 			return false, nil
 		}
 	}
 	return true, nil
 }
 
-// opDead reports whether a signed attempt can never execute. Sponsorship
-// expiry is the whole test: block timestamps only increase, so once the
-// finalized head is past validUntil no block can ever validate it again. The
-// test reads a header and no state, so it holds on any node.
-func opDead(op SignedOp, head *types.Header) bool {
-	return head.Time > op.ValidUntil
-}
-
 func decodeTerms(lg types.Log) (Terms, error) {
-	if len(lg.Topics) == 0 {
-		return Terms{}, fmt.Errorf("rail log: no topics")
+	if len(lg.Topics) != 3 || len(lg.Data) != 160 {
+		return Terms{}, fmt.Errorf("rail log: malformed event")
 	}
+	var kind Kind
 	switch lg.Topics[0] {
 	case topicDeposited:
-		if len(lg.Topics) != 3 || len(lg.Data) != 32 {
-			return Terms{}, fmt.Errorf("rail log: malformed Deposited")
-		}
-		return Terms{
-			Kind:    KindDeposit,
-			Account: common.BytesToAddress(lg.Topics[2].Bytes()),
-			Amount:  new(big.Int).SetBytes(lg.Data),
-		}, nil
-	case topicSettled:
-		if len(lg.Topics) != 4 || len(lg.Data) != 32 {
-			return Terms{}, fmt.Errorf("rail log: malformed Settled")
-		}
-		return Terms{
-			Kind:    KindSettle,
-			Account: common.BytesToAddress(lg.Topics[2].Bytes()),
-			Party:   common.BytesToAddress(lg.Topics[3].Bytes()),
-			Amount:  new(big.Int).SetBytes(lg.Data),
-		}, nil
+		kind = KindDeposit
+	case topicTransferred:
+		kind = KindTransfer
 	case topicWithdrawn:
-		if len(lg.Topics) != 3 || len(lg.Data) != 64 {
-			return Terms{}, fmt.Errorf("rail log: malformed Withdrawn")
-		}
-		return Terms{
-			Kind:    KindWithdraw,
-			Account: common.BytesToAddress(lg.Topics[2].Bytes()),
-			Party:   common.BytesToAddress(lg.Data[:32]),
-			Amount:  new(big.Int).SetBytes(lg.Data[32:]),
-		}, nil
+		kind = KindWithdraw
 	default:
 		return Terms{}, fmt.Errorf("rail log: unknown event %s", lg.Topics[0])
 	}
+	return Terms{
+		Kind:    kind,
+		Account: common.BytesToAddress(lg.Topics[1].Bytes()),
+		Party:   common.BytesToAddress(lg.Data[:32]),
+		Amount:  new(big.Int).SetBytes(lg.Data[32:64]),
+	}, nil
 }

@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,439 +14,402 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+
+	"github.com/daios-ai/juice-rail/go/rail"
 )
 
-const sampleConfig = `{
-  "name": "local",
-  "chainId": 31337,
-  "rpc": "http://127.0.0.1:8545",
-  "bundler": "http://127.0.0.1:4337",
-  "rail": "0x0000000000000000000000000000000000001001",
-  "token": "0x0000000000000000000000000000000000001002",
-  "paymaster": "0x0000000000000000000000000000000000001003",
-  "entryPoint": "0x0000000000000000000000000000000000002001",
-  "safeSingleton": "0x0000000000000000000000000000000000002002",
-  "safeProxyFactory": "0x0000000000000000000000000000000000002003",
-  "safeModule": "0x0000000000000000000000000000000000002004",
-  "safeModuleSetup": "0x0000000000000000000000000000000000002005",
-  "multiSendCallOnly": "0x0000000000000000000000000000000000002006"
-}`
-
-func writeConfig(t *testing.T, body string) string {
+// fakeNode answers the two reads the token check makes, over loopback. It is
+// the only network any test here touches.
+func fakeNode(t *testing.T, hasEip3009 bool) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "domain.json")
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params []json.RawMessage
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode rpc request: %v", err)
+			return
+		}
+		reply := func(result string) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":%q}`, req.ID, result)
+		}
+		if req.Method != "eth_call" {
+			reply("0x")
+			return
+		}
+		var call struct {
+			Input string `json:"input"`
+			Data  string `json:"data"`
+		}
+		if err := json.Unmarshal(req.Params[0], &call); err != nil {
+			t.Errorf("decode call: %v", err)
+			return
+		}
+		data := call.Input
+		if data == "" {
+			data = call.Data
+		}
+		if len(data) < 10 {
+			reply("0x")
+			return
+		}
+		switch data[:10] {
+		case selector("DOMAIN_SEPARATOR()"):
+			reply("0x" + strings.Repeat("11", 32))
+		case selector("authorizationState(address,bytes32)"):
+			if !hasEip3009 {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"execution reverted"}}`, req.ID)
+				return
+			}
+			reply("0x" + strings.Repeat("00", 32))
+		default:
+			reply("0x")
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+func selector(sig string) string {
+	return "0x" + hex.EncodeToString(crypto.Keccak256([]byte(sig))[:4])
+}
+
+func testConfig(rpc string) config {
+	return config{
+		Name:     "local",
+		ChainID:  31337,
+		RPC:      rpc,
+		Rail:     "0x00000000000000000000000000000000000000A1",
+		Token:    "0x00000000000000000000000000000000000000B2",
+		Finality: "finalized",
+	}
+}
+
+func writeConfigFile(t *testing.T, dir string, c config) string {
+	t.Helper()
+	path := filepath.Join(dir, "domain.json")
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path
 }
 
-func TestConfigBecomesAValidDomain(t *testing.T) {
-	c, err := loadConfig(writeConfig(t, sampleConfig))
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestConfigBecomesADomain(t *testing.T) {
+	c := testConfig("http://localhost:1")
 	d := c.domain()
-
+	if d.ChainID.Uint64() != 31337 || d.Rail != common.HexToAddress(c.Rail) || d.Token != common.HexToAddress(c.Token) {
+		t.Fatalf("domain %+v does not match the configuration", d)
+	}
 	if err := d.Validate(); err != nil {
-		t.Fatalf("the sample domain must be valid: %v", err)
-	}
-	if d.ChainID.Uint64() != 31337 {
-		t.Errorf("chain id = %s", d.ChainID)
-	}
-	if d.Rail != common.HexToAddress("0x1001") || d.Contracts.MultiSendCallOnly != common.HexToAddress("0x2006") {
-		t.Errorf("addresses did not survive: %+v", d)
-	}
-	// Finality defaults to true finality, never to something weaker.
-	if d.Finality != "finalized" {
-		t.Errorf("finality = %q, want finalized", d.Finality)
-	}
-}
-
-func TestConfigCannotSelectWeakFinality(t *testing.T) {
-	body := strings.Replace(sampleConfig, `"chainId": 31337,`, `"chainId": 31337, "finality": "latest",`, 1)
-	c, err := loadConfig(writeConfig(t, body))
-	if err != nil {
 		t.Fatal(err)
 	}
+
+	// A missing finality means the only supported one, never a weaker policy.
+	c.Finality = ""
+	if got := c.domain().Finality; got != "finalized" {
+		t.Fatalf("finality defaulted to %q", got)
+	}
+	c.Finality = "6-confirmations"
 	if err := c.domain().Validate(); err == nil {
-		t.Fatal("a weaker finality mechanism must be rejected")
+		t.Fatal("a confirmation-count policy must be refused: confirmed may never revert")
 	}
 }
 
-func TestIncompleteConfigIsRejected(t *testing.T) {
-	body := strings.Replace(sampleConfig,
-		`"rail": "0x0000000000000000000000000000000000001001",`, "", 1)
-	c, err := loadConfig(writeConfig(t, body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := c.domain().Validate(); err == nil {
-		t.Fatal("a missing rail address must be rejected")
-	}
-}
-
-func TestConfigErrorsAreReadable(t *testing.T) {
-	if _, err := loadConfig(filepath.Join(t.TempDir(), "absent.json")); err == nil ||
-		!strings.Contains(err.Error(), "read config") {
-		t.Fatalf("missing file: %v", err)
-	}
-	if _, err := loadConfig(writeConfig(t, "{not json")); err == nil ||
-		!strings.Contains(err.Error(), "parse config") {
-		t.Fatalf("malformed file: %v", err)
-	}
-}
-
-func TestKeyFromEnv(t *testing.T) {
-	key, err := crypto.GenerateKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	hex := common.Bytes2Hex(crypto.FromECDSA(key))
-
-	t.Setenv("RAILCTL_KEY", hex)
-	got, err := keyFromEnv("RAILCTL_KEY")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if crypto.PubkeyToAddress(got.PublicKey) != crypto.PubkeyToAddress(key.PublicKey) {
-		t.Fatal("the key did not round trip")
-	}
-
-	// The 0x prefix is accepted too, since that is how keys are usually pasted.
-	t.Setenv("RAILCTL_KEY", "0x"+hex)
-	if _, err := keyFromEnv("RAILCTL_KEY"); err != nil {
-		t.Fatalf("prefixed key: %v", err)
-	}
-
-	t.Setenv("RAILCTL_KEY", "")
-	if _, err := keyFromEnv("RAILCTL_KEY"); err == nil {
-		t.Error("an unset key must be reported")
-	}
-	t.Setenv("RAILCTL_KEY", "not-a-key")
-	if _, err := keyFromEnv("RAILCTL_KEY"); err == nil {
-		t.Error("a malformed key must be reported")
-	}
-}
-
-// The halt points name the durable steps, and nothing else.
-func TestHaltPoints(t *testing.T) {
-	for _, valid := range []string{"", "intent", "sign", "submit"} {
-		if !validHaltPoint(valid) {
-			t.Errorf("%q must be accepted", valid)
+func TestHaltPointsAreTheDurableSteps(t *testing.T) {
+	for _, ok := range []string{"", "intent", "sign", "submit"} {
+		if !validHaltPoint(ok) {
+			t.Errorf("%q must be a halt point", ok)
 		}
 	}
-	for _, invalid := range []string{"confirm", "send", "nonsense"} {
-		if validHaltPoint(invalid) {
-			t.Errorf("%q must be rejected", invalid)
+	for _, bad := range []string{"relay", "confirm", "nonsense"} {
+		if validHaltPoint(bad) {
+			t.Errorf("%q must not be a halt point", bad)
 		}
-	}
-}
-
-// Every command and flag the harness drives is documented.
-func TestUsageCoversTheCommandSurface(t *testing.T) {
-	for _, name := range []string{
-		"init", "account", "balance", "deposit", "settle", "withdraw", "status", "abandon",
-		"-config", "-store", "-json", "-halt-after", "-profile",
-		"-key-file", "-sponsor-key-file",
-		"RAILCTL_KEY", "RAILCTL_PAYMASTER_KEY",
-	} {
-		if !strings.Contains(usage, name) {
-			t.Errorf("usage does not mention %q", name)
-		}
-	}
-}
-
-// --- profiles ---
-
-func testKeyHex(t *testing.T) string {
-	t.Helper()
-	key, err := crypto.GenerateKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return common.Bytes2Hex(crypto.FromECDSA(key))
-}
-
-func writeKeyFile(t *testing.T, hex string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "key")
-	if err := os.WriteFile(path, []byte(hex+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-// isolate points the home directory at a fresh directory, so no test can read
-// or write the developer's real profiles.
-func isolate(t *testing.T) string {
-	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	return filepath.Join(home, ".juice-rail")
-}
-
-// Everything supplied explicitly must never require a home directory: the
-// integration harness passes all four inputs and must not touch one.
-func TestResolveNeedsNoProfileWhenEverythingIsGiven(t *testing.T) {
-	t.Setenv("HOME", filepath.Join(t.TempDir(), "absent"))
-	t.Setenv("RAILCTL_KEY", "0xaa")
-	t.Setenv("RAILCTL_PAYMASTER_KEY", "0xbb")
-
-	in, err := resolve(options{config: writeConfig(t, sampleConfig), store: "/tmp/x.db"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if in.domain.ChainID != 31337 || in.store != "/tmp/x.db" || in.key != "0xaa" || in.sponsorKey != "0xbb" {
-		t.Fatalf("inputs did not come from the overrides: %+v", in)
-	}
-}
-
-func TestResolveFallsBackToTheProfile(t *testing.T) {
-	dir := isolate(t)
-	key, sponsor := testKeyHex(t), testKeyHex(t)
-	if err := initProfile([]string{"alice", writeConfig(t, sampleConfig)},
-		options{keyFile: writeKeyFile(t, key), sponsorKey: writeKeyFile(t, sponsor)}); err != nil {
-		t.Fatal(err)
-	}
-
-	// No flags, no environment: everything comes from the profile.
-	t.Setenv("RAILCTL_KEY", "")
-	t.Setenv("RAILCTL_PAYMASTER_KEY", "")
-	in, err := resolve(options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if in.domain.ChainID != 31337 {
-		t.Errorf("domain = %+v", in.domain)
-	}
-	if want := filepath.Join(dir, "alice.db"); in.store != want {
-		t.Errorf("store = %q, want %q", in.store, want)
-	}
-	if in.key != key || in.sponsorKey != sponsor {
-		t.Error("keys did not come from the credentials file")
-	}
-
-	// The environment still wins over the profile.
-	t.Setenv("RAILCTL_KEY", "0xcc")
-	if in, err = resolve(options{}); err != nil || in.key != "0xcc" {
-		t.Fatalf("env must take precedence: %q %v", in.key, err)
-	}
-}
-
-// An override may say how a domain is reached, never which domain it is: the
-// profile's store and sponsorship key belong to its own domain.
-func TestResolveRefusesAnOverrideForAnotherDomain(t *testing.T) {
-	isolate(t)
-	t.Setenv("RAILCTL_KEY", "")
-	t.Setenv("RAILCTL_PAYMASTER_KEY", "")
-	if err := initProfile([]string{"alice", writeConfig(t, sampleConfig)},
-		options{sponsorKey: writeKeyFile(t, testKeyHex(t))}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Same domain, different endpoint: legitimate, the profile supplies the rest.
-	moved := strings.Replace(sampleConfig,
-		`"rpc": "http://127.0.0.1:8545"`, `"rpc": "http://127.0.0.1:9999"`, 1)
-	in, err := resolve(options{config: writeConfig(t, moved)})
-	if err != nil {
-		t.Fatalf("an override on the same domain must be accepted: %v", err)
-	}
-	if in.domain.RPC != "http://127.0.0.1:9999" {
-		t.Errorf("the override must win: %q", in.domain.RPC)
-	}
-
-	for _, elsewhere := range []string{
-		strings.Replace(sampleConfig, `"chainId": 31337`, `"chainId": 42161`, 1),
-		strings.Replace(sampleConfig,
-			`"rail": "0x0000000000000000000000000000000000001001"`,
-			`"rail": "0x0000000000000000000000000000000000009999"`, 1),
-	} {
-		_, err := resolve(options{config: writeConfig(t, elsewhere)})
-		if err == nil || !strings.Contains(err.Error(), "profile") {
-			t.Fatalf("another domain must be refused, got %v", err)
-		}
-	}
-}
-
-// A missing profile must name the command that creates one.
-func TestResolveWithoutAnyProfileNamesTheFix(t *testing.T) {
-	isolate(t)
-	t.Setenv("RAILCTL_KEY", "")
-	t.Setenv("RAILCTL_PAYMASTER_KEY", "")
-
-	_, err := resolve(options{})
-	if !errors.Is(err, errNoProfile) {
-		t.Fatalf("want errNoProfile, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "railctl init") {
-		t.Errorf("the error must name the fix: %v", err)
 	}
 }
 
 func TestProfileNamesAreRestricted(t *testing.T) {
-	for _, ok := range []string{"a", "alice", "bob-2", "prod_1", strings.Repeat("x", 32)} {
+	for _, ok := range []string{"alice", "a", "bob-2", "under_score", strings.Repeat("a", 32)} {
 		if err := checkProfileName(ok); err != nil {
-			t.Errorf("%q must be accepted: %v", ok, err)
+			t.Errorf("%q must be allowed: %v", ok, err)
 		}
 	}
-	// A name becomes a filename and a JSON key, so traversal and surprises are
-	// refused rather than escaped.
-	for _, bad := range []string{"", "..", "../escape", "/absolute", "a/b", "Alice", "a b", "-lead", strings.Repeat("x", 33)} {
+	for _, bad := range []string{"", "Alice", "-alice", "../etc", "a/b", strings.Repeat("a", 33), "space bar"} {
 		if err := checkProfileName(bad); err == nil {
-			t.Errorf("%q must be refused", bad)
+			t.Errorf("%q must be refused: it is a filename and a JSON key", bad)
 		}
 	}
 }
 
-func TestInitWritesTheProfileAndRefusesToClobber(t *testing.T) {
-	dir := isolate(t)
-	domainFile := writeConfig(t, sampleConfig)
-	sponsor := writeKeyFile(t, testKeyHex(t))
-
-	if err := initProfile([]string{"alice", domainFile}, options{sponsorKey: sponsor}); err != nil {
-		t.Fatal(err)
-	}
-
-	set, err := loadSettings(dir)
+func TestKeysComeFromFilesAndTheEnvironment(t *testing.T) {
+	key, err := crypto.GenerateKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if set.Current != "alice" {
-		t.Errorf("current = %q, want alice", set.Current)
+	hexKey := common.Bytes2Hex(crypto.FromECDSA(key))
+
+	if _, err := parseKey(hexKey, "test"); err != nil {
+		t.Fatal(err)
 	}
-	if set.Profiles["alice"].Domain != "local" {
-		t.Errorf("profile = %+v", set.Profiles["alice"])
+	if _, err := parseKey("0x"+hexKey, "test"); err != nil {
+		t.Fatalf("a 0x prefix is how keys are pasted: %v", err)
 	}
-	if set.Domains["local"].ChainID != 31337 {
-		t.Errorf("domain = %+v", set.Domains["local"])
+	if _, err := parseKey("", "test"); err == nil {
+		t.Fatal("an empty key must be refused")
+	}
+	if _, err := parseKey("nonsense", "test"); err == nil {
+		t.Fatal("a malformed key must be refused")
 	}
 
-	// A generated key is a real key, and credentials are private.
-	cr, err := loadCredentials(dir)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "key")
+	if err := os.WriteFile(path, []byte(hexKey+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readKeyFile(path)
+	if err != nil || got != hexKey {
+		t.Fatalf("read %q (%v), want %q", got, err, hexKey)
+	}
+	if _, err := readKeyFile(filepath.Join(dir, "absent")); err == nil {
+		t.Fatal("a missing key file must be refused")
+	}
+}
+
+func TestResolvePrefersFlagsThenEnvironmentThenProfile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("RAILCTL_KEY", "")
+	rpc := fakeNode(t, true)
+
+	// Nothing configured at all.
+	if _, err := resolve(options{}); !errors.Is(err, errNoProfile) {
+		t.Fatalf("want errNoProfile, got %v", err)
+	}
+
+	// Everything passed explicitly: the home directory is never read.
+	key, _ := crypto.GenerateKey()
+	hexKey := common.Bytes2Hex(crypto.FromECDSA(key))
+	t.Setenv("RAILCTL_KEY", hexKey)
+	cfgPath := writeConfigFile(t, t.TempDir(), testConfig(rpc))
+	in, err := resolve(options{config: cfgPath, store: "/tmp/x.db"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := parseKey(cr.Profiles["alice"], "generated"); err != nil {
-		t.Errorf("generated key: %v", err)
+	if in.store != "/tmp/x.db" || in.key != hexKey || in.domain.ChainID != 31337 {
+		t.Fatalf("overrides ignored: %+v", in)
 	}
-	info, err := os.Stat(filepath.Join(dir, credentialsFile))
+
+	// A profile fills in what is missing.
+	t.Setenv("RAILCTL_KEY", "")
+	if err := initProfile([]string{"alice", cfgPath}, options{}); err != nil {
+		t.Fatal(err)
+	}
+	in, err = resolve(options{profile: "alice"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("credentials mode = %#o, want 0600", perm)
+	if in.store != filepath.Join(home, ".juice-rail", "alice.db") {
+		t.Fatalf("store %q, want the profile's own", in.store)
+	}
+	if in.key == "" || in.domain.Name != "local" {
+		t.Fatalf("the profile did not fill in: %+v", in)
 	}
 
-	if err := initProfile([]string{"alice", domainFile}, options{sponsorKey: sponsor}); err == nil {
-		t.Error("an existing profile must not be overwritten")
+	// An override may refine how a domain is reached, never which domain.
+	other := testConfig(rpc)
+	other.Rail = "0x00000000000000000000000000000000000000FF"
+	otherPath := writeConfigFile(t, t.TempDir(), other)
+	if _, err := resolve(options{profile: "alice", config: otherPath}); err == nil {
+		t.Fatal("a -config for another deployment must be refused")
 	}
 
-	// A second profile on the installed domain needs no sponsorship key, and
-	// does not disturb the recorded current profile.
-	if err := initProfile([]string{"bob", domainFile}, options{}); err != nil {
-		t.Fatalf("second profile: %v", err)
-	}
-	if set, _ = loadSettings(dir); set.Current != "alice" {
-		t.Errorf("current changed to %q", set.Current)
+	if _, err := resolve(options{profile: "bob"}); err == nil {
+		t.Fatal("an unknown profile must be refused")
 	}
 }
 
-// Redefining an installed domain would repoint existing profiles at another
-// vault, which is the store's ErrWrongDomain one level up.
-func TestInitRefusesAConflictingDomain(t *testing.T) {
-	isolate(t)
-	sponsor := writeKeyFile(t, testKeyHex(t))
-	if err := initProfile([]string{"alice", writeConfig(t, sampleConfig)},
-		options{sponsorKey: sponsor}); err != nil {
+func TestInitRefusesATokenWithoutEip3009(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgPath := writeConfigFile(t, t.TempDir(), testConfig(fakeNode(t, false)))
+
+	if err := initProfile([]string{"alice", cfgPath}, options{}); err == nil {
+		t.Fatal("a token that cannot carry an authorisation must be refused at init")
+	}
+	if _, err := os.Stat(filepath.Join(home, ".juice-rail", "config.json")); err == nil {
+		t.Fatal("a refused init must leave no profile behind")
+	}
+}
+
+func TestInitIsIdempotentlyRefusedAndKeepsSecretsPrivate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("RAILCTL_KEY", "")
+	cfgPath := writeConfigFile(t, t.TempDir(), testConfig(fakeNode(t, true)))
+
+	if err := initProfile([]string{"alice", cfgPath}, options{}); err != nil {
 		t.Fatal(err)
 	}
-
-	elsewhere := strings.Replace(sampleConfig,
-		`"rail": "0x0000000000000000000000000000000000001001"`,
-		`"rail": "0x0000000000000000000000000000000000009999"`, 1)
-	err := initProfile([]string{"bob", writeConfig(t, elsewhere)}, options{sponsorKey: sponsor})
-	if err == nil || !strings.Contains(err.Error(), "already installed") {
-		t.Fatalf("a changed domain must be refused, got %v", err)
+	if err := initProfile([]string{"alice", cfgPath}, options{}); err == nil {
+		t.Fatal("an existing profile must not be silently replaced")
 	}
 
-	// The same contents again are not a conflict.
-	if err := initProfile([]string{"carol", writeConfig(t, sampleConfig)}, options{}); err != nil {
-		t.Fatalf("an unchanged domain must be accepted: %v", err)
-	}
-}
-
-func TestInitRefusesSecretsItCannotRead(t *testing.T) {
-	isolate(t)
-	domainFile := writeConfig(t, sampleConfig)
-
-	// A new domain without a sponsorship key cannot work, and says so.
-	err := initProfile([]string{"alice", domainFile}, options{})
-	if err == nil || !strings.Contains(err.Error(), "-sponsor-key-file") {
-		t.Fatalf("want the flag named, got %v", err)
-	}
-	// Key files are validated, not trusted.
-	if _, err := readKeyFile(writeKeyFile(t, "not-a-key")); err == nil {
-		t.Error("a malformed key file must be refused")
-	}
-	if _, err := readKeyFile(filepath.Join(t.TempDir(), "absent")); err == nil {
-		t.Error("a missing key file must be refused")
-	}
-}
-
-func TestCredentialsReadableByOthersAreRefused(t *testing.T) {
-	dir := isolate(t)
-	if err := initProfile([]string{"alice", writeConfig(t, sampleConfig)},
-		options{sponsorKey: writeKeyFile(t, testKeyHex(t))}); err != nil {
+	info, err := os.Stat(filepath.Join(home, ".juice-rail", "credentials.json"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, credentialsFile)
-	if err := os.Chmod(path, 0o644); err != nil {
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		t.Fatalf("credentials are readable by others: %#o", perm)
+	}
+
+	// A second profile on the same domain is fine; redefining the domain under
+	// the same name is not.
+	if err := initProfile([]string{"bob", cfgPath}, options{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadCredentials(dir); err == nil || !strings.Contains(err.Error(), "readable by others") {
-		t.Fatalf("loose permissions must be refused, got %v", err)
+	moved := testConfig(fakeNode(t, true))
+	moved.Rail = "0x00000000000000000000000000000000000000FF"
+	if err := initProfile([]string{"carol", writeConfigFile(t, t.TempDir(), moved)}, options{}); err == nil {
+		t.Fatal("silently repointing a domain would move everyone's money elsewhere")
 	}
 }
 
-// A half-written file must never replace a good one, since for credentials
-// that would destroy a key.
+func TestInitImportsAKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("RAILCTL_KEY", "")
+
+	key, _ := crypto.GenerateKey()
+	hexKey := common.Bytes2Hex(crypto.FromECDSA(key))
+	keyPath := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(keyPath, []byte(hexKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeConfigFile(t, t.TempDir(), testConfig(fakeNode(t, true)))
+
+	if err := initProfile([]string{"alice", cfgPath}, options{keyFile: keyPath}); err != nil {
+		t.Fatal(err)
+	}
+	cr, err := loadCredentials(filepath.Join(home, ".juice-rail"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cr.Profiles["alice"] != hexKey {
+		t.Fatal("the imported key was not the one recorded")
+	}
+}
+
 func TestWriteJSONReplacesAtomically(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
+	path := filepath.Join(dir, "out.json")
 
-	if err := writeJSON(path, settings{Current: "first"}, 0o600); err != nil {
+	if err := writeJSON(path, map[string]string{"a": "1"}, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(path, settings{Current: "second"}, 0o600); err != nil {
+	if err := writeJSON(path, map[string]string{"a": "2"}, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var got settings
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var got map[string]string
 	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatalf("the file must always be valid JSON: %v", err)
+		t.Fatalf("the file is not valid JSON after replacement: %v", err)
 	}
-	if got.Current != "second" {
-		t.Errorf("current = %q, want second", got.Current)
+	if got["a"] != "2" {
+		t.Fatalf("got %v, want the second write", got)
 	}
-
-	// A failure leaves the previous contents and no debris behind.
-	if err := writeJSON(path, make(chan int), 0o600); err == nil {
-		t.Fatal("an unencodable value must fail")
+	info, _ := os.Stat(path)
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("permissions %#o, want 0600", perm)
 	}
-	if raw, err = os.ReadFile(path); err != nil || !strings.Contains(string(raw), "second") {
-		t.Fatalf("the good file must survive: %q %v", raw, err)
-	}
+	// No temporary file may be left where a key could be read from it.
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".railctl-") {
-			t.Errorf("temporary file left behind: %s", e.Name())
+	if len(entries) != 1 {
+		t.Fatalf("%d files left behind, want 1", len(entries))
+	}
+}
+
+func TestCredentialsRefuseLooseFilePermissions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, credentialsFile)
+	if err := os.WriteFile(path, []byte(`{"profiles":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCredentials(dir); err == nil {
+		t.Fatal("a world-readable key file must be refused")
+	}
+}
+
+// The usage text is the interface: every command must be in it.
+func TestUsageCoversEveryCommand(t *testing.T) {
+	for _, command := range []string{
+		"init", "account", "balance", "deposit", "transfer", "withdraw", "relay", "status", "abandon",
+	} {
+		if !strings.Contains(usage, command) {
+			t.Errorf("usage does not mention %q", command)
+		}
+	}
+	for _, flagName := range []string{"-fee", "-relayer", "-valid-for", "-out", "-halt-after", "-profile", "-json"} {
+		if !strings.Contains(usage, flagName) {
+			t.Errorf("usage does not mention %q", flagName)
+		}
+	}
+	// The V1 vocabulary is gone: no operator sponsorship, no settlement.
+	for _, stale := range []string{"paymaster", "bundler", "sponsor", "settle "} {
+		if strings.Contains(usage, stale) {
+			t.Errorf("usage still mentions %q", stale)
+		}
+	}
+}
+
+func TestNoStoreRefusesEveryRecord(t *testing.T) {
+	var s rail.Store = noStore{}
+	ref := rail.Ref{}
+	if err := s.PutIntent(ref, rail.Intent{}); err == nil {
+		t.Fatal("the token check keeps no records")
+	}
+	if _, _, err := s.Intent(ref); err == nil {
+		t.Fatal("the token check keeps no records")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A destination is signed and then executed faithfully, so a half-pasted
+// address must be refused here or not at all.
+func TestAddressesAreParsedStrictly(t *testing.T) {
+	full := "0x00000000000000000000000000000000000000A1"
+	got, err := parseAddress(full, "recipient")
+	if err != nil || got != common.HexToAddress(full) {
+		t.Fatalf("parsed %s (%v), want %s", got, err, full)
+	}
+	if _, err := parseAddress(strings.TrimPrefix(full, "0x"), "recipient"); err != nil {
+		t.Fatalf("an address without 0x is still an address: %v", err)
+	}
+	for _, bad := range []string{
+		"",
+		"0x",
+		"0x1234", // truncated: would silently become 0x00..1234
+		"0x00000000000000000000000000000000000000A1FF", // too long
+		"0xZZ00000000000000000000000000000000000000",   // not hex
+		"not an address",
+	} {
+		if got, err := parseAddress(bad, "recipient"); err == nil {
+			t.Errorf("%q was accepted as %s", bad, got)
 		}
 	}
 }
