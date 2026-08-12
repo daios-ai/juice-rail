@@ -12,7 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// The six user stories. Each runs against the compiled binary on its own local
+// The seven user stories. Each runs against the compiled binary on its own local
 // chain, and ends on the property the story is about.
 
 // 1. onboard: a new account is created, funded once with money and gas, and is
@@ -346,5 +346,46 @@ func TestDomainsAreIndependent(t *testing.T) {
 	refusal := crossed.mustFail("status", id)
 	if !strings.Contains(refusal, "different domain") {
 		t.Fatalf("using one domain's records on another was refused with %q", refusal)
+	}
+}
+
+// 7. leave: a participant sends the whole balance out in one transfer, without
+// buying gas on the way.
+func TestStory7WithdrawAll(t *testing.T) {
+	h := newHarness(t)
+	alice := h.participant("alice", aliceKeyHex)
+	account := alice.account()
+	exchange := common.HexToAddress("0x00000000000000000000000000000000000ec4a5")
+
+	h.mintTo(account, tokens(500))
+	h.fund(account, wei(reserveMax))
+	h.settleAndFinalise()
+
+	alice.pay("transfer", freshID(t), addressOf(t, bobKeyHex), "5.00")
+	h.settleAndFinalise()
+
+	whole := h.tokenBalance(account)
+	id := freshID(t)
+	out := alice.pay("withdraw", id, exchange, "all")
+	if out.Refill != "" {
+		t.Fatalf("leaving bought gas on the way out: %+v", out)
+	}
+	h.settleAndFinalise()
+
+	if status := alice.status(id); status != "confirmed" {
+		t.Fatalf("leaving is %s, want confirmed", status)
+	}
+	if h.tokenBalance(exchange).Cmp(whole) != 0 {
+		t.Fatalf("the destination received %s, want %s", h.tokenBalance(exchange), whole)
+	}
+	if h.tokenBalance(account).Sign() != 0 {
+		t.Fatalf("the account kept %s of stablecoin", h.tokenBalance(account))
+	}
+	if n := h.transfers(account, exchange); n != 1 {
+		t.Fatalf("leaving moved money %d times", n)
+	}
+	// The reserve stays behind. It is reachable with the key, not with a verb.
+	if h.reserve(account).Sign() == 0 {
+		t.Fatal("the reserve vanished; leaving does not spend it")
 	}
 }

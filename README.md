@@ -117,6 +117,12 @@ configured ceiling on what a refill may cost, and above it the account waits.
 And if the reserve ever empties completely, the only way back is somebody
 sending gas currency in, exactly as at the start.
 
+Leaving is the mirror of that. `withdraw ... all` sends the whole balance out
+and does not buy gas to do it — spending money to leave would be perverse. The
+reserve stays behind, a couple of units of gas currency. It is your key and
+your address, so any wallet can sweep it; juice-rail simply has no verb that
+does, because all three of its verbs move the stablecoin.
+
 ---
 
 ## 4. Doing the same thing twice
@@ -160,12 +166,12 @@ git clone --recurse-submodules <this repo> && cd juice-rail
 go build ./...
 cd contracts && forge build && cd ..
 go test ./...                                  # the library
-go test -tags integration ./integration-tests  # the six stories on a local chain
+go test -tags integration ./integration-tests  # the seven stories on a local chain
 ```
 
 The stories start their own throwaway chain, deploy a mock token and a mock
 venue, and drive the real `railctl` binary through onboarding, a deposit, a
-payment, a withdrawal, a refill and a crash.
+payment, a withdrawal, a refill, a crash, and leaving.
 
 ---
 
@@ -203,6 +209,7 @@ railctl balance                       # money, and the reserve, separately
 railctl deposits                      # money that arrived and finalized
 railctl transfer <id> <address> 25.00
 railctl withdraw <id> <address> 25.00
+railctl withdraw <id> <address> all   # send the whole balance out
 railctl status <id>
 railctl retry <id>                    # if a payment is stuck
 ```
@@ -318,6 +325,7 @@ r, err := rail.New(domain, store, chainClient, key)
 r.Balances(ctx)                                 // money, reserve
 r.ScanDeposits(ctx)                             // newly finalized money in
 r.Pay(ctx, id, rail.KindTransfer, to, amount)   // the whole payment flow
+r.WithdrawAll(ctx, id, to)                      // send the whole balance out
 r.Retry(ctx, id)                                // same nonce, higher fee
 r.Status(ctx, id)                               // from finalized facts only
 ```
@@ -368,7 +376,7 @@ rather than guessing.
   implementation written independently.
 - The lifecycle of a payment is enumerated: every shape its history can take,
   checking that a settled status never moves again.
-- The six stories run against the compiled tool on a real chain.
+- The seven stories run against the compiled tool on a real chain.
 - The whole flow has been run on Arbitrum Sepolia against a real Uniswap V3
   pool, including a refill.
 
@@ -387,6 +395,6 @@ go/sqlite/        the shipped record store
 cmd/railctl/      the operations tool
 contracts/        test and staging fixtures only; no rail contract exists
 deployments/      one file per domain
-integration-tests/ the six stories
+integration-tests/ the seven stories
 requirements.md   what this is meant to be, and why
 ```

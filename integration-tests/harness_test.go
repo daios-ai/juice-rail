@@ -1,6 +1,6 @@
 //go:build integration
 
-// Package integration runs the six user stories against the compiled railctl
+// Package integration runs the seven user stories against the compiled railctl
 // binary on a live chain. Only the compiled surface is driven; chain reads are
 // used as an independent oracle, never as a way into the rail's internals.
 package integration

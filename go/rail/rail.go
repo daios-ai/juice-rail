@@ -204,6 +204,14 @@ func (r *Rail) Prepare(ctx context.Context, id ID, kind Kind, to common.Address,
 			ErrNeedRefill, FormatNative(in.Gas), FormatNative(r.domain.Gas.Min))
 	}
 
+	return r.record(ctx, id, kind, to, amount, head.Number.Uint64())
+}
+
+// record writes the write-ahead record: build the call, prove it can execute,
+// take a nonce, store it. It asks nothing about the reserve. Whether the
+// reserve matters is the caller's business, and that is the whole difference
+// between paying and leaving.
+func (r *Rail) record(ctx context.Context, id ID, kind Kind, to common.Address, amount *big.Int, head uint64) error {
 	data, err := transferCalldata(to, amount)
 	if err != nil {
 		return err
@@ -219,8 +227,56 @@ func (r *Rail) Prepare(ctx context.Context, id ID, kind Kind, to common.Address,
 	}
 	return r.store.PutIntent(r.address, Intent{
 		ID: id, Kind: kind, To: to, Amount: new(big.Int).Set(amount),
-		Nonce: nonce, Calldata: data, FromBlock: head.Number.Uint64(),
+		Nonce: nonce, Calldata: data, FromBlock: head,
 	})
+}
+
+// WithdrawAll sends the whole stablecoin balance to one destination.
+//
+// Leaving is not paying, so it does not go through Pay and never consults the
+// reserve policy. A payment is one of many and wants the reserve kept up; an
+// exit is terminal. Asking the policy here would buy gas on the way out, which
+// is money spent to leave.
+//
+// The operating reserve stays behind — a couple of units of the chain's own
+// currency, reachable with the account's key from any wallet, but not by any
+// verb here.
+func (r *Rail) WithdrawAll(ctx context.Context, id ID, to common.Address) (common.Hash, error) {
+	if to == (common.Address{}) {
+		return common.Hash{}, fmt.Errorf("%w: destination must be set", ErrBadInput)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := r.ready(ctx); err != nil {
+		return common.Hash{}, err
+	}
+	head, tip, feeCap, err := r.fees(ctx)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	token, gas, err := r.Balances(ctx)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	if token.Sign() <= 0 {
+		return common.Hash{}, fmt.Errorf("%w: the account holds no stablecoin to withdraw", ErrBadInput)
+	}
+	// The transfer must be payable at the fees it will be signed at, and
+	// nothing is signed on a shortage.
+	cost := new(big.Int).Mul(feeCap, new(big.Int).SetUint64(r.gasLimit(KindWithdraw)))
+	if gas.Cmp(cost) < 0 {
+		return common.Hash{}, fmt.Errorf("%w: holding %s, this transfer costs %s — send native currency to %s",
+			ErrInsufficientNative, FormatNative(gas), FormatNative(cost), r.address)
+	}
+	if err := r.record(ctx, id, KindWithdraw, to, token, head.Number.Uint64()); err != nil {
+		return common.Hash{}, err
+	}
+	in, _, err := r.store.Intent(r.address, id)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	return r.submit(ctx, in, Submission{Gas: r.gasLimit(KindWithdraw), Tip: tip, FeeCap: feeCap})
 }
 
 // Outcome is what one call to Pay achieved. Exactly one of the two happens: a

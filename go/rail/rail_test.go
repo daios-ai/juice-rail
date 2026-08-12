@@ -1013,3 +1013,62 @@ func TestARailWillNotActOnTheWrongChain(t *testing.T) {
 		t.Fatal("an operation on the wrong chain was broadcast")
 	}
 }
+
+func TestWithdrawAllSendsEverythingAndDoesNotBuyGasToLeave(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	// Below the reserve minimum, where an ordinary payment would refill first.
+	chain.gas[r.Account()] = big.NewInt(10_000_000_000_000_000)
+	if err := r.Prepare(ctx, id(9), KindTransfer, bob, big.NewInt(1_000_000)); !errors.Is(err, ErrNeedRefill) {
+		t.Fatalf("a payment on this reserve says %v, want a refill first", err)
+	}
+
+	whole := new(big.Int).Set(chain.token[r.Account()])
+	hash, err := r.WithdrawAll(ctx, id(1), exchange)
+	if err != nil {
+		t.Fatalf("withdraw all: %v", err)
+	}
+	if hash == (common.Hash{}) {
+		t.Fatal("nothing was sent")
+	}
+	// It bought no gas on the way out, and it sent the lot.
+	if len(chain.order) != 1 {
+		t.Fatalf("%d transactions broadcast, want the withdrawal alone", len(chain.order))
+	}
+	in, _, _ := store.Intent(r.Account(), id(1))
+	if in.Kind != KindWithdraw || in.To != exchange || in.Amount.Cmp(whole) != 0 {
+		t.Fatalf("it recorded %+v, want the whole balance to the destination", in)
+	}
+	chain.include(t, hash, true, transferLogOf(r.Domain(), r.Account(), exchange, whole))
+	chain.finalize()
+	if status, _ := r.Status(ctx, id(1)); status != StatusConfirmed {
+		t.Fatalf("leaving is %s, want confirmed", status)
+	}
+}
+
+func TestWithdrawAllWillNotSignATransferItCannotPayFor(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	chain.gas[r.Account()] = big.NewInt(1)
+
+	_, err := r.WithdrawAll(ctx, id(1), exchange)
+	if !errors.Is(err, ErrInsufficientNative) {
+		t.Fatalf("leaving with no gas: %v", err)
+	}
+	if _, ok, _ := store.Intent(r.Account(), id(1)); ok {
+		t.Fatal("an unpayable transfer was recorded")
+	}
+	if len(chain.order) != 0 {
+		t.Fatal("an unpayable transfer was broadcast")
+	}
+}
+
+func TestWithdrawAllRefusesAnEmptyAccount(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	chain.token[r.Account()] = new(big.Int)
+
+	if _, err := r.WithdrawAll(ctx, id(1), exchange); !errors.Is(err, ErrBadInput) {
+		t.Fatalf("leaving an account with no money: %v, want a refusal", err)
+	}
+}

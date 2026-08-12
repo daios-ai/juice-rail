@@ -34,7 +34,7 @@ usage:
   railctl [flags] balance
   railctl [flags] deposits
   railctl [flags] transfer <id> <recipient>   <amount>
-  railctl [flags] withdraw <id> <destination> <amount>
+  railctl [flags] withdraw <id> <destination> <amount|all>
   railctl [flags] retry    <id>
   railctl [flags] status   <id>
 
@@ -57,7 +57,8 @@ Profiles live in ~/.juice-rail: config.json holds domains and profiles,
 credentials.json holds keys and nothing else. Secrets are passed as file
 paths, never as flag values, because a flag value is world-readable.
 
-Amounts are decimal token units, for example 12.50. Diagnostics go to
+Amounts are decimal token units, for example 12.50. "withdraw ... all" sends
+the whole balance out; the gas reserve stays behind. Diagnostics go to
 stderr, data to stdout.
 `
 
@@ -697,6 +698,15 @@ func (a *app) pay(ctx context.Context, kind rail.Kind, args []string) error {
 	to, err := rail.ParseAddress(args[1], what)
 	if err != nil {
 		return err
+	}
+	// "all" is the terminal case: the whole balance, on the way out. It is not
+	// an amount, so it never reaches the reserve policy.
+	if kind == rail.KindWithdraw && args[2] == "all" {
+		hash, err := a.rail.WithdrawAll(ctx, id, to)
+		if err != nil {
+			return err
+		}
+		return a.report(ctx, id, submitted(hash))
 	}
 	amount, err := a.domain.ParseAmount(args[2])
 	if err != nil {

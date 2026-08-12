@@ -189,6 +189,11 @@ The same primitive with an external destination, supplied per operation;
 there is no stored withdrawal address. The distinction from transfer is
 semantic: the destination is outside the rail.
 
+A withdrawal may take the whole balance. Leaving is not paying and does not
+consult the reserve policy: a payment wants the reserve kept up, an exit does
+not, and buying gas on the way out is money spent to leave. The reserve stays
+behind, reachable with the account's key and by no verb here.
+
 7. Identity, retry and confirmation
 
 Before signing, the client durably records the intent:
@@ -288,7 +293,7 @@ decision is about. Configured bounds only.
 
 11. User stories
 
-Exactly six. Each runs against the standalone app on a local chain stack,
+Exactly seven. Each runs against the standalone app on a local chain stack,
 and the whole sequence is also driven once on a staging domain against a
 real venue.
 
@@ -301,6 +306,7 @@ real venue.
                 USDT0 blocks loudly with nothing signed
 6. recovery     killed after signing; restart reconciles nonces from
                 finalized history; retry duplicates nothing
+7. leave        the whole balance goes out in one transfer, buying no gas
 ```
 
 The standalone app is an operations and test harness, never a wallet
@@ -310,7 +316,7 @@ product.
 
 There is no contract to verify. The gas policy is a pure decision function
 over (ETH, USDT0, quote, pending operation) and is tested exhaustively; the
-library is conventionally tested and exercised by the six stories.
+library is conventionally tested and exercised by the seven stories.
 
 Trust base:
 
@@ -325,7 +331,7 @@ RPC honest
 
 13. Plan
 
-Standalone-first: the library and app prove all six stories before host
+Standalone-first: the library and app prove all seven stories before host
 integration.
 
 Layout:
