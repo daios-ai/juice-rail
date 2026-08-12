@@ -9,6 +9,7 @@
 package rail
 
 import (
+	"crypto/ecdsa"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // Kind is what an operation is for. Transfer and withdraw are the same token
@@ -245,6 +247,10 @@ type Domain struct {
 	Name    string
 	ChainID *big.Int
 	Token   common.Address
+	// Decimals is how many base units make one unit of the token. It is a
+	// property of the token, so amounts are the domain's business and not the
+	// app's.
+	Decimals uint8
 	// Finality names the mechanism that makes a fact permanent. Only true
 	// finality is supported, because a confirmed fact must never revert.
 	Finality string
@@ -263,6 +269,9 @@ func (d Domain) Validate() error {
 	if d.Token == (common.Address{}) {
 		return fmt.Errorf("%w: domain %q: token address must be set", ErrBadInput, d.Name)
 	}
+	if d.Decimals == 0 || d.Decimals > 36 {
+		return fmt.Errorf("%w: domain %q: token decimals must be set", ErrBadInput, d.Name)
+	}
 	if d.Finality != "finalized" {
 		return fmt.Errorf("%w: domain %q: finality %q unsupported: only true finality (\"finalized\") is safe here",
 			ErrBadInput, d.Name, d.Finality)
@@ -274,6 +283,102 @@ func (d Domain) Validate() error {
 		return fmt.Errorf("%w: domain %q: the swap venue needs a pool fee tier", ErrBadInput, d.Name)
 	}
 	return d.Gas.Validate()
+}
+
+// NativeDecimals is how the chain's own currency is denominated. Every EVM
+// chain uses the same figure, so nothing configures it.
+const NativeDecimals = 18
+
+// ParseAmount reads a decimal amount of the token into base units, exactly.
+// There is no floating point anywhere in this library: money is integers.
+func (d Domain) ParseAmount(s string) (*big.Int, error) {
+	return parseUnits(s, d.Decimals)
+}
+
+// FormatAmount renders base units of the token the way people write them.
+func (d Domain) FormatAmount(v *big.Int) string { return formatUnits(v, d.Decimals) }
+
+// FormatNative renders an amount of the chain's own currency. It is fuel here,
+// never money, but a person still has to be able to read it.
+func FormatNative(v *big.Int) string { return formatUnits(v, NativeDecimals) }
+
+// FundingChecklist says what has to be sent before an account can act. Both
+// assets are named, because an account with only one of them cannot move.
+func (d Domain) FundingChecklist(account common.Address) string {
+	return fmt.Sprintf(`to make this account operational, fund it:
+  1. send the stablecoin to %s
+  2. send at least %s of the native currency to the same address
+  3. wait for finality
+
+after that the account keeps its own gas: it buys more with its own
+stablecoin whenever the reserve runs low.`, account, FormatNative(d.Gas.Min))
+}
+
+func parseUnits(s string, decimals uint8) (*big.Int, error) {
+	text := strings.TrimSpace(s)
+	if text == "" {
+		return nil, fmt.Errorf("%w: amount is empty", ErrBadInput)
+	}
+	whole, frac, _ := strings.Cut(text, ".")
+	if whole == "" {
+		whole = "0"
+	}
+	if len(frac) > int(decimals) {
+		return nil, fmt.Errorf("%w: amount %q has more than %d decimal places", ErrBadInput, s, decimals)
+	}
+	digits := whole + frac + strings.Repeat("0", int(decimals)-len(frac))
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return nil, fmt.Errorf("%w: amount %q is not a decimal number", ErrBadInput, s)
+		}
+	}
+	v, ok := new(big.Int).SetString(digits, 10)
+	if !ok {
+		return nil, fmt.Errorf("%w: amount %q is not a decimal number", ErrBadInput, s)
+	}
+	return v, nil
+}
+
+// formatUnits shows two decimal places at least, and no trailing noise beyond
+// that.
+func formatUnits(v *big.Int, decimals uint8) string {
+	if v == nil {
+		v = new(big.Int)
+	}
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+	whole, frac := new(big.Int).QuoRem(v, scale, new(big.Int))
+	digits := fmt.Sprintf("%0*s", int(decimals), frac.String())
+	digits = strings.TrimRight(digits, "0")
+	for len(digits) < 2 {
+		digits += "0"
+	}
+	return whole.String() + "." + digits
+}
+
+// ParseAddress refuses anything that is not a whole address.
+// common.HexToAddress pads and truncates in silence, so a half-pasted
+// destination would become a real address nobody holds the key to, and the
+// signature would make it authoritative. Nothing downstream can catch that:
+// the chain cannot know an address was a typo.
+func ParseAddress(s, what string) (common.Address, error) {
+	if !common.IsHexAddress(s) {
+		return common.Address{}, fmt.Errorf("%w: %s %q is not an Ethereum address", ErrBadInput, what, s)
+	}
+	return common.HexToAddress(s), nil
+}
+
+// ParseKey reads a hex key, with or without the 0x prefix that is how keys are
+// usually pasted. source names where it came from, so the error does too.
+func ParseKey(hex, source string) (*ecdsa.PrivateKey, error) {
+	v := strings.TrimPrefix(hex, "0x")
+	if v == "" {
+		return nil, fmt.Errorf("%w: %s is not set", ErrBadInput, source)
+	}
+	k, err := crypto.HexToECDSA(v)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %v", ErrBadInput, source, err)
+	}
+	return k, nil
 }
 
 // DomainKey names the domain a store serves: the chain and the token accounted

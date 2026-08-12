@@ -221,10 +221,16 @@ assumption.
 Go. A `Rail` instance binds one domain at construction; a host using
 several domains holds several instances.
 
+THE LIBRARY IS THE WHOLE RAIL. All chain access, all amount handling in the
+token's own units, all checks that a domain is what it claims, and the
+payment flow itself. A host adds configuration discovery and rendering, and
+nothing else; logic a host has to write is logic missing from the library.
+
 ```text
 account   balances (USDT0, ETH reserve)   nonce
-prepare / sign / submit   (transfer, withdrawal, refill)
+pay (transfer, withdrawal), retry        prepare / send / refill beneath it
 deposit observation   status   finality
+domain check   amount parsing and formatting   funding checklist
 ```
 
 Durable state, write-once or append-only, nothing else:

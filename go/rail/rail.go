@@ -3,6 +3,7 @@ package rail
 import (
 	"context"
 	"crypto/ecdsa"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -21,6 +22,7 @@ const refillWindow = time.Hour
 // Chain is everything the rail needs from a node: the reads that decide
 // status, and plain transaction machinery. *ethclient.Client satisfies it.
 type Chain interface {
+	ChainID(ctx context.Context) (*big.Int, error)
 	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
 	FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error)
 	CallContract(ctx context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
@@ -51,6 +53,9 @@ type Rail struct {
 	// mu serialises reconciliation, the reserve decision, nonce assignment and
 	// submission: the sequence that must not interleave with itself.
 	mu sync.Mutex
+	// chainChecked records that this endpoint really serves this domain. Asked
+	// once, before the first thing that could move money.
+	chainChecked bool
 }
 
 // New binds a rail to one domain. The key both spends the money and pays the
@@ -89,21 +94,60 @@ func (r *Rail) Balances(ctx context.Context) (token, gas *big.Int, err error) {
 	return token, gas, nil
 }
 
-// CheckDomain proves the domain is usable before any money depends on it: the
-// token answers, it carries EIP-2612 permits, and the venue can price a
+// CheckDomain proves a domain is usable before any money depends on it: the
+// endpoint really serves this chain, the token answers and carries EIP-2612
+// permits, it counts in the units configured, and the venue can price a
 // refill. A domain that fails this can never keep an account in gas.
+//
+// It needs no store and no key, so it can be run before an account exists.
+func CheckDomain(ctx context.Context, d Domain, chain Chain, account common.Address) error {
+	if err := d.Validate(); err != nil {
+		return err
+	}
+	if err := checkChain(ctx, d, chain); err != nil {
+		return err
+	}
+	if _, err := tokenUint(ctx, chain, d.Token, "balanceOf", account); err != nil {
+		return fmt.Errorf("token %s is not an ERC-20 here: %w", d.Token, err)
+	}
+	if _, err := callWord(ctx, chain, d.Token, tokenABI, "DOMAIN_SEPARATOR"); err != nil {
+		return fmt.Errorf("token %s does not implement EIP-2612: %w", d.Token, err)
+	}
+	if _, err := tokenUint(ctx, chain, d.Token, "nonces", account); err != nil {
+		return fmt.Errorf("token %s does not implement EIP-2612: %w", d.Token, err)
+	}
+	// Units are worth one read: mistaking six decimals for eighteen misstates
+	// every amount this domain will ever handle, by a factor of a trillion.
+	decimals, err := tokenUint(ctx, chain, d.Token, "decimals")
+	if err != nil {
+		return fmt.Errorf("token %s does not report its decimals: %w", d.Token, err)
+	}
+	if decimals.Uint64() != uint64(d.Decimals) {
+		return fmt.Errorf("%w: token %s has %s decimals, the domain says %d",
+			ErrBadInput, d.Token, decimals, d.Decimals)
+	}
+	if _, err := quoteRefill(ctx, chain, d, d.Gas.Min); err != nil {
+		return fmt.Errorf("swap venue %s cannot price a refill: %w", d.Venue.Router, err)
+	}
+	return nil
+}
+
+// CheckDomain re-checks this rail's own domain.
 func (r *Rail) CheckDomain(ctx context.Context) error {
-	if _, err := tokenUint(ctx, r.chain, r.domain.Token, "balanceOf", r.address); err != nil {
-		return fmt.Errorf("token %s is not an ERC-20 here: %w", r.domain.Token, err)
+	return CheckDomain(ctx, r.domain, r.chain, r.address)
+}
+
+// checkChain refuses an endpoint for a different chain. The endpoint is the
+// one thing a person types by hand, and money sent on the wrong chain is
+// simply gone.
+func checkChain(ctx context.Context, d Domain, chain Chain) error {
+	got, err := chain.ChainID(ctx)
+	if err != nil {
+		return fmt.Errorf("read chain id: %w", err)
 	}
-	if _, err := callWord(ctx, r.chain, r.domain.Token, tokenABI, "DOMAIN_SEPARATOR"); err != nil {
-		return fmt.Errorf("token %s does not implement EIP-2612: %w", r.domain.Token, err)
-	}
-	if _, err := tokenUint(ctx, r.chain, r.domain.Token, "nonces", r.address); err != nil {
-		return fmt.Errorf("token %s does not implement EIP-2612: %w", r.domain.Token, err)
-	}
-	if _, err := quoteRefill(ctx, r.chain, r.domain, r.domain.Gas.Min); err != nil {
-		return fmt.Errorf("swap venue %s cannot price a refill: %w", r.domain.Venue.Router, err)
+	if got == nil || got.Cmp(d.ChainID) != 0 {
+		return fmt.Errorf("%w: the endpoint serves chain %s, domain %q is chain %s",
+			ErrWrongDomain, got, d.Name, d.ChainID)
 	}
 	return nil
 }
@@ -156,7 +200,8 @@ func (r *Rail) Prepare(ctx context.Context, id ID, kind Kind, to common.Address,
 	case ActionWait:
 		return r.shortage(d.Reason, in, amount)
 	case ActionQuote, ActionRefill:
-		return fmt.Errorf("%w: reserve is %s, minimum is %s", ErrNeedRefill, in.Gas, r.domain.Gas.Min)
+		return fmt.Errorf("%w: reserve is %s, minimum is %s",
+			ErrNeedRefill, FormatNative(in.Gas), FormatNative(r.domain.Gas.Min))
 	}
 
 	data, err := transferCalldata(to, amount)
@@ -176,6 +221,45 @@ func (r *Rail) Prepare(ctx context.Context, id ID, kind Kind, to common.Address,
 		ID: id, Kind: kind, To: to, Amount: new(big.Int).Set(amount),
 		Nonce: nonce, Calldata: data, FromBlock: head.Number.Uint64(),
 	})
+}
+
+// Outcome is what one call to Pay achieved. Exactly one of the two happens: a
+// payment goes out, or gas is bought so that it can next time.
+type Outcome struct {
+	// TxHash is the payment. Zero if it did not run, or had already settled.
+	TxHash common.Hash
+	// RefillID and RefillTx are set when the reserve was too low and gas was
+	// bought instead. Ask again once that has finalized.
+	RefillID ID
+	RefillTx common.Hash
+}
+
+// Refilled reports whether this call bought gas rather than paying.
+func (o Outcome) Refilled() bool { return o.RefillTx != (common.Hash{}) }
+
+// Pay records a payment and sends it, buying gas first if the reserve is too
+// low to act. It is sequencing and nothing more: the reserve rule lives in one
+// place and Pay does not second-guess it.
+//
+// Repeating a Pay with the same identifier is safe. Once the refill it
+// reports has finalized, call it again and the payment goes out.
+func (r *Rail) Pay(ctx context.Context, id ID, kind Kind, to common.Address, amount *big.Int) (Outcome, error) {
+	err := r.Prepare(ctx, id, kind, to, amount)
+	switch {
+	case errors.Is(err, ErrNeedRefill):
+		refill, tx, err := r.Refill(ctx, amount)
+		if err != nil {
+			return Outcome{}, err
+		}
+		return Outcome{RefillID: refill, RefillTx: tx}, nil
+	case err != nil:
+		return Outcome{}, err
+	}
+	hash, err := r.Send(ctx, id)
+	if err != nil {
+		return Outcome{}, err
+	}
+	return Outcome{TxHash: hash}, nil
 }
 
 // Refill buys native currency with the account's own stablecoin, topping the
@@ -202,7 +286,8 @@ func (r *Rail) Refill(ctx context.Context, reserve *big.Int) (ID, common.Hash, e
 
 	d := Decide(r.domain.Gas, in)
 	if d.Action == ActionExecute {
-		return ID{}, common.Hash{}, fmt.Errorf("%w: %s held, minimum is %s", ErrNoRefillNeeded, in.Gas, r.domain.Gas.Min)
+		return ID{}, common.Hash{}, fmt.Errorf("%w: %s held, minimum is %s",
+			ErrNoRefillNeeded, FormatNative(in.Gas), FormatNative(r.domain.Gas.Min))
 	}
 	if d.Action == ActionQuote {
 		quote, err := quoteRefill(ctx, r.chain, r.domain, d.Delta)
@@ -308,6 +393,12 @@ func (r *Rail) Intent(id ID) (Intent, bool, error) { return r.store.Intent(r.add
 // something is still in flight. One outgoing transaction at a time is what
 // keeps two operations from projecting the same reserve twice.
 func (r *Rail) ready(ctx context.Context) error {
+	if !r.chainChecked {
+		if err := checkChain(ctx, r.domain, r.chain); err != nil {
+			return err
+		}
+		r.chainChecked = true
+	}
 	if err := r.reconcile(ctx); err != nil {
 		return err
 	}
@@ -365,12 +456,13 @@ func (r *Rail) shortage(reason Reason, in PolicyInput, pending *big.Int) error {
 	switch reason {
 	case ReasonNeedToken:
 		return fmt.Errorf("%w: holding %s, need %s plus the cost of a refill — send stablecoin to %s",
-			ErrInsufficientStablecoin, in.Token, orZero(pending), r.address)
+			ErrInsufficientStablecoin, r.domain.FormatAmount(in.Token), r.domain.FormatAmount(orZero(pending)), r.address)
 	case ReasonNeedNative:
 		return fmt.Errorf("%w: holding %s, a refill costs %s — send native currency to %s",
-			ErrInsufficientNative, in.Gas, in.SwapCost, r.address)
+			ErrInsufficientNative, FormatNative(in.Gas), FormatNative(in.SwapCost), r.address)
 	case ReasonFeesAboveBound:
-		return fmt.Errorf("%w: a refill would cost %s, the bound is %s", ErrFeesAboveBound, in.SwapCost, r.domain.Gas.FeeBound)
+		return fmt.Errorf("%w: a refill would cost %s, the bound is %s",
+			ErrFeesAboveBound, FormatNative(in.SwapCost), FormatNative(r.domain.Gas.FeeBound))
 	default:
 		return fmt.Errorf("%w: refused with no reason", ErrBadInput)
 	}

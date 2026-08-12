@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -36,9 +37,11 @@ type fakeChain struct {
 	order      []common.Hash
 	logs       []types.Log
 	// price is token base units per 1e18 of native currency.
-	price   *big.Int
-	sendErr error
-	callErr error
+	price    *big.Int
+	decimals byte
+	chainID  *big.Int
+	sendErr  error
+	callErr  error
 	// receiptErr stands in for a node that cannot answer, as distinct from one
 	// answering "no such transaction".
 	receiptErr error
@@ -66,7 +69,17 @@ func newFakeChain(d Domain) *fakeChain {
 		receipts:   map[common.Hash]*types.Receipt{},
 		sent:       map[common.Hash]*types.Transaction{},
 		price:      big.NewInt(3_000_000_000), // 3000 token units per unit of gas currency
+		decimals:   6,
 	}
+}
+
+func (c *fakeChain) ChainID(context.Context) (*big.Int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.chainID != nil {
+		return c.chainID, nil
+	}
+	return c.domain.ChainID, nil
 }
 
 func (c *fakeChain) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
@@ -203,6 +216,8 @@ func (c *fakeChain) CallContract(_ context.Context, msg ethereum.CallMsg, _ *big
 			return common.LeftPadBytes(orZero(c.token[args[0].(common.Address)]).Bytes(), 32), nil
 		case string(tokenABI.Methods["nonces"].ID):
 			return common.LeftPadBytes(nil, 32), nil
+		case string(tokenABI.Methods["decimals"].ID):
+			return common.LeftPadBytes([]byte{c.decimals}, 32), nil
 		case string(tokenABI.Methods["DOMAIN_SEPARATOR"].ID):
 			return crypto.Keccak256([]byte("token domain")), nil
 		case string(tokenABI.Methods["transfer"].ID):
@@ -321,6 +336,7 @@ func testDomain() Domain {
 		Name:     "test",
 		ChainID:  big.NewInt(31337),
 		Token:    common.HexToAddress("0x00000000000000000000000000000000000000a0"),
+		Decimals: 6,
 		Finality: "finalized",
 		Venue: Venue{
 			Router:  common.HexToAddress("0x00000000000000000000000000000000000000b0"),
@@ -895,5 +911,105 @@ func TestAPaymentMayLeaveTheReserveUnderMinimumAndTheNextOneRefills(t *testing.T
 	if landing.Cmp(r.Domain().Gas.Max) < 0 {
 		t.Fatalf("a refill of %s lands the reserve at %s, short of the maximum %s",
 			in.Delta, landing, r.Domain().Gas.Max)
+	}
+}
+
+func TestPayIsTheWholeFlowAnAppWouldOtherwiseWrite(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+
+	// Reserve is fine: the payment goes out, and nothing was refilled.
+	out, err := r.Pay(ctx, id(1), KindTransfer, bob, big.NewInt(10_000_000))
+	if err != nil {
+		t.Fatalf("pay: %v", err)
+	}
+	if out.Refilled() || out.TxHash == (common.Hash{}) {
+		t.Fatalf("a funded account paid as %+v", out)
+	}
+	chain.include(t, out.TxHash, true, transferLogOf(r.Domain(), r.Account(), bob, big.NewInt(10_000_000)))
+	chain.finalize()
+
+	// Reserve below the minimum: gas is bought instead, under an identifier of
+	// its own, and the payment is left for next time.
+	chain.gas[r.Account()] = big.NewInt(10_000_000_000_000_000)
+	out, err = r.Pay(ctx, id(2), KindTransfer, bob, big.NewInt(10_000_000))
+	if err != nil {
+		t.Fatalf("pay on a low reserve: %v", err)
+	}
+	if !out.Refilled() || out.TxHash != (common.Hash{}) {
+		t.Fatalf("a low reserve paid as %+v", out)
+	}
+	if out.RefillID == id(2) {
+		t.Fatal("the refill took the caller's identifier")
+	}
+	if _, ok, _ := store.Intent(r.Account(), id(2)); ok {
+		t.Fatal("a payment that never ran left a record behind")
+	}
+
+	// Once the refill has finalized, the same call pays.
+	chain.include(t, out.RefillTx, true)
+	chain.finalize()
+	chain.gas[r.Account()] = big.NewInt(100_000_000_000_000_000)
+	again, err := r.Pay(ctx, id(2), KindTransfer, bob, big.NewInt(10_000_000))
+	if err != nil {
+		t.Fatalf("pay after the refill: %v", err)
+	}
+	if again.Refilled() || again.TxHash == (common.Hash{}) {
+		t.Fatalf("after refilling, paying gave %+v", again)
+	}
+}
+
+func TestPayReportsAShortageInUnitsAPersonReads(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	chain.gas[r.Account()] = big.NewInt(1) // cannot even pay for a refill
+
+	_, err := r.Pay(ctx, id(1), KindTransfer, bob, big.NewInt(10_000_000))
+	if !errors.Is(err, ErrInsufficientNative) {
+		t.Fatalf("pay with no gas: %v", err)
+	}
+	// Every amount is written the way a person writes one. A long run of
+	// digits that is not the tail of a decimal is wei leaking out.
+	if m := regexp.MustCompile(`(^|[^.0-9])([0-9]{12,})`).FindString(err.Error()); m != "" {
+		t.Fatalf("the message shows raw base units %q: %s", strings.TrimSpace(m), err)
+	}
+	if !strings.Contains(err.Error(), r.Account().Hex()) {
+		t.Fatalf("the message does not say where to send: %s", err)
+	}
+}
+
+func TestTheUnitsAreCheckedAgainstTheToken(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	if err := r.CheckDomain(ctx); err != nil {
+		t.Fatalf("a correctly configured domain was refused: %v", err)
+	}
+	// A token that counts in eighteen decimals while the domain says six would
+	// misstate every amount by a factor of a trillion.
+	chain.decimals = 18
+	if err := r.CheckDomain(ctx); err == nil {
+		t.Fatal("a domain that disagrees with its token about units was accepted")
+	}
+}
+
+func TestARailWillNotActOnTheWrongChain(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	// The endpoint is for some other chain. Records are bound to a chain id,
+	// and money sent on the wrong one is gone.
+	chain.chainID = big.NewInt(1)
+
+	if err := r.CheckDomain(ctx); !errors.Is(err, ErrWrongDomain) {
+		t.Fatalf("checking a domain against the wrong endpoint: %v", err)
+	}
+	err := r.Prepare(ctx, id(1), KindTransfer, bob, big.NewInt(10_000_000))
+	if !errors.Is(err, ErrWrongDomain) {
+		t.Fatalf("paying through the wrong endpoint: %v, want a refusal", err)
+	}
+	if _, ok, _ := store.Intent(r.Account(), id(1)); ok {
+		t.Fatal("an operation on the wrong chain was recorded")
+	}
+	if len(chain.order) != 0 {
+		t.Fatal("an operation on the wrong chain was broadcast")
 	}
 }

@@ -270,6 +270,9 @@ A domain file, field by field:
 }
 ```
 
+- `decimals` is how many base units make one token. It is checked against the
+  token itself at `init`, because mistaking six for eighteen would misstate
+  every amount by a factor of a trillion.
 - `finality` must be `finalized`. Counting confirmations is not supported,
   because something reported as confirmed must never come undone.
 - `fromBlock` is where the search for deposits starts. Set it to the block your
@@ -312,17 +315,31 @@ addresses to put in the domain file.
 ```go
 r, err := rail.New(domain, store, chainClient, key)
 
-r.Balances(ctx)                                    // money, reserve
-r.ScanDeposits(ctx)                                // newly finalized money in
-r.Prepare(ctx, id, rail.KindTransfer, to, amount)  // decide and write down
-r.Send(ctx, id)                                    // sign and broadcast
-r.Retry(ctx, id)                                   // same nonce, higher fee
-r.Status(ctx, id)                                  // from finalized facts only
-r.Refill(ctx, reserve)                             // buy gas, when asked to
+r.Balances(ctx)                                 // money, reserve
+r.ScanDeposits(ctx)                             // newly finalized money in
+r.Pay(ctx, id, rail.KindTransfer, to, amount)   // the whole payment flow
+r.Retry(ctx, id)                                // same nonce, higher fee
+r.Status(ctx, id)                               // from finalized facts only
 ```
 
-`Prepare` returns `ErrNeedRefill` when the reserve is short, and having written
-nothing down. Call `Refill`, wait for finality, then call `Prepare` again.
+`Pay` returns an `Outcome`. Either the payment went out, or the reserve was
+too low and the account bought gas instead:
+
+```go
+if out.Refilled() {
+    // out.RefillTx is buying gas. Wait for it to finalize, then call Pay
+    // again with the same identifier.
+}
+```
+
+Nothing else is needed to run a rail. The steps behind `Pay` —
+`Prepare`, `Send`, `Refill` — stay public for hosts that want to stop between
+them, but no host has to reimplement the flow, and none should.
+
+Amounts are the domain's business, not yours: `domain.ParseAmount("12.50")`,
+`domain.FormatAmount(v)` and `rail.FormatNative(v)` handle units, and every
+error the library returns is already written in them. `domain.FundingChecklist(addr)`
+gives you the onboarding text.
 
 The library reads no file, no environment variable and no home directory.
 Everything arrives at construction; finding configuration is the app's job.

@@ -8,7 +8,6 @@ package main
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -96,10 +95,6 @@ type gasConfig struct {
 	SwapGas     uint64 `json:"swapGas"`
 }
 
-// gasDecimals is how the native currency is displayed. It is never money here,
-// only fuel.
-const gasDecimals = 18
-
 func loadConfig(path string) (config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -137,6 +132,7 @@ func (c config) domain() (rail.Domain, error) {
 		Name:      c.Name,
 		ChainID:   new(big.Int).SetUint64(c.ChainID),
 		Token:     common.HexToAddress(c.Token),
+		Decimals:  c.decimals(),
 		Finality:  finality,
 		FromBlock: c.FromBlock,
 		Venue: rail.Venue{
@@ -166,51 +162,6 @@ func wei(s, what string) (*big.Int, error) {
 		return nil, fmt.Errorf("%s %q is not a whole number of wei", what, s)
 	}
 	return v, nil
-}
-
-// --- amounts ---
-
-// parseUnits reads a decimal amount into base units, exactly. There is no
-// floating point anywhere in this program: money is integers.
-func parseUnits(s string, decimals uint8) (*big.Int, error) {
-	text := strings.TrimSpace(s)
-	if text == "" {
-		return nil, errors.New("amount is empty")
-	}
-	whole, frac, _ := strings.Cut(text, ".")
-	if whole == "" {
-		whole = "0"
-	}
-	if len(frac) > int(decimals) {
-		return nil, fmt.Errorf("amount %q has more than %d decimal places", s, decimals)
-	}
-	digits := whole + frac + strings.Repeat("0", int(decimals)-len(frac))
-	for _, r := range digits {
-		if r < '0' || r > '9' {
-			return nil, fmt.Errorf("amount %q is not a decimal number", s)
-		}
-	}
-	v, ok := new(big.Int).SetString(digits, 10)
-	if !ok {
-		return nil, fmt.Errorf("amount %q is not a decimal number", s)
-	}
-	return v, nil
-}
-
-// formatUnits renders base units for people: two decimal places at least, and
-// no trailing noise beyond that.
-func formatUnits(v *big.Int, decimals uint8) string {
-	if v == nil {
-		v = new(big.Int)
-	}
-	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
-	whole, frac := new(big.Int).QuoRem(v, scale, new(big.Int))
-	digits := fmt.Sprintf("%0*s", int(decimals), frac.String())
-	digits = strings.TrimRight(digits, "0")
-	for len(digits) < 2 {
-		digits += "0"
-	}
-	return whole.String() + "." + digits
 }
 
 // --- profiles: ~/.juice-rail ---
@@ -571,7 +522,7 @@ func initProfile(args []string, opt options) error {
 		}
 		key = common.Bytes2Hex(crypto.FromECDSA(fresh))
 	}
-	owner, err := parseKey(key, "account key")
+	owner, err := rail.ParseKey(key, "account key")
 	if err != nil {
 		return err
 	}
@@ -579,7 +530,7 @@ func initProfile(args []string, opt options) error {
 	// Prove the domain works before any money depends on it: the token must
 	// carry permits and the venue must be able to price a refill, or this
 	// account could never keep itself in gas.
-	if err := checkDomain(c, domain, owner); err != nil {
+	if err := checkDomain(c, domain, crypto.PubkeyToAddress(owner.PublicKey)); err != nil {
 		return err
 	}
 
@@ -599,50 +550,22 @@ func initProfile(args []string, opt options) error {
 		return err
 	}
 
-	address := crypto.PubkeyToAddress(owner.PublicKey).Hex()
+	address := crypto.PubkeyToAddress(owner.PublicKey)
 	fmt.Fprintf(os.Stdout, "profile %s on domain %s, account %s\n", name, c.Name, address)
-	fmt.Fprintf(os.Stderr, `
-to make this account operational, fund it:
-  1. send the stablecoin to %s
-  2. send at least %s of the native currency to the same address
-  3. wait for finality
-
-after that the account keeps its own gas: it buys more with its own
-stablecoin whenever the reserve runs low.
-`, address, formatUnits(domain.Gas.Max, gasDecimals))
+	fmt.Fprintf(os.Stderr, "\n%s\n", domain.FundingChecklist(address))
 	return nil
 }
 
-// checkDomain dials the domain once to make sure it can be operated at all.
-func checkDomain(c config, domain rail.Domain, key *ecdsa.PrivateKey) error {
+// checkDomain dials the domain once and lets the library decide whether it can
+// be operated at all.
+func checkDomain(c config, domain rail.Domain, account common.Address) error {
 	ctx := context.Background()
 	chain, err := ethclient.DialContext(ctx, c.RPC)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", c.RPC, err)
 	}
 	defer chain.Close()
-
-	if err := sameChain(ctx, chain, domain.ChainID); err != nil {
-		return err
-	}
-	r, err := rail.New(domain, noStore{}, chain, key)
-	if err != nil {
-		return err
-	}
-	return r.CheckDomain(ctx)
-}
-
-// sameChain refuses an endpoint for a different chain. Records are bound to a
-// chain id, and money sent on the wrong one is simply gone.
-func sameChain(ctx context.Context, chain *ethclient.Client, want *big.Int) error {
-	got, err := chain.ChainID(ctx)
-	if err != nil {
-		return fmt.Errorf("read chain id: %w", err)
-	}
-	if got.Cmp(want) != 0 {
-		return fmt.Errorf("the endpoint serves chain %s, the domain is chain %s", got, want)
-	}
-	return nil
+	return rail.CheckDomain(ctx, domain, chain, account)
 }
 
 // readKeyFile takes a key from a file, so no secret ever appears in a command
@@ -653,18 +576,18 @@ func readKeyFile(path string) (string, error) {
 		return "", fmt.Errorf("read key file: %w", err)
 	}
 	key := strings.TrimSpace(string(raw))
-	if _, err := parseKey(key, path); err != nil {
+	if _, err := rail.ParseKey(key, path); err != nil {
 		return "", err
 	}
 	return key, nil
 }
 
 type app struct {
-	opt      options
-	rail     *rail.Rail
-	store    *sqlite.Store
-	chain    *ethclient.Client
-	decimals uint8
+	opt    options
+	rail   *rail.Rail
+	store  *sqlite.Store
+	chain  *ethclient.Client
+	domain rail.Domain
 }
 
 func open(ctx context.Context, opt options) (*app, error) {
@@ -672,7 +595,7 @@ func open(ctx context.Context, opt options) (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	key, err := parseKey(in.key, "account key")
+	key, err := rail.ParseKey(in.key, "account key")
 	if err != nil {
 		return nil, err
 	}
@@ -683,10 +606,6 @@ func open(ctx context.Context, opt options) (*app, error) {
 	chain, err := ethclient.DialContext(ctx, in.domain.RPC)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", in.domain.RPC, err)
-	}
-	if err := sameChain(ctx, chain, domain.ChainID); err != nil {
-		chain.Close()
-		return nil, err
 	}
 	store, err := sqlite.Open(in.store, rail.DomainKey(domain.ChainID, domain.Token))
 	if err != nil {
@@ -699,37 +618,12 @@ func open(ctx context.Context, opt options) (*app, error) {
 		chain.Close()
 		return nil, err
 	}
-	return &app{opt: opt, rail: r, store: store, chain: chain, decimals: in.domain.decimals()}, nil
+	return &app{opt: opt, rail: r, store: store, chain: chain, domain: domain}, nil
 }
 
 func (a *app) close() {
 	a.store.Close()
 	a.chain.Close()
-}
-
-// parseAddress refuses anything that is not a whole address.
-// common.HexToAddress pads and truncates in silence, so a half-pasted
-// destination would become a real address nobody holds the key to. Nothing
-// downstream can catch that: the chain cannot know an address was a typo.
-func parseAddress(s, what string) (common.Address, error) {
-	if !common.IsHexAddress(s) {
-		return common.Address{}, fmt.Errorf("%s %q is not an Ethereum address", what, s)
-	}
-	return common.HexToAddress(s), nil
-}
-
-// parseKey reads a hex key, with or without the 0x prefix that is how keys are
-// usually pasted. source names where it came from, so the error does too.
-func parseKey(hex, source string) (*ecdsa.PrivateKey, error) {
-	v := strings.TrimPrefix(hex, "0x")
-	if v == "" {
-		return nil, fmt.Errorf("%s is not set", source)
-	}
-	k, err := crypto.HexToECDSA(v)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", source, err)
-	}
-	return k, nil
 }
 
 func (a *app) account() error {
@@ -747,11 +641,11 @@ func (a *app) balance(ctx context.Context) error {
 	return a.emit(
 		map[string]any{
 			"account": a.rail.Account().Hex(),
-			"balance": formatUnits(token, a.decimals),
+			"balance": a.domain.FormatAmount(token),
 			"units":   token.String(),
-			"reserve": formatUnits(gas, gasDecimals),
+			"reserve": rail.FormatNative(gas),
 		},
-		fmt.Sprintf("balance %s  reserve %s", formatUnits(token, a.decimals), formatUnits(gas, gasDecimals)),
+		fmt.Sprintf("balance %s  reserve %s", a.domain.FormatAmount(token), rail.FormatNative(gas)),
 	)
 }
 
@@ -770,10 +664,10 @@ func (a *app) deposits(ctx context.Context) error {
 	for _, d := range all {
 		rows = append(rows, map[string]any{
 			"tx": d.TxHash.Hex(), "logIndex": d.LogIndex, "from": d.From.Hex(),
-			"amount": formatUnits(d.Amount, a.decimals), "block": d.BlockNumber,
+			"amount": a.domain.FormatAmount(d.Amount), "block": d.BlockNumber,
 		})
 		lines = append(lines, fmt.Sprintf("%s from %s (%s#%d)",
-			formatUnits(d.Amount, a.decimals), d.From.Hex(), d.TxHash.Hex(), d.LogIndex))
+			a.domain.FormatAmount(d.Amount), d.From.Hex(), d.TxHash.Hex(), d.LogIndex))
 	}
 	if a.opt.asJSON {
 		return a.emit(map[string]any{"deposits": rows}, "")
@@ -800,23 +694,37 @@ func (a *app) pay(ctx context.Context, kind rail.Kind, args []string) error {
 	if kind == rail.KindWithdraw {
 		what = "destination"
 	}
-	to, err := parseAddress(args[1], what)
+	to, err := rail.ParseAddress(args[1], what)
 	if err != nil {
 		return err
 	}
-	amount, err := parseUnits(args[2], a.decimals)
+	amount, err := a.domain.ParseAmount(args[2])
 	if err != nil {
 		return err
 	}
 
-	err = a.rail.Prepare(ctx, id, kind, to, amount)
-	if errors.Is(err, rail.ErrNeedRefill) {
-		if a.opt.noRefill {
-			return err
-		}
-		return a.refill(ctx, amount)
+	// The library owns the flow. The step methods are used only where a story
+	// has to stop between durable steps, or where a refill is refused outright.
+	if a.opt.haltAfter != "" || a.opt.noRefill {
+		return a.steps(ctx, id, kind, to, amount)
 	}
+	out, err := a.rail.Pay(ctx, id, kind, to, amount)
 	if err != nil {
+		return err
+	}
+	if out.Refilled() {
+		return a.emit(
+			map[string]any{"refill": out.RefillID.String(), "tx": out.RefillTx.Hex(), "submitted": true},
+			fmt.Sprintf("reserve low: refill %s submitted %s; run the payment again once it is confirmed",
+				out.RefillID, out.RefillTx.Hex()))
+	}
+	return a.report(ctx, id, submitted(out.TxHash))
+}
+
+// steps runs the same payment one durable step at a time, so -halt-after can
+// stop between them and -no-refill can decline to buy gas.
+func (a *app) steps(ctx context.Context, id rail.ID, kind rail.Kind, to common.Address, amount *big.Int) error {
+	if err := a.rail.Prepare(ctx, id, kind, to, amount); err != nil {
 		return err
 	}
 	if a.opt.haltAfter == "intent" {
@@ -826,32 +734,22 @@ func (a *app) pay(ctx context.Context, kind rail.Kind, args []string) error {
 	if err != nil {
 		return err
 	}
-	// A zero hash means the operation had already finished: there was nothing
-	// left to send, which is what a repeated command should find.
-	note := "already settled"
-	if hash != (common.Hash{}) {
-		note = "submitted " + hash.Hex()
-	}
 	if a.opt.haltAfter == "submit" {
 		return a.emit(
 			map[string]any{"id": id.String(), "tx": hash.Hex(), "submitted": hash != common.Hash{}},
-			fmt.Sprintf("%s %s", id, note))
+			fmt.Sprintf("%s %s", id, submitted(hash)))
 	}
-	return a.report(ctx, id, note)
+	return a.report(ctx, id, submitted(hash))
 }
 
-// refill buys native currency with the account's own stablecoin. It is
-// maintenance, not a payment, so it reports separately and leaves the payment
-// for the caller to repeat once the reserve is really there.
-func (a *app) refill(ctx context.Context, reserve *big.Int) error {
-	id, hash, err := a.rail.Refill(ctx, reserve)
-	if err != nil {
-		return err
+// submitted describes what became of an attempt. A zero hash means the
+// operation had already finished, which is what a repeated command should
+// find.
+func submitted(hash common.Hash) string {
+	if hash == (common.Hash{}) {
+		return "already settled"
 	}
-	return a.emit(
-		map[string]any{"refill": id.String(), "tx": hash.Hex(), "submitted": true},
-		fmt.Sprintf("reserve low: refill %s submitted %s; run the payment again once it is confirmed", id, hash.Hex()),
-	)
+	return "submitted " + hash.Hex()
 }
 
 // retry re-sends a recorded operation under the same nonce and terms, paying
@@ -914,35 +812,3 @@ func (a *app) emit(structured map[string]any, line string) error {
 	enc.SetIndent("", "  ")
 	return enc.Encode(structured)
 }
-
-// noStore satisfies rail.Store for the one command that binds a rail without
-// keeping records: the domain check at init reads the chain and nothing else.
-type noStore struct{}
-
-var errNoStore = errors.New("railctl: this command keeps no records")
-
-func (noStore) PutIntent(common.Address, rail.Intent) error { return errNoStore }
-func (noStore) Intent(common.Address, rail.ID) (rail.Intent, bool, error) {
-	return rail.Intent{}, false, errNoStore
-}
-func (noStore) IntentByNonce(common.Address, uint64) (rail.Intent, bool, error) {
-	return rail.Intent{}, false, errNoStore
-}
-func (noStore) Pending(common.Address) ([]rail.Intent, error) { return nil, errNoStore }
-func (noStore) AppendSubmission(common.Address, rail.ID, rail.Submission) error {
-	return errNoStore
-}
-func (noStore) Submissions(common.Address, rail.ID) ([]rail.Submission, error) {
-	return nil, errNoStore
-}
-func (noStore) PutFact(common.Address, rail.ID, rail.Fact) error { return errNoStore }
-func (noStore) Fact(common.Address, rail.ID) (rail.Fact, bool, error) {
-	return rail.Fact{}, false, errNoStore
-}
-func (noStore) PutDeposit(common.Address, rail.Deposit) error   { return errNoStore }
-func (noStore) Deposits(common.Address) ([]rail.Deposit, error) { return nil, errNoStore }
-func (noStore) Cursor(common.Address) (uint64, bool, error)     { return 0, false, errNoStore }
-func (noStore) PutCursor(common.Address, uint64) error          { return errNoStore }
-func (noStore) NonceFloor(common.Address) (uint64, bool, error) { return 0, false, errNoStore }
-func (noStore) PutNonceFloor(common.Address, uint64) error      { return errNoStore }
-func (noStore) Close() error                                    { return nil }

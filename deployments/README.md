@@ -24,8 +24,9 @@ account created after that and wrong for one created before.
 The `gas` block is the operating reserve, in wei. `min` must be at least
 `feeBound`, or the reserve could fall to a level from which it cannot pay for
 its own refill. `railctl init` checks the whole file against the chain before
-writing a profile: the token must answer as an ERC-20 and carry EIP-2612
-permits, and the venue must be able to price a refill.
+writing a profile: the token must answer as an ERC-20, carry EIP-2612 permits
+and report the `decimals` this file claims, and the venue must be able to
+price a refill.
 
 ## arbitrum-one
 

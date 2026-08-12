@@ -2,71 +2,11 @@ package main
 
 import (
 	"encoding/json"
-	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
-
-func TestAmountsAreExactIntegers(t *testing.T) {
-	for _, tc := range []struct {
-		text     string
-		decimals uint8
-		want     string
-	}{
-		{"1250", 6, "1250000000"},
-		{"1250.00", 6, "1250000000"},
-		{"0.000001", 6, "1"},
-		{".5", 6, "500000"},
-		{"0", 6, "0"},
-		{"0.1", 18, "100000000000000000"},
-	} {
-		got, err := parseUnits(tc.text, tc.decimals)
-		if err != nil {
-			t.Fatalf("%q: %v", tc.text, err)
-		}
-		if got.String() != tc.want {
-			t.Fatalf("%q is %s base units, want %s", tc.text, got, tc.want)
-		}
-	}
-	for _, bad := range []string{"", "  ", "1.2345678", "one", "1.2.3", "-5", "1e6"} {
-		if _, err := parseUnits(bad, 6); err == nil {
-			t.Fatalf("%q was accepted as an amount", bad)
-		}
-	}
-}
-
-func TestAmountsAreShownWithAtLeastTwoDecimals(t *testing.T) {
-	for _, tc := range []struct {
-		units    string
-		decimals uint8
-		want     string
-	}{
-		{"1250000000", 6, "1250.00"},
-		{"1250500000", 6, "1250.50"},
-		{"1", 6, "0.000001"},
-		{"0", 6, "0.00"},
-		{"50000000000000000", 18, "0.05"},
-	} {
-		v, _ := new(big.Int).SetString(tc.units, 10)
-		if got := formatUnits(v, tc.decimals); got != tc.want {
-			t.Fatalf("%s base units shows as %s, want %s", tc.units, got, tc.want)
-		}
-	}
-}
-
-func TestAmountsRoundTrip(t *testing.T) {
-	for _, text := range []string{"0.00", "1.00", "12.34", "999999.999999"} {
-		units, err := parseUnits(text, 6)
-		if err != nil {
-			t.Fatalf("%q: %v", text, err)
-		}
-		if got := formatUnits(units, 6); got != text {
-			t.Fatalf("%q came back as %q", text, got)
-		}
-	}
-}
 
 func testConfig() config {
 	return config{
@@ -215,17 +155,6 @@ func TestHaltPointsAreTheDurableSteps(t *testing.T) {
 	for _, bad := range []string{"sign", "confirm", "anything"} {
 		if validHaltPoint(bad) {
 			t.Fatalf("%q was accepted as a durable step", bad)
-		}
-	}
-}
-
-func TestAddressesMustBeWholeAddresses(t *testing.T) {
-	if _, err := parseAddress("0x1111111111111111111111111111111111111111", "recipient"); err != nil {
-		t.Fatalf("a whole address was refused: %v", err)
-	}
-	for _, bad := range []string{"0x1111", "1111111111111111111111111111111111111111x", "", "bob"} {
-		if _, err := parseAddress(bad, "recipient"); err == nil {
-			t.Fatalf("%q was accepted as an address", bad)
 		}
 	}
 }

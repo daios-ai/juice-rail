@@ -30,6 +30,8 @@ const (
         "outputs":[{"type":"uint256"}],"stateMutability":"view"},
       {"type":"function","name":"nonces","inputs":[{"name":"owner","type":"address"}],
         "outputs":[{"type":"uint256"}],"stateMutability":"view"},
+      {"type":"function","name":"decimals","inputs":[],
+        "outputs":[{"type":"uint8"}],"stateMutability":"view"},
       {"type":"function","name":"DOMAIN_SEPARATOR","inputs":[],
         "outputs":[{"type":"bytes32"}],"stateMutability":"view"}]`
 

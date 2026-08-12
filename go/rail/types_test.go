@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 func TestKindsRoundTripByName(t *testing.T) {
@@ -139,5 +140,132 @@ func TestGasPolicyMustBeAbleToRefillItself(t *testing.T) {
 				t.Fatal("an unworkable policy was accepted")
 			}
 		})
+	}
+}
+
+func TestAmountsAreExactIntegers(t *testing.T) {
+	d := testDomain() // six decimals, like the stablecoins this serves
+	for _, tc := range []struct {
+		text string
+		want string
+	}{
+		{"1250", "1250000000"},
+		{"1250.00", "1250000000"},
+		{"0.000001", "1"},
+		{".5", "500000"},
+		{"0", "0"},
+	} {
+		got, err := d.ParseAmount(tc.text)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.text, err)
+		}
+		if got.String() != tc.want {
+			t.Fatalf("%q is %s base units, want %s", tc.text, got, tc.want)
+		}
+	}
+	for _, bad := range []string{"", "  ", "1.2345678", "one", "1.2.3", "-5", "1e6"} {
+		if _, err := d.ParseAmount(bad); !errors.Is(err, ErrBadInput) {
+			t.Fatalf("%q was accepted as an amount", bad)
+		}
+	}
+}
+
+func TestAmountsAreShownTheWayPeopleWriteThem(t *testing.T) {
+	d := testDomain()
+	for _, tc := range []struct {
+		units string
+		want  string
+	}{
+		{"1250000000", "1250.00"},
+		{"1250500000", "1250.50"},
+		{"1", "0.000001"},
+		{"0", "0.00"},
+	} {
+		v, _ := new(big.Int).SetString(tc.units, 10)
+		if got := d.FormatAmount(v); got != tc.want {
+			t.Fatalf("%s base units shows as %s, want %s", tc.units, got, tc.want)
+		}
+	}
+	// The native currency needs no configuration: every EVM chain uses 18.
+	for _, tc := range []struct {
+		wei  string
+		want string
+	}{
+		{"50000000000000000", "0.05"},
+		{"68280001500000", "0.0000682800015"},
+		{"0", "0.00"},
+	} {
+		v, _ := new(big.Int).SetString(tc.wei, 10)
+		if got := FormatNative(v); got != tc.want {
+			t.Fatalf("%s wei shows as %s, want %s", tc.wei, got, tc.want)
+		}
+	}
+}
+
+func TestAmountsRoundTrip(t *testing.T) {
+	d := testDomain()
+	for _, text := range []string{"0.00", "1.00", "12.34", "999999.999999"} {
+		units, err := d.ParseAmount(text)
+		if err != nil {
+			t.Fatalf("%q: %v", text, err)
+		}
+		if got := d.FormatAmount(units); got != text {
+			t.Fatalf("%q came back as %q", text, got)
+		}
+	}
+}
+
+func TestTheFundingChecklistNamesBothAssetsAndTheAddress(t *testing.T) {
+	d := testDomain()
+	got := d.FundingChecklist(bob)
+	for _, want := range []string{
+		bob.Hex(),
+		"send the stablecoin",
+		"native currency",
+		FormatNative(d.Gas.Min), // the minimum is what makes an account operational
+		"wait for finality",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the checklist does not mention %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestADomainWithoutUnitsIsRefused(t *testing.T) {
+	d := testDomain()
+	d.Decimals = 0
+	if err := d.Validate(); err == nil {
+		t.Fatal("a domain that does not know its own units was accepted")
+	}
+}
+
+func TestAddressesMustBeWholeAddresses(t *testing.T) {
+	if _, err := ParseAddress("0x1111111111111111111111111111111111111111", "recipient"); err != nil {
+		t.Fatalf("a whole address was refused: %v", err)
+	}
+	for _, bad := range []string{"0x1111", "1111111111111111111111111111111111111111x", "", "bob"} {
+		if _, err := ParseAddress(bad, "recipient"); err == nil {
+			t.Fatalf("%q was accepted as an address", bad)
+		}
+	}
+}
+
+func TestKeysAreReadWithOrWithoutThePrefix(t *testing.T) {
+	const hex = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+	bare, err := ParseKey(hex, "account key")
+	if err != nil {
+		t.Fatalf("bare key: %v", err)
+	}
+	prefixed, err := ParseKey("0x"+hex, "account key")
+	if err != nil {
+		t.Fatalf("prefixed key: %v", err)
+	}
+	if crypto.PubkeyToAddress(bare.PublicKey) != crypto.PubkeyToAddress(prefixed.PublicKey) {
+		t.Fatal("the same key read two ways gave two accounts")
+	}
+	for _, bad := range []string{"", "zz", hex[:10]} {
+		if _, err := ParseKey(bad, "account key"); err == nil {
+			t.Fatalf("%q was accepted as a key", bad)
+		}
 	}
 }
