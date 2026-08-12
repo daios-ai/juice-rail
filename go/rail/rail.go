@@ -364,9 +364,11 @@ func (r *Rail) policyInput(ctx context.Context, feeCap, pending *big.Int) (Polic
 func (r *Rail) shortage(reason Reason, in PolicyInput, pending *big.Int) error {
 	switch reason {
 	case ReasonNeedToken:
-		return fmt.Errorf("%w: holding %s, need %s plus the cost of a refill", ErrInsufficientToken, in.Token, orZero(pending))
-	case ReasonNeedGas:
-		return fmt.Errorf("%w: holding %s, a refill costs %s", ErrInsufficientGas, in.Gas, in.SwapCost)
+		return fmt.Errorf("%w: holding %s, need %s plus the cost of a refill — send stablecoin to %s",
+			ErrInsufficientStablecoin, in.Token, orZero(pending), r.address)
+	case ReasonNeedNative:
+		return fmt.Errorf("%w: holding %s, a refill costs %s — send native currency to %s",
+			ErrInsufficientNative, in.Gas, in.SwapCost, r.address)
 	case ReasonFeesAboveBound:
 		return fmt.Errorf("%w: a refill would cost %s, the bound is %s", ErrFeesAboveBound, in.SwapCost, r.domain.Gas.FeeBound)
 	default:

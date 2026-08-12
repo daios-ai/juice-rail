@@ -263,7 +263,7 @@ func TestStory5Refill(t *testing.T) {
 	h.settleAndFinalise()
 
 	refusal := poor.mustFail("transfer", freshID(t), to.Hex(), "5.00")
-	if !strings.Contains(refusal, "not enough stablecoin") {
+	if !strings.Contains(refusal, "stablecoin too low") {
 		t.Fatalf("a shortage was reported as %q", refusal)
 	}
 	if h.nonce(poorAccount) != 0 {

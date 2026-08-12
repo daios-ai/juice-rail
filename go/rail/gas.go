@@ -26,9 +26,9 @@ const (
 	// ReasonNeedToken: not enough stablecoin for the payment, or for the
 	// refill that would enable it.
 	ReasonNeedToken
-	// ReasonNeedGas: the reserve cannot pay for its own refill. Only an
+	// ReasonNeedNative: the reserve cannot pay for its own refill. Only an
 	// external top-up recovers from this.
-	ReasonNeedGas
+	ReasonNeedNative
 	// ReasonFeesAboveBound: gas costs more than the configured bound.
 	ReasonFeesAboveBound
 )
@@ -37,9 +37,9 @@ const (
 func (r Reason) Err() error {
 	switch r {
 	case ReasonNeedToken:
-		return ErrInsufficientToken
-	case ReasonNeedGas:
-		return ErrInsufficientGas
+		return ErrInsufficientStablecoin
+	case ReasonNeedNative:
+		return ErrInsufficientNative
 	case ReasonFeesAboveBound:
 		return ErrFeesAboveBound
 	default:
@@ -100,7 +100,7 @@ func Decide(p GasPolicy, in PolicyInput) Decision {
 		return Decision{Action: ActionWait, Reason: ReasonFeesAboveBound}
 	}
 	if gas.Cmp(swapCost) < 0 {
-		return Decision{Action: ActionWait, Reason: ReasonNeedGas}
+		return Decision{Action: ActionWait, Reason: ReasonNeedNative}
 	}
 	// Counting the refill's own gas as spent. This is positive: the reserve is
 	// under MIN, and MAX is above it.

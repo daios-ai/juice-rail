@@ -440,7 +440,7 @@ func TestShortOfMoneySignsNothing(t *testing.T) {
 	chain.token[r.Account()] = big.NewInt(5)
 
 	err := r.Prepare(ctx, id(1), KindTransfer, bob, big.NewInt(10_000_000))
-	if !errors.Is(err, ErrInsufficientToken) {
+	if !errors.Is(err, ErrInsufficientStablecoin) {
 		t.Fatalf("paying more than it holds: %v, want a shortage", err)
 	}
 	if _, ok, _ := store.Intent(r.Account(), id(1)); ok {
@@ -514,7 +514,7 @@ func TestRefillWillNotSpendThePaymentItEnables(t *testing.T) {
 	chain.token[r.Account()] = big.NewInt(60_000_000)
 
 	_, _, err := r.Refill(ctx, big.NewInt(59_000_000))
-	if !errors.Is(err, ErrInsufficientToken) {
+	if !errors.Is(err, ErrInsufficientStablecoin) {
 		t.Fatalf("refill that would eat the payment: %v, want a shortage", err)
 	}
 	if pending, _ := store.Pending(r.Account()); len(pending) != 0 {
@@ -543,7 +543,7 @@ func TestReserveTooLowToRefillIsReportedNotHidden(t *testing.T) {
 	chain.gas[r.Account()] = big.NewInt(1) // cannot pay for anything
 
 	_, _, err := r.Refill(ctx, big.NewInt(0))
-	if !errors.Is(err, ErrInsufficientGas) {
+	if !errors.Is(err, ErrInsufficientNative) {
 		t.Fatalf("refill with no gas at all: %v, want an external top-up", err)
 	}
 }

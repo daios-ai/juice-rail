@@ -188,8 +188,8 @@ const (
 )
 
 // GasPolicy is the operating reserve: keep the native balance between Min and
-// Max, buying more with the account's own stablecoin when a payment would take
-// it below Min.
+// Max, buying more with the account's own stablecoin whenever the balance is
+// below Min.
 type GasPolicy struct {
 	Min, Max *big.Int
 	// SlippageBps bounds how much more than the quote a refill may spend, in
@@ -308,12 +308,13 @@ var (
 	// ErrNoRefillNeeded is returned when a refill is asked for and the reserve
 	// is already sufficient.
 	ErrNoRefillNeeded = errors.New("rail: reserve is sufficient")
-	// ErrInsufficientToken is returned when the account cannot afford the
+	// ErrInsufficientStablecoin is returned when the account cannot afford the
 	// payment, or the refill that would let it make the payment.
-	ErrInsufficientToken = errors.New("rail: not enough stablecoin")
-	// ErrInsufficientGas is returned when the reserve cannot even pay for its
-	// own refill. Recovery is an external top-up.
-	ErrInsufficientGas = errors.New("rail: not enough native currency to refill; top up externally")
+	ErrInsufficientStablecoin = errors.New("stablecoin too low, top up")
+	// ErrInsufficientNative is returned when the reserve cannot even pay for its
+	// own refill. Nothing internal recovers from this: the account cannot buy
+	// the currency it needs in order to buy it.
+	ErrInsufficientNative = errors.New("native currency too low, top up")
 	// ErrFeesAboveBound is returned when a refill would cost more than the
 	// configured bound. The account waits for cheaper gas.
 	ErrFeesAboveBound = errors.New("rail: gas costs more than the configured bound")

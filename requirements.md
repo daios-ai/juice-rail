@@ -93,10 +93,27 @@ covering the next transaction is what MIN is for. One threshold, one place, a
 pure function. A second reserve rule anywhere is a defect; delete it. A
 reserve under MIN is not a fault, it is the reorder point doing its job.
 
-MIN covers the replenishment transactions plus margin at the fee bound B; no
-constant MIN suffices for every fee level, so refill transaction cost <= B is
-a trust-base assumption and external ETH top-up is the recovery beyond it.
-MAX provides runway so the account rarely rebalances.
+A payment is what takes the balance under MIN, and the refill comes after it,
+so MIN must cover both:
+
+```text
+MIN >= (payment gas + swap gas) × p_ref
+```
+
+p_ref is a reference fee cap: a high percentile of the domain's historical
+base fee, doubled per the formula below, plus tip. No constant MIN suffices
+for every fee level, so refill transaction cost <= B is a trust-base
+assumption and external ETH top-up is the recovery beyond it. MAX provides
+runway so the account rarely rebalances.
+
+Transaction fees follow go-ethereum's default, which the excess-refund rule
+makes free to overstate:
+
+```text
+tip     = node suggestion (eth_maxPriorityFeePerGas), floor 1 wei
+fee cap = tip + 2 × base fee
+cost    = fee cap × gas bound
+```
 
 At most one outgoing transaction is in flight per account.
 

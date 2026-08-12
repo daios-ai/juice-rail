@@ -104,9 +104,11 @@ otherwise:                             wait, and say why
 Waiting is a real outcome and always says which of two things is short:
 
 ```text
-not enough stablecoin  wait for money to come in
-not enough gas         someone must send gas currency from outside
+stablecoin too low, top up        send the stablecoin to the account
+native currency too low, top up   send the gas currency to the account
 ```
+
+Each message carries the amounts and the address to send to.
 
 Nothing is signed when the account waits. Blocked is not lost.
 
@@ -276,7 +278,7 @@ A domain file, field by field:
   two encode a swap slightly differently. Arbitrum One has the first;
   Arbitrum Sepolia has SwapRouter02.
 - `gas.min` / `gas.max` are the reserve band, in wei. The account refills when
-  a payment would take it below `min`, and buys back up to `max`.
+  its reserve is below `min`, and buys back up to `max`.
 - `gas.feeBound` is the most a refill may cost. Above it the account waits.
   It must be no larger than `min`, or the reserve could fall to a level from
   which it cannot pay for its own refill.

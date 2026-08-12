@@ -30,7 +30,7 @@ func oracle(p oraclePolicy, in oracleInput) Decision {
 		return Decision{Action: ActionWait, Reason: ReasonFeesAboveBound}
 	}
 	if in.gas < in.swapCost {
-		return Decision{Action: ActionWait, Reason: ReasonNeedGas}
+		return Decision{Action: ActionWait, Reason: ReasonNeedNative}
 	}
 	delta := p.max - (in.gas - in.swapCost)
 	if !in.quoted {
