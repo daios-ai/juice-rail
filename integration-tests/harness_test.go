@@ -29,20 +29,33 @@ import (
 )
 
 const (
-	// anvil's first two accounts, which arrive with ether: one deploys, one
-	// relays. Everyone else is a fresh key and holds no ether at all.
+	// anvil's first account arrives with ether and does the setup. Everyone
+	// else is a fresh key that starts with nothing at all.
 	deployerKeyHex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-	relayerKeyHex  = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
-	relayer2KeyHex = "5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+	aliceKeyHex    = "1111111111111111111111111111111111111111111111111111111111111111"
+	bobKeyHex      = "2222222222222222222222222222222222222222222222222222222222222222"
+	payerKeyHex    = "3333333333333333333333333333333333333333333333333333333333333333"
 
-	aliceKeyHex = "1111111111111111111111111111111111111111111111111111111111111111"
-	bobKeyHex   = "2222222222222222222222222222222222222222222222222222222222222222"
+	defaultChainID   = 31337
+	slotsInAnEpoch   = 1
+	blocksToFinalise = 3 // finalized lags the head by two blocks
 
-	defaultChainID     = 31337
-	slotsInAnEpoch     = 1
-	blocksToFinalise   = 3 // finalized lags the head by two blocks
-	tokenDecimalsScale = 1_000_000
+	tokenScale = 1_000_000 // the token has six decimals
+
+	// The reserve policy the stories run under, in wei.
+	reserveMin      = "20000000000000000" // 0.02
+	reserveMax      = "50000000000000000" // 0.05
+	reserveFeeBound = "10000000000000000" // 0.01
+	slippageBps     = 50
+
+	// The venue prices one unit of native currency at 3000 token units.
+	venuePrice = 3000 * tokenScale
+	feeTier    = 500
 )
+
+// wethPlaceholder stands for the wrapped native token. The mock venue holds
+// native currency directly, so this is only ever a label in its calldata.
+var wethPlaceholder = common.HexToAddress("0x000000000000000000000000000000000000eeee")
 
 // harness is one isolated fixture: its own chain, its own deployment, its own
 // stores. Nothing is shared between stories.
@@ -61,7 +74,7 @@ func newHarness(t *testing.T) *harness {
 }
 
 // newHarnessOn builds a fixture on a named chain. A second chain is a second
-// domain: separate balances, separate identifiers, no bridging.
+// domain: separate money, separate records, no bridging.
 func newHarnessOn(t *testing.T, chain int64) *harness {
 	t.Helper()
 	dir := t.TempDir()
@@ -97,8 +110,8 @@ func (h *harness) startAnvil() {
 	)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		// The story suite is opt-in, so a missing chain is a failure to run
-		// it, never a quiet pass.
+		// The story suite is opt-in, so a missing chain is a failure to run it,
+		// never a quiet pass.
 		h.t.Fatalf("anvil is required for the story tests: %v", err)
 	}
 	h.t.Cleanup(func() {
@@ -160,12 +173,11 @@ func (h *harness) settleAndFinalise() {
 	h.finalise()
 }
 
-// advanceTime moves chain time forward, which is what expires a signed
-// operation.
-func (h *harness) advanceTime(d time.Duration) {
+// setReserve puts an account's native balance at an exact figure, which is how
+// a story arranges a reserve too low to pay from.
+func (h *harness) setReserve(account common.Address, wei *big.Int) {
 	h.t.Helper()
-	h.rpcCall("evm_increaseTime", int64(d.Seconds()))
-	h.mine(1)
+	h.rpcCall("anvil_setBalance", account, "0x"+wei.Text(16))
 }
 
 // --- deployment ---
@@ -188,13 +200,13 @@ func creationCode(t *testing.T, name string) []byte {
 	return common.FromHex(a.Bytecode.Object)
 }
 
-func (h *harness) deploy(name string, args ...[]byte) common.Address {
+func (h *harness) deploy(name string, value *big.Int, args ...[]byte) common.Address {
 	h.t.Helper()
 	code := creationCode(h.t, name)
 	for _, a := range args {
 		code = append(code, a...)
 	}
-	receipt := h.sendTx(nil, code, nil)
+	receipt := h.sendTx(nil, code, value)
 	if receipt.ContractAddress == (common.Address{}) {
 		h.t.Fatalf("%s did not deploy", name)
 	}
@@ -202,12 +214,15 @@ func (h *harness) deploy(name string, args ...[]byte) common.Address {
 	return receipt.ContractAddress
 }
 
-// deployAll stands up one domain. There is nothing else to deploy and nobody
-// to fund: the rail is adminless and needs no operator infrastructure.
+// deployAll stands up one domain: the token accounted on it and the venue
+// where an account buys its own gas. There is no rail contract and nobody in
+// charge of one.
 func (h *harness) deployAll() {
 	h.t.Helper()
-	token := h.deploy("MockUSDT0")
-	h.deploy("JuiceRail", wordOf(token))
+	token := h.deploy("MockUSDT0", nil)
+	h.deploy("MockRouter", ether(10),
+		wordOf(token), wordOf(wethPlaceholder),
+		wordOfInt(big.NewInt(feeTier)), wordOfInt(big.NewInt(venuePrice)))
 }
 
 // mintTo funds an address with tokens, standing in for money arriving from
@@ -216,6 +231,13 @@ func (h *harness) mintTo(account common.Address, amount *big.Int) {
 	h.t.Helper()
 	to := h.addr["MockUSDT0"]
 	h.sendTx(&to, mustPack(h.t, tokenABI, "mint", account, amount), nil)
+}
+
+// fund gives an address native currency, which is what onboarding asks a new
+// participant to do once.
+func (h *harness) fund(account common.Address, wei *big.Int) {
+	h.t.Helper()
+	h.sendTx(&account, nil, wei)
 }
 
 // --- transactions ---
@@ -248,8 +270,8 @@ func (h *harness) sendTx(to *common.Address, data []byte, value *big.Int) *types
 	if err := h.client.SendTransaction(ctx, signed); err != nil {
 		h.t.Fatalf("send transaction: %v", err)
 	}
-	// Setup transactions land immediately; the stories control everything
-	// after that with mine and finalise.
+	// Setup transactions land immediately; the stories control everything after
+	// that with mine and finalise.
 	h.rpcCall("evm_mine")
 
 	deadline := time.Now().Add(20 * time.Second)
@@ -265,6 +287,37 @@ func (h *harness) sendTx(to *common.Address, data []byte, value *big.Int) *types
 	}
 }
 
+// transferFrom sends tokens from an arbitrary key, standing in for an exchange
+// or a wallet paying money in.
+func (h *harness) transferFrom(keyHex string, to common.Address, amount *big.Int) {
+	h.t.Helper()
+	ctx := context.Background()
+	key := mustKey(h.t, keyHex)
+	from := crypto.PubkeyToAddress(key.PublicKey)
+
+	nonce, err := h.client.PendingNonceAt(ctx, from)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	gasPrice, err := h.client.SuggestGasPrice(ctx)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	token := h.addr["MockUSDT0"]
+	tx := types.NewTx(&types.LegacyTx{
+		Nonce: nonce, To: &token, Gas: 200_000,
+		GasPrice: new(big.Int).Mul(gasPrice, big.NewInt(2)),
+		Data:     mustPack(h.t, tokenABI, "transfer", to, amount),
+	})
+	signed, err := types.SignTx(tx, types.NewEIP155Signer(h.chainID), key)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if err := h.client.SendTransaction(ctx, signed); err != nil {
+		h.t.Fatalf("send transfer: %v", err)
+	}
+}
+
 // --- reads used as an independent oracle ---
 
 func (h *harness) callUint(to common.Address, parsed abi.ABI, method string, args ...any) *big.Int {
@@ -277,21 +330,17 @@ func (h *harness) callUint(to common.Address, parsed abi.ABI, method string, arg
 	return new(big.Int).SetBytes(out)
 }
 
-func (h *harness) railBalance(account common.Address) *big.Int {
-	return h.callUint(h.addr["JuiceRail"], railABI, "balanceOf", account)
-}
-
 func (h *harness) tokenBalance(account common.Address) *big.Int {
 	return h.callUint(h.addr["MockUSDT0"], tokenABI, "balanceOf", account)
 }
 
-// heldByRail is the contract's own token holding, the left side of the
-// solvency invariant.
-func (h *harness) heldByRail() *big.Int {
-	return h.tokenBalance(h.addr["JuiceRail"])
+// allowance is what the venue may still take. A refill authorises at most its
+// own input bound, and the next refill replaces whatever is left.
+func (h *harness) allowance(owner common.Address) *big.Int {
+	return h.callUint(h.addr["MockUSDT0"], tokenABI, "allowance", owner, h.addr["MockRouter"])
 }
 
-func (h *harness) etherBalance(account common.Address) *big.Int {
+func (h *harness) reserve(account common.Address) *big.Int {
 	h.t.Helper()
 	balance, err := h.client.BalanceAt(context.Background(), account, nil)
 	if err != nil {
@@ -300,30 +349,26 @@ func (h *harness) etherBalance(account common.Address) *big.Int {
 	return balance
 }
 
-// assertNoEther is the persona requirement, checked rather than assumed:
-// ordinary participants never hold the chain's native currency.
-func (h *harness) assertNoEther(who string, account common.Address) {
+func (h *harness) nonce(account common.Address) uint64 {
 	h.t.Helper()
-	if balance := h.etherBalance(account); balance.Sign() != 0 {
-		h.t.Fatalf("%s holds %s wei: participants must never need gas", who, balance)
+	n, err := h.client.NonceAt(context.Background(), account, nil)
+	if err != nil {
+		h.t.Fatal(err)
 	}
+	return n
 }
 
-// railEvents counts the rail events an account emitted under an identifier, so
-// a story can assert that money moved exactly once.
-func (h *harness) railEvents(account common.Address, id string) int {
+// transfers counts the token transfers between two addresses, so a story can
+// assert that money moved exactly once.
+func (h *harness) transfers(from, to common.Address) int {
 	h.t.Helper()
 	logs, err := h.client.FilterLogs(context.Background(), ethereum.FilterQuery{
 		FromBlock: big.NewInt(0),
-		Addresses: []common.Address{h.addr["JuiceRail"]},
+		Addresses: []common.Address{h.addr["MockUSDT0"]},
 		Topics: [][]common.Hash{
-			{
-				crypto.Keccak256Hash([]byte("Deposited(address,bytes32,address,uint256,uint256,address,uint256)")),
-				crypto.Keccak256Hash([]byte("Transferred(address,bytes32,address,uint256,uint256,address,uint256)")),
-				crypto.Keccak256Hash([]byte("Withdrawn(address,bytes32,address,uint256,uint256,address,uint256)")),
-			},
-			{common.BytesToHash(account.Bytes())},
-			{common.HexToHash(id)},
+			{crypto.Keccak256Hash([]byte("Transfer(address,address,uint256)"))},
+			{common.BytesToHash(from.Bytes())},
+			{common.BytesToHash(to.Bytes())},
 		},
 	})
 	if err != nil {
@@ -332,29 +377,30 @@ func (h *harness) railEvents(account common.Address, id string) int {
 	return len(logs)
 }
 
-// assertSolvent is the invariant every story ends on: every balance is backed.
-func (h *harness) assertSolvent(accounts ...common.Address) {
-	h.t.Helper()
-	sum := new(big.Int)
-	for _, a := range accounts {
-		sum.Add(sum, h.railBalance(a))
-	}
-	if held := h.heldByRail(); held.Cmp(sum) < 0 {
-		h.t.Fatalf("held %s < sum of balances %s", held, sum)
-	}
-}
-
 // --- the railctl binary ---
 
 func (h *harness) writeConfig() {
 	h.t.Helper()
 	cfg := map[string]any{
-		"name":     "local",
-		"chainId":  h.chainID.Uint64(),
-		"rpc":      h.rpcURL,
-		"rail":     h.addr["JuiceRail"].Hex(),
-		"token":    h.addr["MockUSDT0"].Hex(),
-		"finality": "finalized",
+		"name":      "local",
+		"chainId":   h.chainID.Uint64(),
+		"rpc":       h.rpcURL,
+		"token":     h.addr["MockUSDT0"].Hex(),
+		"decimals":  6,
+		"finality":  "finalized",
+		"fromBlock": 0,
+		"venue": map[string]any{
+			"router":  h.addr["MockRouter"].Hex(),
+			"quoter":  h.addr["MockRouter"].Hex(),
+			"weth":    wethPlaceholder.Hex(),
+			"feeTier": feeTier,
+		},
+		"gas": map[string]any{
+			"min":         reserveMin,
+			"max":         reserveMax,
+			"slippageBps": slippageBps,
+			"feeBound":    reserveFeeBound,
+		},
 	}
 	raw, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -456,33 +502,59 @@ func (p *participant) status(id string) string {
 	return reply.Status
 }
 
-// sign writes a signed operation for a relayer to carry, and returns its path.
-func (p *participant) sign(kind, id string, party common.Address, amount, fee int64, relayer common.Address, extra ...string) string {
+// pay runs a payment and reports what happened: whether it was submitted, and
+// whether the account had to buy gas first.
+type outcome struct {
+	ID        string `json:"id"`
+	Status    string `json:"status"`
+	Note      string `json:"note"`
+	Refill    string `json:"refill"`
+	Tx        string `json:"tx"`
+	Submitted bool   `json:"submitted"`
+}
+
+func (p *participant) pay(kind, id string, to common.Address, amount string, extra ...string) outcome {
 	p.h.t.Helper()
-	// One file per (signer, kind, intent, relayer): re-signing for the same
-	// relayer must land on the same file, so a story can see that the variant
-	// was reused rather than replaced.
-	path := filepath.Join(p.h.dir, fmt.Sprintf("%s-%s-%s-%s.json", p.name, kind, id[:10], relayer.Hex()[:10]))
-	args := append([]string{
-		"-fee", fmt.Sprint(fee),
-		"-relayer", relayer.Hex(),
-		"-out", path,
-	}, extra...)
-	args = append(args, kind, id, party.Hex(), fmt.Sprint(amount))
-	p.mustRun(args...)
-	return path
+	args := append([]string{"-json"}, extra...)
+	args = append(args, kind, id, to.Hex(), amount)
+	out := p.mustRun(args...)
+	var got outcome
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		p.h.t.Fatalf("output %q: %v", out, err)
+	}
+	return got
+}
+
+// deposits lists the finalized incoming transfers the account has recorded.
+func (p *participant) deposits() []struct {
+	Tx       string `json:"tx"`
+	LogIndex uint   `json:"logIndex"`
+	From     string `json:"from"`
+	Amount   string `json:"amount"`
+} {
+	p.h.t.Helper()
+	var reply struct {
+		Deposits []struct {
+			Tx       string `json:"tx"`
+			LogIndex uint   `json:"logIndex"`
+			From     string `json:"from"`
+			Amount   string `json:"amount"`
+		} `json:"deposits"`
+	}
+	out := p.mustRun("-json", "deposits")
+	if err := json.Unmarshal([]byte(out), &reply); err != nil {
+		p.h.t.Fatalf("deposits output %q: %v", out, err)
+	}
+	return reply.Deposits
 }
 
 // --- shared ABIs ---
 
-var (
-	railABI = mustABI(`[
-      {"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address"}],"outputs":[{"type":"uint256"}],"stateMutability":"view"}]`)
-
-	tokenABI = mustABI(`[
+var tokenABI = mustABI(`[
       {"type":"function","name":"mint","inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}]},
+      {"type":"function","name":"transfer","inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[{"type":"bool"}]},
+      {"type":"function","name":"allowance","inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"outputs":[{"type":"uint256"}],"stateMutability":"view"},
       {"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address"}],"outputs":[{"type":"uint256"}],"stateMutability":"view"}]`)
-)
 
 func mustABI(s string) abi.ABI {
 	parsed, err := abi.JSON(strings.NewReader(s))
@@ -522,8 +594,22 @@ func wordOf(a common.Address) []byte {
 	return w[:]
 }
 
-func tokens(n int64) *big.Int {
-	return big.NewInt(n * tokenDecimalsScale)
+func wordOfInt(v *big.Int) []byte {
+	return common.LeftPadBytes(v.Bytes(), 32)
+}
+
+func tokens(n int64) *big.Int { return big.NewInt(n * tokenScale) }
+
+func ether(n int64) *big.Int {
+	return new(big.Int).Mul(big.NewInt(n), big.NewInt(1_000_000_000_000_000_000))
+}
+
+func wei(text string) *big.Int {
+	v, ok := new(big.Int).SetString(text, 10)
+	if !ok {
+		panic("bad wei " + text)
+	}
+	return v
 }
 
 // freshID is an unguessable identifier, which is what a host would issue.

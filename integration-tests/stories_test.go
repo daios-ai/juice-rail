@@ -5,339 +5,346 @@ package integration
 import (
 	"math/big"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
 )
 
-// The six user stories of the specification, each driven entirely through the
-// compiled binary. Participants never hold ether; a relayer does, and earns a
-// stablecoin fee for it.
+// The six user stories. Each runs against the compiled binary on its own local
+// chain, and ends on the property the story is about.
 
-// fundRail gives an account a rail balance the only way there is: a deposit
-// carried by a relayer.
-func (h *harness) fundRail(who, relayer *participant, amount int64) {
-	h.t.Helper()
-	id := freshID(h.t)
-	h.mintTo(who.account(), big.NewInt(amount))
-	path := who.sign("deposit", id, who.account(), amount, 0, relayer.account())
-	relayer.mustRun("relay", path)
-	h.settleAndFinalise()
-	if got := who.status(id); got != "confirmed" {
-		h.t.Fatalf("funding %s: status %s, want confirmed", who.name, got)
-	}
-}
-
-func mustEqual(t *testing.T, what string, got *big.Int, want int64) {
-	t.Helper()
-	if got.Cmp(big.NewInt(want)) != 0 {
-		t.Fatalf("%s is %s, want %d", what, got, want)
-	}
-}
-
-// 1. bootstrap: an operator stands up a fresh domain. There is nothing else to
-// deploy, nobody to fund, and no privileged party left behind.
-func TestStory1Bootstrap(t *testing.T) {
+// 1. onboard: a new account is created, funded once with money and gas, and is
+// then operational. That single funding step is the only time a participant
+// handles the native currency by hand.
+func TestStory1Onboard(t *testing.T) {
 	h := newHarness(t)
+	home := t.TempDir()
+
+	cmd := exec.Command(railctlBinary, "init", "alice", h.configPath)
+	cmd.Env = append(os.Environ(), "HOME="+home)
+	var checklist strings.Builder
+	cmd.Stderr = &checklist
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("init: %v: %s", err, checklist.String())
+	}
+	if !strings.Contains(string(out), "profile alice on domain local") {
+		t.Fatalf("init said %q", out)
+	}
+	// Onboarding is a checklist, and it says both things that must be sent.
+	for _, want := range []string{"send the stablecoin", "native currency", "wait for finality"} {
+		if !strings.Contains(checklist.String(), want) {
+			t.Fatalf("the funding checklist does not mention %q:\n%s", want, checklist.String())
+		}
+	}
+
 	alice := h.participant("alice", aliceKeyHex)
-
-	// The account is the key's own address, known before the chain has ever
-	// heard of it, so money can arrive first.
-	if got, want := alice.account(), addressOf(t, aliceKeyHex); got != want {
-		t.Fatalf("account %s, want the key's own address %s", got, want)
+	account := alice.account()
+	// A fresh account holds nothing.
+	if h.tokenBalance(account).Sign() != 0 || h.reserve(account).Sign() != 0 {
+		t.Fatal("a new account was not empty")
 	}
-	h.assertNoEther("alice", alice.account())
 
-	mustEqual(t, "a fresh account's balance", h.railBalance(alice.account()), 0)
-	mustEqual(t, "a fresh domain's holding", h.heldByRail(), 0)
+	h.mintTo(account, tokens(1000))
+	h.fund(account, wei(reserveMax))
+	h.settleAndFinalise()
 
-	// Tokens arriving at the address are the account holder's, not the rail's.
-	h.mintTo(alice.account(), tokens(100))
-	out := alice.mustRun("balance")
-	if !strings.Contains(out, "balance 0 token 100000000") {
-		t.Fatalf("balance reported %q", out)
+	balance := alice.mustRun("balance")
+	if !strings.Contains(balance, "balance 1000.00") || !strings.Contains(balance, "reserve 0.05") {
+		t.Fatalf("after funding, balance reads %q", balance)
 	}
-	mustEqual(t, "the rail's holding", h.heldByRail(), 0)
-	h.assertSolvent(alice.account())
+
+	// Operational means it can pay.
+	id := freshID(t)
+	got := alice.pay("transfer", id, addressOf(t, bobKeyHex), "1.00")
+	if !strings.Contains(got.Note, "submitted") {
+		t.Fatalf("a funded account could not pay: %+v", got)
+	}
+	h.settleAndFinalise()
+	if status := alice.status(id); status != "confirmed" {
+		t.Fatalf("the first payment is %s, want confirmed", status)
+	}
 }
 
-// 2. deposit: stablecoin at an ordinary address becomes a rail balance. The
-// payer signs; a relayer pays the gas and takes its fee from the deposit.
+// 2. deposit: money arrives with no transaction from this account at all, and
+// each finalized transfer is recognised exactly once.
 func TestStory2Deposit(t *testing.T) {
 	h := newHarness(t)
 	alice := h.participant("alice", aliceKeyHex)
-	relayer := h.participant("relayer", relayerKeyHex)
+	account := alice.account()
 
-	// This is also the exchange path: withdraw to your own address first, then
-	// sign it into the rail.
-	h.mintTo(alice.account(), tokens(100))
-	id := freshID(t)
-	path := alice.sign("deposit", id, alice.account(), 60_000_000, 20_000, relayer.account())
+	payer := addressOf(t, payerKeyHex)
+	h.mintTo(payer, tokens(500))
+	h.fund(payer, ether(1))
+	h.settleAndFinalise()
 
-	// Signing moves nothing.
-	if got := alice.status(id); got != "pending" {
-		t.Fatalf("status %s before submission, want pending", got)
-	}
-	if n := h.railEvents(alice.account(), id); n != 0 {
-		t.Fatalf("%d events before submission", n)
-	}
-
-	relayer.mustRun("relay", path)
-	if got := alice.status(id); got != "pending" {
-		t.Fatalf("status %s while unmined: submission is not confirmation", got)
-	}
+	// Two payments in from outside: an exchange and a wallet, say.
+	h.transferFrom(payerKeyHex, account, tokens(120))
+	h.transferFrom(payerKeyHex, account, tokens(30))
 	h.mine(1)
-	if got := alice.status(id); got != "pending" {
-		t.Fatalf("status %s while unfinalized: inclusion is not confirmation", got)
+
+	// Inclusion is not confirmation.
+	if got := alice.deposits(); len(got) != 0 {
+		t.Fatalf("%d deposits before finality", len(got))
 	}
 	h.finalise()
-	if got := alice.status(id); got != "confirmed" {
-		t.Fatalf("status %s after finality, want confirmed", got)
-	}
 
-	mustEqual(t, "alice's rail balance", h.railBalance(alice.account()), 60_000_000)
-	mustEqual(t, "the relayer's fee", h.railBalance(relayer.account()), 20_000)
-	mustEqual(t, "the rail's holding", h.heldByRail(), 60_020_000)
-	mustEqual(t, "alice's remaining tokens", h.tokenBalance(alice.account()), 100_000_000-60_020_000)
-	if n := h.railEvents(alice.account(), id); n != 1 {
-		t.Fatalf("%d events, want exactly 1", n)
+	got := alice.deposits()
+	if len(got) != 2 {
+		t.Fatalf("%d deposits after finality, want 2", len(got))
 	}
-	h.assertNoEther("alice", alice.account())
-	h.assertSolvent(alice.account(), relayer.account())
+	if got[0].Amount != "120.00" || got[1].Amount != "30.00" {
+		t.Fatalf("deposits read %+v", got)
+	}
+	if got[0].Tx == got[1].Tx && got[0].LogIndex == got[1].LogIndex {
+		t.Fatal("two deposits share one identity")
+	}
+	// Asking again finds nothing new: the log that carried it is its identity.
+	if again := alice.deposits(); len(again) != 2 {
+		t.Fatalf("rescanning turned 2 deposits into %d", len(again))
+	}
+	if h.tokenBalance(account).Cmp(tokens(150)) != 0 {
+		t.Fatalf("the account holds %s", h.tokenBalance(account))
+	}
+	// The account never sent anything to receive its money.
+	if h.nonce(account) != 0 {
+		t.Fatal("receiving money cost the account a transaction")
+	}
 }
 
-// 3. transfer: A pays B inside the rail. Conservation holds and the relayer is
-// paid from money already backed.
+// 3. transfer: A pays B. B needs nothing at all, not even gas, and the money
+// moves exactly once however many times the command is repeated.
 func TestStory3Transfer(t *testing.T) {
 	h := newHarness(t)
-	alice := h.participant("alice", aliceKeyHex)
-	bob := h.participant("bob", bobKeyHex)
-	relayer := h.participant("relayer", relayerKeyHex)
-	h.fundRail(alice, relayer, 100_000_000)
+	alice, bob := h.participant("alice", aliceKeyHex), h.participant("bob", bobKeyHex)
+	from, to := alice.account(), bob.account()
 
-	heldBefore := h.heldByRail()
-	relayerBefore := h.railBalance(relayer.account())
-
-	id := freshID(t)
-	path := alice.sign("transfer", id, bob.account(), 10_000_000, 10_000, relayer.account())
-	relayer.mustRun("relay", path)
+	h.mintTo(from, tokens(1000))
+	h.fund(from, wei(reserveMax))
 	h.settleAndFinalise()
 
-	if got := alice.status(id); got != "confirmed" {
-		t.Fatalf("status %s, want confirmed", got)
+	id := freshID(t)
+	alice.pay("transfer", id, to, "250.00")
+	h.settleAndFinalise()
+
+	if status := alice.status(id); status != "confirmed" {
+		t.Fatalf("payment is %s, want confirmed", status)
 	}
-	mustEqual(t, "alice's balance", h.railBalance(alice.account()), 100_000_000-10_000_000-10_000)
-	mustEqual(t, "bob's balance", h.railBalance(bob.account()), 10_000_000)
-	mustEqual(t, "the relayer's balance", h.railBalance(relayer.account()),
-		relayerBefore.Int64()+10_000)
-	if h.heldByRail().Cmp(heldBefore) != 0 {
-		t.Fatalf("a transfer moved tokens: held %s, was %s", h.heldByRail(), heldBefore)
+	if h.tokenBalance(to).Cmp(tokens(250)) != 0 {
+		t.Fatalf("the recipient holds %s", h.tokenBalance(to))
 	}
-	if n := h.railEvents(alice.account(), id); n != 1 {
-		t.Fatalf("%d events, want exactly 1", n)
+	// The recipient holds no native currency and never needed any.
+	if h.reserve(to).Sign() != 0 {
+		t.Fatalf("the recipient holds %s wei to receive money", h.reserve(to))
 	}
-	h.assertNoEther("alice", alice.account())
-	h.assertNoEther("bob", bob.account())
-	h.assertSolvent(alice.account(), bob.account(), relayer.account())
+	if h.nonce(to) != 0 {
+		t.Fatal("receiving cost the recipient a transaction")
+	}
+
+	// Repeating the command is a replay, not a second payment.
+	alice.pay("transfer", id, to, "250.00")
+	h.settleAndFinalise()
+	if n := h.transfers(from, to); n != 1 {
+		t.Fatalf("the money moved %d times", n)
+	}
+	// The same identifier may not mean something else.
+	refusal := alice.mustFail("transfer", id, to.Hex(), "1.00")
+	if !strings.Contains(refusal, "already recorded") {
+		t.Fatalf("reusing an identifier was refused with %q", refusal)
+	}
+	// And the recipient can spend what it received, once it has gas of its own.
+	h.fund(to, wei(reserveMax))
+	h.settleAndFinalise()
+	back := freshID(t)
+	bob.pay("transfer", back, from, "10.00")
+	h.settleAndFinalise()
+	if bob.status(back) != "confirmed" {
+		t.Fatal("the recipient could not spend what it received")
+	}
 }
 
-// 4. withdraw: money leaves the rail to an address the account holder signed,
-// which may be an exchange rather than the account itself.
+// 4. withdraw: the same primitive, sent outside the rail. The destination is
+// supplied per operation; nothing about it is stored.
 func TestStory4Withdraw(t *testing.T) {
 	h := newHarness(t)
-	bob := h.participant("bob", bobKeyHex)
-	relayer := h.participant("relayer", relayerKeyHex)
-	h.fundRail(bob, relayer, 50_000_000)
+	alice := h.participant("alice", aliceKeyHex)
+	account := alice.account()
+	exchange := common.HexToAddress("0x00000000000000000000000000000000000ec4a5")
 
-	// Somewhere else entirely: the destination is a signed term, so it needs
-	// no relationship with the rail at all.
-	exchange := crypto.PubkeyToAddress(mustKey(t, relayer2KeyHex).PublicKey)
-	heldBefore := h.heldByRail()
-	relayerBefore := h.railBalance(relayer.account())
-
-	id := freshID(t)
-	path := bob.sign("withdraw", id, exchange, 20_000_000, 10_000, relayer.account())
-	relayer.mustRun("relay", path)
+	h.mintTo(account, tokens(1000))
+	h.fund(account, wei(reserveMax))
 	h.settleAndFinalise()
 
-	if got := bob.status(id); got != "confirmed" {
-		t.Fatalf("status %s, want confirmed", got)
+	id := freshID(t)
+	alice.pay("withdraw", id, exchange, "300.00")
+	h.settleAndFinalise()
+
+	if status := alice.status(id); status != "confirmed" {
+		t.Fatalf("withdrawal is %s, want confirmed", status)
 	}
-	mustEqual(t, "the destination's tokens", h.tokenBalance(exchange), 20_000_000)
-	mustEqual(t, "bob's balance", h.railBalance(bob.account()), 50_000_000-20_000_000-10_000)
-	mustEqual(t, "the relayer's balance", h.railBalance(relayer.account()), relayerBefore.Int64()+10_000)
-	mustEqual(t, "the rail's holding", h.heldByRail(), heldBefore.Int64()-20_000_000)
-	h.assertNoEther("bob", bob.account())
-	h.assertSolvent(bob.account(), relayer.account())
+	if h.tokenBalance(exchange).Cmp(tokens(300)) != 0 {
+		t.Fatalf("the destination received %s", h.tokenBalance(exchange))
+	}
+	if h.tokenBalance(account).Cmp(tokens(700)) != 0 {
+		t.Fatalf("the account kept %s", h.tokenBalance(account))
+	}
+	if n := h.transfers(account, exchange); n != 1 {
+		t.Fatalf("the withdrawal moved %d times", n)
+	}
 }
 
-// 5. retry and conflict: replaying moves money once and reports the same
-// outcome; the same identifier under different terms fails loudly and moves
-// nothing.
-func TestStory5RetryAndConflict(t *testing.T) {
+// 5. refill: a reserve too low for the next payment is topped up from the
+// account's own money, and a shortage blocks loudly with nothing signed.
+func TestStory5Refill(t *testing.T) {
 	h := newHarness(t)
 	alice := h.participant("alice", aliceKeyHex)
-	bob := h.participant("bob", bobKeyHex)
-	relayer := h.participant("relayer", relayerKeyHex)
-	h.fundRail(alice, relayer, 100_000_000)
+	account := alice.account()
+	to := addressOf(t, bobKeyHex)
 
+	h.mintTo(account, tokens(1000))
+	// Enough gas to buy gas, not enough to pay from.
+	h.setReserve(account, wei("15000000000000000")) // 0.015
+	h.settleAndFinalise()
+
+	before := h.tokenBalance(account)
 	id := freshID(t)
-	path := alice.sign("transfer", id, bob.account(), 10_000_000, 10_000, relayer.account())
-	relayer.mustRun("relay", path)
-	h.settleAndFinalise()
-	after := h.railBalance(alice.account())
 
-	// Presenting the same signed operation again costs nothing and changes
-	// nothing.
-	out := relayer.mustRun("relay", path)
-	if !strings.Contains(out, "already executed") {
-		t.Fatalf("a replay reported %q", out)
+	// The payment does not go through; the account buys gas instead, and says
+	// so. Nothing about the payment was signed.
+	first := alice.pay("transfer", id, to, "25.00")
+	if first.Refill == "" || first.Tx == "" {
+		t.Fatalf("a low reserve did not produce a refill: %+v", first)
 	}
-	// Re-running the whole command is equally safe.
-	alice.sign("transfer", id, bob.account(), 10_000_000, 10_000, relayer.account())
+	if alice.status(id) != "unknown" {
+		t.Fatal("a payment that never ran left a record behind")
+	}
 	h.settleAndFinalise()
 
-	if n := h.railEvents(alice.account(), id); n != 1 {
-		t.Fatalf("%d events after two replays, want exactly 1", n)
+	reserve := h.reserve(account)
+	if reserve.Cmp(wei(reserveMin)) <= 0 {
+		t.Fatalf("after refilling the reserve is %s, still under the minimum %s", reserve, reserveMin)
 	}
-	if h.railBalance(alice.account()).Cmp(after) != 0 {
-		t.Fatal("a replay moved money a second time")
+	// It bought its gas with its own money, and no more than the quote plus its
+	// slippage margin. The whole reserve range at the venue's price is the
+	// loosest bound that still means something.
+	spent := new(big.Int).Sub(before, h.tokenBalance(account))
+	worstCase := big.NewInt(0).Div(new(big.Int).Mul(wei(reserveMax), big.NewInt(venuePrice)), ether(1))
+	worstCase.Mul(worstCase, big.NewInt(10_000+slippageBps))
+	worstCase.Div(worstCase, big.NewInt(10_000))
+	if spent.Sign() <= 0 || spent.Cmp(worstCase) > 0 {
+		t.Fatalf("the refill spent %s, outside (0, %s]", spent, worstCase)
 	}
-	if got := alice.status(id); got != "confirmed" {
-		t.Fatalf("status %s, want the same outcome as before", got)
+	// What the venue may still take is bounded by that same input bound.
+	if left := h.allowance(account); left.Cmp(worstCase) > 0 {
+		t.Fatalf("the venue may still take %s, more than one refill's input bound %s", left, worstCase)
 	}
 
-	// The same identifier with different terms is refused by the write-ahead
-	// record, before anything is signed.
-	refusal := alice.mustFail("-fee", "10000", "-relayer", relayer.account().Hex(), "-out",
-		h.dir+"/conflict.json", "transfer", id, bob.account().Hex(), "99000000")
-	if !strings.Contains(refusal, "already recorded") {
-		t.Fatalf("conflicting terms were refused with %q", refusal)
+	// Now the payment goes through.
+	second := alice.pay("transfer", id, to, "25.00")
+	if second.Refill != "" {
+		t.Fatalf("the payment asked for a second refill: %+v", second)
+	}
+	h.settleAndFinalise()
+	if status := alice.status(id); status != "confirmed" {
+		t.Fatalf("the payment after a refill is %s, want confirmed", status)
+	}
+	if h.reserve(account).Cmp(wei(reserveMin)) < 0 {
+		t.Fatalf("after paying the reserve is %s, under the minimum", h.reserve(account))
 	}
 
-	// Even from another installation of the same key, which has no record to
-	// consult, the chain refuses: the binding is per account and write-once.
-	elsewhere := h.participant("alice-elsewhere", aliceKeyHex)
-	other := elsewhere.sign("transfer", id, bob.account(), 99_000_000, 10_000, relayer.account())
-	refusal = relayer.mustFail("relay", other)
-	if !strings.Contains(refusal, "different terms") {
-		t.Fatalf("a conflicting variant was refused with %q", refusal)
+	// A second account with money enough for the payment but not for the
+	// payment and the gas it would need: blocked, loudly, with nothing signed.
+	poor := h.participant("poor", payerKeyHex)
+	poorAccount := poor.account()
+	h.mintTo(poorAccount, tokens(100))
+	h.setReserve(poorAccount, wei("15000000000000000"))
+	h.settleAndFinalise()
+
+	refusal := poor.mustFail("transfer", freshID(t), to.Hex(), "5.00")
+	if !strings.Contains(refusal, "not enough stablecoin") {
+		t.Fatalf("a shortage was reported as %q", refusal)
 	}
-	if n := h.railEvents(alice.account(), id); n != 1 {
-		t.Fatalf("%d events after the conflict, want exactly 1", n)
+	if h.nonce(poorAccount) != 0 {
+		t.Fatal("a blocked payment sent a transaction")
 	}
-	if h.railBalance(alice.account()).Cmp(after) != 0 {
-		t.Fatal("the conflict moved money")
-	}
-	h.assertSolvent(alice.account(), bob.account(), relayer.account())
 }
 
-// 6. crash recovery: a restart resumes to exactly-once, an unresponsive
-// relayer is replaced without waiting, and an abandoned intent whose variants
-// have all expired is terminally failed.
-func TestStory6CrashRecovery(t *testing.T) {
+// 6. recovery: a process killed at any durable step resumes to exactly once,
+// and a stuck payment is retried under the same nonce and the same terms.
+func TestStory6Recovery(t *testing.T) {
 	h := newHarness(t)
 	alice := h.participant("alice", aliceKeyHex)
-	bob := h.participant("bob", bobKeyHex)
-	relayer := h.participant("relayer", relayerKeyHex)
-	relayer2 := h.participant("relayer2", relayer2KeyHex)
-	h.fundRail(alice, relayer, 100_000_000)
-	before := h.railBalance(alice.account())
+	account := alice.account()
+	to := addressOf(t, bobKeyHex)
 
-	// Killed after the intent is durable but before anything is signed.
-	id := freshID(t)
-	alice.mustRun("-halt-after", "intent", "transfer", id, bob.account().Hex(), "10000000")
-	if got := alice.status(id); got != "pending" {
-		t.Fatalf("status %s after the write-ahead record, want pending", got)
-	}
-
-	// Killed after signing, before submission: the restart must reuse the
-	// signed variant rather than sign a second one.
-	path := alice.sign("transfer", id, bob.account(), 10_000_000, 10_000, relayer.account())
-	first, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	alice.sign("transfer", id, bob.account(), 10_000_000, 10_000, relayer.account())
-	second, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(first) != string(second) {
-		t.Fatal("a restart signed a second variant where the first was still live")
-	}
-
-	// The relayer disappears. Another is named at once: no waiting, because
-	// the contract will execute at most one variant.
-	replacement := alice.sign("transfer", id, bob.account(), 10_000_000, 20_000, relayer2.account())
-	relayer2.mustRun("relay", replacement)
+	h.mintTo(account, tokens(1000))
+	h.fund(account, wei(reserveMax))
 	h.settleAndFinalise()
 
-	if got := alice.status(id); got != "confirmed" {
-		t.Fatalf("status %s, want confirmed", got)
+	// Killed after the write-ahead record and before anything was signed.
+	first := freshID(t)
+	alice.mustRun("-halt-after", "intent", "transfer", first, to.Hex(), "40.00")
+	if h.nonce(account) != 0 {
+		t.Fatal("an intent that was only recorded still sent something")
 	}
-	mustEqual(t, "alice's balance", h.railBalance(alice.account()),
-		before.Int64()-10_000_000-20_000)
-	mustEqual(t, "the replacement relayer's fee", h.railBalance(relayer2.account()), 20_000)
+	if alice.status(first) != "pending" {
+		t.Fatal("a recorded intent is not pending")
+	}
+	// A fresh process finishes it, on the nonce the record already owns.
+	alice.mustRun("retry", first)
+	h.settleAndFinalise()
+	if status := alice.status(first); status != "confirmed" {
+		t.Fatalf("the resumed payment is %s, want confirmed", status)
+	}
+	if n := h.transfers(account, to); n != 1 {
+		t.Fatalf("the resumed payment moved money %d times", n)
+	}
 
-	// The first relayer wakes up and presents its variant. It is refused, and
-	// nothing moves twice.
-	refusal := relayer.mustFail("relay", path)
-	if !strings.Contains(refusal, "different terms") {
-		t.Fatalf("the losing variant was refused with %q", refusal)
-	}
-	if n := h.railEvents(alice.account(), id); n != 1 {
-		t.Fatalf("%d events, want exactly 1", n)
-	}
+	// Killed after broadcasting, before anything finalized.
+	second := freshID(t)
+	alice.mustRun("-halt-after", "submit", "transfer", second, to.Hex(), "60.00")
+	h.mine(1)
+	// A fresh process retries what it does not yet know the outcome of. The
+	// nonce is the same, so at most one of the two can ever execute.
+	alice.mustRun("retry", second)
+	h.settleAndFinalise()
 
-	// An abandoned intent is terminal only once every variant it signed is
-	// finalized-dead. Until then it stays pending, because a signed operation
-	// abandonment does not kill can still execute.
-	dead := freshID(t)
-	alice.sign("transfer", dead, bob.account(), 1_000_000, 10_000, relayer.account(), "-valid-for", "60s")
-	alice.mustRun("abandon", dead)
-	if got := alice.status(dead); got != "pending" {
-		t.Fatalf("status %s: abandonment kills nothing already signed", got)
+	if status := alice.status(second); status != "confirmed" {
+		t.Fatalf("after a crash and a retry the payment is %s, want confirmed", status)
 	}
-	h.advanceTime(2 * time.Minute)
-	if got := alice.status(dead); got != "pending" {
-		t.Fatalf("status %s: expiry is terminal only once finalized", got)
+	if n := h.transfers(account, to); n != 2 {
+		t.Fatalf("two payments moved money %d times", n)
 	}
-	h.finalise()
-	if got := alice.status(dead); got != "failed" {
-		t.Fatalf("status %s after expiry past finality, want failed", got)
+	if h.tokenBalance(to).Cmp(tokens(100)) != 0 {
+		t.Fatalf("the recipient holds %s, want 100", h.tokenBalance(to))
 	}
-	if n := h.railEvents(alice.account(), dead); n != 0 {
-		t.Fatalf("%d events for an intent that never executed", n)
+	// Repeating the whole command changes nothing.
+	alice.pay("transfer", second, to, "60.00")
+	h.settleAndFinalise()
+	if n := h.transfers(account, to); n != 2 {
+		t.Fatalf("a repeated command moved money %d times", n)
 	}
-	h.assertSolvent(alice.account(), bob.account(), relayer.account(), relayer2.account())
 }
 
-// A domain is (chain id, contract address): the same agreement cannot be
-// discharged on another deployment.
+// Domains are independent: records made on one chain are refused on another.
 func TestDomainsAreIndependent(t *testing.T) {
-	here := newHarness(t)
-	there := newHarnessOn(t, defaultChainID+1)
+	first := newHarness(t)
+	alice := first.participant("alice", aliceKeyHex)
+	account := alice.account()
+	first.mintTo(account, tokens(100))
+	first.fund(account, wei(reserveMax))
+	first.settleAndFinalise()
 
-	alice := here.participant("alice", aliceKeyHex)
-	relayer := here.participant("relayer", relayerKeyHex)
-	here.fundRail(alice, relayer, 50_000_000)
-
-	// The same identifier and terms, signed for this domain, are not a
-	// payment on the other one.
 	id := freshID(t)
-	bob := here.participant("bob", bobKeyHex)
-	path := alice.sign("transfer", id, bob.account(), 10_000_000, 10_000, relayer.account())
+	alice.pay("transfer", id, addressOf(t, bobKeyHex), "10.00")
+	first.settleAndFinalise()
 
-	elsewhere := there.participant("relayer", relayerKeyHex)
-	refusal := elsewhere.mustFail("relay", path)
+	second := newHarnessOn(t, defaultChainID+1)
+	crossed := &participant{h: second, name: "alice", key: aliceKeyHex, store: alice.store}
+	refusal := crossed.mustFail("status", id)
 	if !strings.Contains(refusal, "different domain") {
-		t.Fatalf("a variant from another domain was refused with %q", refusal)
-	}
-	if n := there.railEvents(common.HexToAddress(alice.account().Hex()), id); n != 0 {
-		t.Fatalf("%d events on the other domain", n)
+		t.Fatalf("using one domain's records on another was refused with %q", refusal)
 	}
 }

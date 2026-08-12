@@ -1,7 +1,6 @@
-// Command railctl drives one juice-rail domain: create an account, deposit,
-// transfer, withdraw, relay other people's signed operations, and read status.
-// It is the operational and test harness for the library, never a wallet
-// product.
+// Command railctl drives one juice-rail account: create it, watch deposits,
+// pay, withdraw and read status. It is the operational and test harness for
+// the library, never a wallet product.
 //
 // Configuration discovery lives here and nowhere else: the library takes every
 // input at construction.
@@ -14,13 +13,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -30,31 +27,24 @@ import (
 	"github.com/daios-ai/juice-rail/go/sqlite"
 )
 
-const usage = `railctl drives one juice-rail domain.
+const usage = `railctl drives one juice-rail account.
 
 usage:
   railctl init <profile> <domain-file>
   railctl [flags] account
-  railctl [flags] balance  [address]
-  railctl [flags] deposit  <id> <credited-account> <amount>
-  railctl [flags] transfer <id> <recipient> <amount>
+  railctl [flags] balance
+  railctl [flags] deposits
+  railctl [flags] transfer <id> <recipient>   <amount>
   railctl [flags] withdraw <id> <destination> <amount>
-  railctl [flags] relay    <variant-file|->
+  railctl [flags] retry    <id>
   railctl [flags] status   <id>
-  railctl [flags] abandon  <id>
 
 flags:
   -profile name  which profile to act as (default $RAILCTL_PROFILE, else the
                  current profile recorded by init)
   -json          machine-readable output
-  -halt-after s  exit right after a durable step: intent, sign, or submit
-
-operation flags:
-  -fee n         the relay fee, in token base units (default 0)
-  -relayer addr  who may submit it, and earns the fee (default: yourself)
-  -valid-for d   how long the signed operation lives (default 1h)
-  -out path      write the signed operation instead of submitting it, for a
-                 relayer to carry; "-" writes to stdout
+  -halt-after s  exit right after a durable step: intent or submit
+  -no-refill     refuse a payment that needs a refill instead of buying gas
 
 init flags:
   -key-file p    import an account key instead of generating one
@@ -62,25 +52,53 @@ init flags:
 overrides, for automation; each one skips its part of the profile:
   -config path   domain configuration (default $RAILCTL_CONFIG)
   -store path    durable records (default $RAILCTL_STORE)
-  RAILCTL_KEY    account key, hex; it signs money and pays gas when relaying
+  RAILCTL_KEY    the account key, hex; it spends the money and pays the gas
 
 Profiles live in ~/.juice-rail: config.json holds domains and profiles,
 credentials.json holds keys and nothing else. Secrets are passed as file
 paths, never as flag values, because a flag value is world-readable.
 
-Amounts are token base units. Diagnostics go to stderr, data to stdout.
+Amounts are decimal token units, for example 12.50. Diagnostics go to
+stderr, data to stdout.
 `
 
-// config is one domain: (chain id, rail address) plus how to reach it. Every
-// address is configuration, never code.
+// config is one domain: the chain, the token accounted on it, how to reach it,
+// where to buy gas and how much gas to keep. Every address is configuration,
+// never code.
 type config struct {
-	Name     string `json:"name"`
-	ChainID  uint64 `json:"chainId"`
-	RPC      string `json:"rpc"`
-	Rail     string `json:"rail"`
-	Token    string `json:"token"`
-	Finality string `json:"finality"`
+	Name      string      `json:"name"`
+	ChainID   uint64      `json:"chainId"`
+	RPC       string      `json:"rpc"`
+	Token     string      `json:"token"`
+	Decimals  uint8       `json:"decimals"`
+	Finality  string      `json:"finality"`
+	FromBlock uint64      `json:"fromBlock"`
+	Venue     venueConfig `json:"venue"`
+	Gas       gasConfig   `json:"gas"`
 }
+
+type venueConfig struct {
+	Router   string `json:"router"`
+	Quoter   string `json:"quoter"`
+	WETH     string `json:"weth"`
+	FeeTier  uint32 `json:"feeTier"`
+	Router02 bool   `json:"router02"`
+}
+
+// gasConfig is the operating reserve, in wei. Text, so no precision is lost
+// passing through JSON.
+type gasConfig struct {
+	Min         string `json:"min"`
+	Max         string `json:"max"`
+	SlippageBps uint32 `json:"slippageBps"`
+	FeeBound    string `json:"feeBound"`
+	PaymentGas  uint64 `json:"paymentGas"`
+	SwapGas     uint64 `json:"swapGas"`
+}
+
+// gasDecimals is how the native currency is displayed. It is never money here,
+// only fuel.
+const gasDecimals = 18
 
 func loadConfig(path string) (config, error) {
 	raw, err := os.ReadFile(path)
@@ -95,18 +113,104 @@ func loadConfig(path string) (config, error) {
 }
 
 // domain turns the configuration into the domain the rail binds to.
-func (c config) domain() rail.Domain {
+func (c config) domain() (rail.Domain, error) {
 	finality := c.Finality
 	if finality == "" {
 		finality = "finalized"
 	}
-	return rail.Domain{
-		Name:     c.Name,
-		ChainID:  new(big.Int).SetUint64(c.ChainID),
-		Rail:     common.HexToAddress(c.Rail),
-		Token:    common.HexToAddress(c.Token),
-		Finality: finality,
+	gas := rail.GasPolicy{
+		SlippageBps: c.Gas.SlippageBps,
+		PaymentGas:  c.Gas.PaymentGas,
+		SwapGas:     c.Gas.SwapGas,
 	}
+	var err error
+	if gas.Min, err = wei(c.Gas.Min, "gas.min"); err != nil {
+		return rail.Domain{}, err
+	}
+	if gas.Max, err = wei(c.Gas.Max, "gas.max"); err != nil {
+		return rail.Domain{}, err
+	}
+	if gas.FeeBound, err = wei(c.Gas.FeeBound, "gas.feeBound"); err != nil {
+		return rail.Domain{}, err
+	}
+	return rail.Domain{
+		Name:      c.Name,
+		ChainID:   new(big.Int).SetUint64(c.ChainID),
+		Token:     common.HexToAddress(c.Token),
+		Finality:  finality,
+		FromBlock: c.FromBlock,
+		Venue: rail.Venue{
+			Router:   common.HexToAddress(c.Venue.Router),
+			Quoter:   common.HexToAddress(c.Venue.Quoter),
+			WETH:     common.HexToAddress(c.Venue.WETH),
+			FeeTier:  c.Venue.FeeTier,
+			Router02: c.Venue.Router02,
+		},
+		Gas: gas,
+	}, nil
+}
+
+func (c config) decimals() uint8 {
+	if c.Decimals == 0 {
+		return 6
+	}
+	return c.Decimals
+}
+
+func wei(s, what string) (*big.Int, error) {
+	if s == "" {
+		return nil, fmt.Errorf("%s is not set", what)
+	}
+	v, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return nil, fmt.Errorf("%s %q is not a whole number of wei", what, s)
+	}
+	return v, nil
+}
+
+// --- amounts ---
+
+// parseUnits reads a decimal amount into base units, exactly. There is no
+// floating point anywhere in this program: money is integers.
+func parseUnits(s string, decimals uint8) (*big.Int, error) {
+	text := strings.TrimSpace(s)
+	if text == "" {
+		return nil, errors.New("amount is empty")
+	}
+	whole, frac, _ := strings.Cut(text, ".")
+	if whole == "" {
+		whole = "0"
+	}
+	if len(frac) > int(decimals) {
+		return nil, fmt.Errorf("amount %q has more than %d decimal places", s, decimals)
+	}
+	digits := whole + frac + strings.Repeat("0", int(decimals)-len(frac))
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return nil, fmt.Errorf("amount %q is not a decimal number", s)
+		}
+	}
+	v, ok := new(big.Int).SetString(digits, 10)
+	if !ok {
+		return nil, fmt.Errorf("amount %q is not a decimal number", s)
+	}
+	return v, nil
+}
+
+// formatUnits renders base units for people: two decimal places at least, and
+// no trailing noise beyond that.
+func formatUnits(v *big.Int, decimals uint8) string {
+	if v == nil {
+		v = new(big.Int)
+	}
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+	whole, frac := new(big.Int).QuoRem(v, scale, new(big.Int))
+	digits := fmt.Sprintf("%0*s", int(decimals), frac.String())
+	digits = strings.TrimRight(digits, "0")
+	for len(digits) < 2 {
+		digits += "0"
+	}
+	return whole.String() + "." + digits
 }
 
 // --- profiles: ~/.juice-rail ---
@@ -134,8 +238,8 @@ type credentials struct {
 	Profiles map[string]string `json:"profiles"`
 }
 
-// profileNames are also filenames and JSON keys, so they are restricted rather
-// than escaped.
+// profile names are also filenames and JSON keys, so they are restricted
+// rather than escaped.
 var profileName = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 func checkProfileName(name string) error {
@@ -147,8 +251,8 @@ func checkProfileName(name string) error {
 
 var errNoProfile = errors.New(`no profile configured: run "railctl init <name> <domain-file>"`)
 
-// railDir is only ever consulted when an override is missing, so automation
-// that passes every input never needs a home directory at all.
+// railDir is only consulted when an override is missing, so automation that
+// passes every input never needs a home directory at all.
 func railDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -207,8 +311,8 @@ func loadCredentials(dir string) (credentials, error) {
 	return c, nil
 }
 
-// writeJSON replaces path atomically. A crash part way through credentials.json
-// would otherwise destroy a key, and with it access to money.
+// writeJSON replaces path atomically. A crash part way through
+// credentials.json would otherwise destroy a key, and with it access to money.
 func writeJSON(path string, v any, mode os.FileMode) error {
 	blob, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -243,7 +347,7 @@ func writeJSON(path string, v any, mode os.FileMode) error {
 // validHaltPoint reports whether s names a durable step to stop after.
 func validHaltPoint(s string) bool {
 	switch s {
-	case "", "intent", "sign", "submit":
+	case "", "intent", "submit":
 		return true
 	default:
 		return false
@@ -264,10 +368,7 @@ type options struct {
 	keyFile   string
 	asJSON    bool
 	haltAfter string
-	fee       string
-	relayer   string
-	validFor  time.Duration
-	out       string
+	noRefill  bool
 }
 
 func run() error {
@@ -277,11 +378,8 @@ func run() error {
 	flag.StringVar(&opt.profile, "profile", "", "profile to act as")
 	flag.StringVar(&opt.keyFile, "key-file", "", "init: import an account key from this file")
 	flag.BoolVar(&opt.asJSON, "json", false, "machine-readable output")
-	flag.StringVar(&opt.haltAfter, "halt-after", "", "exit after a durable step: intent, sign, submit")
-	flag.StringVar(&opt.fee, "fee", "0", "relay fee in token base units")
-	flag.StringVar(&opt.relayer, "relayer", "", "who may submit this operation (default: yourself)")
-	flag.DurationVar(&opt.validFor, "valid-for", rail.DefaultValidFor, "how long the signed operation lives")
-	flag.StringVar(&opt.out, "out", "", `write the signed operation here instead of submitting it ("-" for stdout)`)
+	flag.StringVar(&opt.haltAfter, "halt-after", "", "exit after a durable step: intent, submit")
+	flag.BoolVar(&opt.noRefill, "no-refill", false, "refuse a payment that needs a refill")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
 
@@ -294,8 +392,8 @@ func run() error {
 		return fmt.Errorf("unknown halt point %q", opt.haltAfter)
 	}
 
-	// init creates the configuration the other commands read, so it runs
-	// before any attempt to bind a domain.
+	// init creates the configuration the other commands read, so it runs before
+	// any attempt to bind a domain.
 	if args[0] == "init" {
 		return initProfile(args[1:], opt)
 	}
@@ -311,19 +409,17 @@ func run() error {
 	case "account":
 		return app.account()
 	case "balance":
-		return app.balance(ctx, args[1:])
-	case "deposit":
-		return app.operation(ctx, rail.KindDeposit, args[1:])
+		return app.balance(ctx)
+	case "deposits":
+		return app.deposits(ctx)
 	case "transfer":
-		return app.operation(ctx, rail.KindTransfer, args[1:])
+		return app.pay(ctx, rail.KindTransfer, args[1:])
 	case "withdraw":
-		return app.operation(ctx, rail.KindWithdraw, args[1:])
-	case "relay":
-		return app.relay(ctx, args[1:])
+		return app.pay(ctx, rail.KindWithdraw, args[1:])
+	case "retry":
+		return app.retry(ctx, args[1:])
 	case "status":
 		return app.status(ctx, args[1:])
-	case "abandon":
-		return app.abandon(ctx, args[1:])
 	default:
 		flag.Usage()
 		return fmt.Errorf("unknown command %q", args[0])
@@ -385,15 +481,15 @@ func resolve(opt options) (inputs, error) {
 	if !ok {
 		return inputs{}, fmt.Errorf("profile %q names domain %q, which is not installed", name, p.Domain)
 	}
-	// An override may refine how a domain is reached, never which domain it
-	// is. The store belongs to the profile's domain, so a different (chain id,
-	// rail address) would bind records to the wrong chain.
+	// An override may refine how a domain is reached, never which domain it is.
+	// The store belongs to the profile's domain, so a different (chain id,
+	// token) would bind records to the wrong ledger.
 	if haveDomain {
 		if in.domain.ChainID != domain.ChainID ||
-			common.HexToAddress(in.domain.Rail) != common.HexToAddress(domain.Rail) {
+			common.HexToAddress(in.domain.Token) != common.HexToAddress(domain.Token) {
 			return inputs{}, fmt.Errorf(
 				"-config is domain (%d, %s) but profile %q is on (%d, %s): pass -store and RAILCTL_KEY as well",
-				in.domain.ChainID, in.domain.Rail, name, domain.ChainID, domain.Rail)
+				in.domain.ChainID, in.domain.Token, name, domain.ChainID, domain.Token)
 		}
 	} else {
 		in.domain = domain
@@ -414,7 +510,8 @@ func resolve(opt options) (inputs, error) {
 	return in, nil
 }
 
-// initProfile installs a domain and creates one profile that uses it.
+// initProfile installs a domain, creates one profile that uses it, and says
+// what has to be sent before the account can act.
 func initProfile(args []string, opt options) error {
 	if len(args) != 2 {
 		return errors.New("init: want <profile> <domain-file>")
@@ -430,7 +527,11 @@ func initProfile(args []string, opt options) error {
 	if c.Name == "" {
 		return fmt.Errorf("%s: the domain file has no name", domainFile)
 	}
-	if err := c.domain().Validate(); err != nil {
+	domain, err := c.domain()
+	if err != nil {
+		return fmt.Errorf("%s: %w", domainFile, err)
+	}
+	if err := domain.Validate(); err != nil {
 		return fmt.Errorf("%s: %w", domainFile, err)
 	}
 
@@ -448,8 +549,8 @@ func initProfile(args []string, opt options) error {
 	if _, exists := set.Profiles[name]; exists {
 		return fmt.Errorf("profile %q already exists", name)
 	}
-	// A domain is (chain id, rail address): silently redefining it would
-	// repoint every profile that uses it at another vault.
+	// A domain is (chain id, token): silently redefining it would repoint every
+	// profile that uses it at another ledger.
 	if installed, ok := set.Domains[c.Name]; ok && installed != c {
 		return fmt.Errorf("domain %q is already installed with different contents; pick another name in the domain file", c.Name)
 	}
@@ -475,10 +576,10 @@ func initProfile(args []string, opt options) error {
 		return err
 	}
 
-	// The token must carry EIP-3009 authorisations or no deposit can ever be
-	// made on this domain. Better to learn that here than at the first
-	// deposit.
-	if err := checkDomainToken(c, owner); err != nil {
+	// Prove the domain works before any money depends on it: the token must
+	// carry permits and the venue must be able to price a refill, or this
+	// account could never keep itself in gas.
+	if err := checkDomain(c, domain, owner); err != nil {
 		return err
 	}
 
@@ -498,15 +599,22 @@ func initProfile(args []string, opt options) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stdout, "profile %s on domain %s, account %s\n",
-		name, c.Name, crypto.PubkeyToAddress(owner.PublicKey).Hex())
-	fmt.Fprintf(os.Stderr, "run \"railctl -profile %s account\" for the address to fund\n", name)
+	address := crypto.PubkeyToAddress(owner.PublicKey).Hex()
+	fmt.Fprintf(os.Stdout, "profile %s on domain %s, account %s\n", name, c.Name, address)
+	fmt.Fprintf(os.Stderr, `
+to make this account operational, fund it:
+  1. send the stablecoin to %s
+  2. send at least %s of the native currency to the same address
+  3. wait for finality
+
+after that the account keeps its own gas: it buys more with its own
+stablecoin whenever the reserve runs low.
+`, address, formatUnits(domain.Gas.Max, gasDecimals))
 	return nil
 }
 
-// checkDomainToken dials the domain once to make sure its token can take a
-// deposit at all.
-func checkDomainToken(c config, key *ecdsa.PrivateKey) error {
+// checkDomain dials the domain once to make sure it can be operated at all.
+func checkDomain(c config, domain rail.Domain, key *ecdsa.PrivateKey) error {
 	ctx := context.Background()
 	chain, err := ethclient.DialContext(ctx, c.RPC)
 	if err != nil {
@@ -514,11 +622,27 @@ func checkDomainToken(c config, key *ecdsa.PrivateKey) error {
 	}
 	defer chain.Close()
 
-	r, err := rail.New(c.domain(), noStore{}, chain, key)
+	if err := sameChain(ctx, chain, domain.ChainID); err != nil {
+		return err
+	}
+	r, err := rail.New(domain, noStore{}, chain, key)
 	if err != nil {
 		return err
 	}
-	return r.CheckToken(ctx)
+	return r.CheckDomain(ctx)
+}
+
+// sameChain refuses an endpoint for a different chain. Records are bound to a
+// chain id, and money sent on the wrong one is simply gone.
+func sameChain(ctx context.Context, chain *ethclient.Client, want *big.Int) error {
+	got, err := chain.ChainID(ctx)
+	if err != nil {
+		return fmt.Errorf("read chain id: %w", err)
+	}
+	if got.Cmp(want) != 0 {
+		return fmt.Errorf("the endpoint serves chain %s, the domain is chain %s", got, want)
+	}
+	return nil
 }
 
 // readKeyFile takes a key from a file, so no secret ever appears in a command
@@ -536,10 +660,11 @@ func readKeyFile(path string) (string, error) {
 }
 
 type app struct {
-	opt   options
-	rail  *rail.Rail
-	store *sqlite.Store
-	chain *ethclient.Client
+	opt      options
+	rail     *rail.Rail
+	store    *sqlite.Store
+	chain    *ethclient.Client
+	decimals uint8
 }
 
 func open(ctx context.Context, opt options) (*app, error) {
@@ -551,12 +676,19 @@ func open(ctx context.Context, opt options) (*app, error) {
 	if err != nil {
 		return nil, err
 	}
+	domain, err := in.domain.domain()
+	if err != nil {
+		return nil, err
+	}
 	chain, err := ethclient.DialContext(ctx, in.domain.RPC)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", in.domain.RPC, err)
 	}
-	domain := in.domain.domain()
-	store, err := sqlite.Open(in.store, rail.DomainKey(domain.ChainID, domain.Rail))
+	if err := sameChain(ctx, chain, domain.ChainID); err != nil {
+		chain.Close()
+		return nil, err
+	}
+	store, err := sqlite.Open(in.store, rail.DomainKey(domain.ChainID, domain.Token))
 	if err != nil {
 		chain.Close()
 		return nil, err
@@ -567,7 +699,7 @@ func open(ctx context.Context, opt options) (*app, error) {
 		chain.Close()
 		return nil, err
 	}
-	return &app{opt: opt, rail: r, store: store, chain: chain}, nil
+	return &app{opt: opt, rail: r, store: store, chain: chain, decimals: in.domain.decimals()}, nil
 }
 
 func (a *app) close() {
@@ -575,11 +707,10 @@ func (a *app) close() {
 	a.chain.Close()
 }
 
-// parseAddress refuses anything that is not a whole address. common.HexToAddress
-// pads and truncates in silence, so a half-pasted destination would become a
-// real address nobody holds the key to, and the signature would make it
-// authoritative. Nothing downstream can catch that: the contract cannot know an
-// address was a typo.
+// parseAddress refuses anything that is not a whole address.
+// common.HexToAddress pads and truncates in silence, so a half-pasted
+// destination would become a real address nobody holds the key to. Nothing
+// downstream can catch that: the chain cannot know an address was a typo.
 func parseAddress(s, what string) (common.Address, error) {
 	if !common.IsHexAddress(s) {
 		return common.Address{}, fmt.Errorf("%s %q is not an Ethereum address", what, s)
@@ -606,31 +737,58 @@ func (a *app) account() error {
 	return a.emit(map[string]any{"account": addr.Hex()}, addr.Hex())
 }
 
-func (a *app) balance(ctx context.Context, args []string) error {
-	addr := a.rail.Account()
-	if len(args) > 0 {
-		var err error
-		if addr, err = parseAddress(args[0], "address"); err != nil {
-			return err
-		}
-	}
-	balance, err := a.rail.Balance(ctx, addr)
-	if err != nil {
-		return err
-	}
-	held, err := a.rail.TokenBalance(ctx, addr)
+// balance shows the money, and the reserve separately. The reserve is fuel,
+// never spendable balance.
+func (a *app) balance(ctx context.Context) error {
+	token, gas, err := a.rail.Balances(ctx)
 	if err != nil {
 		return err
 	}
 	return a.emit(
-		map[string]any{"account": addr.Hex(), "balance": balance.String(), "token": held.String()},
-		fmt.Sprintf("%s balance %s token %s", addr.Hex(), balance, held),
+		map[string]any{
+			"account": a.rail.Account().Hex(),
+			"balance": formatUnits(token, a.decimals),
+			"units":   token.String(),
+			"reserve": formatUnits(gas, gasDecimals),
+		},
+		fmt.Sprintf("balance %s  reserve %s", formatUnits(token, a.decimals), formatUnits(gas, gasDecimals)),
 	)
 }
 
-// operation runs one intent through its durable steps, stopping wherever
-// -halt-after says. The steps are the same for all three kinds.
-func (a *app) operation(ctx context.Context, kind rail.Kind, args []string) error {
+// deposits catches up with finalized incoming transfers and lists them.
+// Receiving needs no transaction from this account at all.
+func (a *app) deposits(ctx context.Context) error {
+	if _, err := a.rail.ScanDeposits(ctx); err != nil {
+		return err
+	}
+	all, err := a.rail.Deposits()
+	if err != nil {
+		return err
+	}
+	rows := make([]map[string]any, 0, len(all))
+	lines := make([]string, 0, len(all))
+	for _, d := range all {
+		rows = append(rows, map[string]any{
+			"tx": d.TxHash.Hex(), "logIndex": d.LogIndex, "from": d.From.Hex(),
+			"amount": formatUnits(d.Amount, a.decimals), "block": d.BlockNumber,
+		})
+		lines = append(lines, fmt.Sprintf("%s from %s (%s#%d)",
+			formatUnits(d.Amount, a.decimals), d.From.Hex(), d.TxHash.Hex(), d.LogIndex))
+	}
+	if a.opt.asJSON {
+		return a.emit(map[string]any{"deposits": rows}, "")
+	}
+	if len(lines) == 0 {
+		return a.emit(nil, "no deposits")
+	}
+	_, err = fmt.Fprintln(os.Stdout, strings.Join(lines, "\n"))
+	return err
+}
+
+// pay runs one payment through its durable steps. A reserve too low for the
+// payment is not an error: it buys gas and says to come back once that is
+// confirmed.
+func (a *app) pay(ctx context.Context, kind rail.Kind, args []string) error {
 	if len(args) != 3 {
 		return fmt.Errorf("%s: want <id> <address> <amount>", kind)
 	}
@@ -638,118 +796,83 @@ func (a *app) operation(ctx context.Context, kind rail.Kind, args []string) erro
 	if err != nil {
 		return err
 	}
-	party, err := parseAddress(args[1], map[rail.Kind]string{
-		rail.KindDeposit:  "credited account",
-		rail.KindTransfer: "recipient",
-		rail.KindWithdraw: "destination",
-	}[kind])
+	what := "recipient"
+	if kind == rail.KindWithdraw {
+		what = "destination"
+	}
+	to, err := parseAddress(args[1], what)
 	if err != nil {
 		return err
 	}
-	amount, ok := new(big.Int).SetString(args[2], 10)
-	if !ok {
-		return fmt.Errorf("amount %q is not an integer", args[2])
-	}
-	fee, ok := new(big.Int).SetString(a.opt.fee, 10)
-	if !ok {
-		return fmt.Errorf("fee %q is not an integer", a.opt.fee)
-	}
-	relayer := a.rail.Account()
-	if a.opt.relayer != "" {
-		if relayer, err = parseAddress(a.opt.relayer, "relayer"); err != nil {
-			return err
-		}
-	}
-	if relayer != a.rail.Account() && a.opt.out == "" {
-		return fmt.Errorf("only %s may submit this operation: write it out with -out and hand it over", relayer)
+	amount, err := parseUnits(args[2], a.decimals)
+	if err != nil {
+		return err
 	}
 
-	terms := rail.Terms{Kind: kind, Account: a.rail.Account(), Party: party, Amount: amount}
-	if err := a.rail.Prepare(ctx, id, terms); err != nil {
+	err = a.rail.Prepare(ctx, id, kind, to, amount)
+	if errors.Is(err, rail.ErrNeedRefill) {
+		if a.opt.noRefill {
+			return err
+		}
+		return a.refill(ctx, amount)
+	}
+	if err != nil {
 		return err
 	}
 	if a.opt.haltAfter == "intent" {
 		return a.report(ctx, id, "intent recorded")
 	}
-
-	v, err := a.rail.Sign(ctx, id, fee, relayer, a.opt.validFor)
+	hash, err := a.rail.Send(ctx, id)
 	if err != nil {
 		return err
 	}
-	if a.opt.out != "" {
-		if err := a.writeVariant(v); err != nil {
-			return err
-		}
-		return a.report(ctx, id, "signed for "+relayer.Hex())
+	// A zero hash means the operation had already finished: there was nothing
+	// left to send, which is what a repeated command should find.
+	note := "already settled"
+	if hash != (common.Hash{}) {
+		note = "submitted " + hash.Hex()
 	}
-	if a.opt.haltAfter == "sign" {
-		return a.report(ctx, id, "variant signed")
-	}
-
-	if _, err := a.rail.Relay(ctx, v); err != nil && !errors.Is(err, rail.ErrExecuted) {
-		return err
-	}
-	// No note: a submission is not an outcome, and after a retry the intent
-	// may already have executed without this run presenting anything.
-	return a.report(ctx, id, "")
-}
-
-// writeVariant hands a signed operation to whoever will carry it.
-func (a *app) writeVariant(v rail.Variant) error {
-	blob, err := rail.EncodeVariant(a.rail.Domain(), v)
-	if err != nil {
-		return err
-	}
-	blob = append(blob, '\n')
-	if a.opt.out == "-" {
-		_, err := os.Stdout.Write(blob)
-		return err
-	}
-	return os.WriteFile(a.opt.out, blob, 0o600)
-}
-
-// relay carries someone else's signed operation, paying its gas. Nothing about
-// the operation is taken on trust: the signature, the binding, the deadline
-// and the balance are all checked, and the exact call is simulated, before any
-// gas is spent.
-func (a *app) relay(ctx context.Context, args []string) error {
-	if len(args) != 1 {
-		return errors.New("relay: want <variant-file|->")
-	}
-	var (
-		raw []byte
-		err error
-	)
-	if args[0] == "-" {
-		raw, err = io.ReadAll(os.Stdin)
-	} else {
-		raw, err = os.ReadFile(args[0])
-	}
-	if err != nil {
-		return fmt.Errorf("read variant: %w", err)
-	}
-	env, err := rail.DecodeVariant(raw)
-	if err != nil {
-		return err
-	}
-	v, err := a.rail.Accept(env)
-	if err != nil {
-		return err
-	}
-	hash, err := a.rail.Relay(ctx, v)
-	if errors.Is(err, rail.ErrExecuted) {
+	if a.opt.haltAfter == "submit" {
 		return a.emit(
-			map[string]any{"id": v.ID.String(), "account": v.Account.Hex(), "submitted": false, "note": "already executed"},
-			fmt.Sprintf("%s already executed", v.ID),
-		)
+			map[string]any{"id": id.String(), "tx": hash.Hex(), "submitted": hash != common.Hash{}},
+			fmt.Sprintf("%s %s", id, note))
 	}
+	return a.report(ctx, id, note)
+}
+
+// refill buys native currency with the account's own stablecoin. It is
+// maintenance, not a payment, so it reports separately and leaves the payment
+// for the caller to repeat once the reserve is really there.
+func (a *app) refill(ctx context.Context, reserve *big.Int) error {
+	id, hash, err := a.rail.Refill(ctx, reserve)
 	if err != nil {
 		return err
 	}
 	return a.emit(
-		map[string]any{"id": v.ID.String(), "account": v.Account.Hex(), "submitted": true, "tx": hash.Hex()},
-		fmt.Sprintf("%s submitted %s", v.ID, hash.Hex()),
+		map[string]any{"refill": id.String(), "tx": hash.Hex(), "submitted": true},
+		fmt.Sprintf("reserve low: refill %s submitted %s; run the payment again once it is confirmed", id, hash.Hex()),
 	)
+}
+
+// retry re-sends a recorded operation under the same nonce and terms, paying
+// more only in transaction fees.
+func (a *app) retry(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return errors.New("retry: want <id>")
+	}
+	id, err := rail.ParseID(args[0])
+	if err != nil {
+		return err
+	}
+	hash, err := a.rail.Retry(ctx, id)
+	if err != nil {
+		return err
+	}
+	note := "nothing to retry"
+	if hash != (common.Hash{}) {
+		note = "resubmitted " + hash.Hex()
+	}
+	return a.report(ctx, id, note)
 }
 
 func (a *app) status(ctx context.Context, args []string) error {
@@ -761,20 +884,6 @@ func (a *app) status(ctx context.Context, args []string) error {
 		return err
 	}
 	return a.report(ctx, id, "")
-}
-
-func (a *app) abandon(ctx context.Context, args []string) error {
-	if len(args) != 1 {
-		return errors.New("abandon: want <id>")
-	}
-	id, err := rail.ParseID(args[0])
-	if err != nil {
-		return err
-	}
-	if err := a.rail.Abandon(ctx, id); err != nil {
-		return err
-	}
-	return a.report(ctx, id, "abandoned: no further variant will be signed")
 }
 
 // report prints the intent's status. Status is a property of the intent, so
@@ -795,6 +904,9 @@ func (a *app) report(ctx context.Context, id rail.ID, note string) error {
 
 func (a *app) emit(structured map[string]any, line string) error {
 	if !a.opt.asJSON {
+		if line == "" {
+			return nil
+		}
 		_, err := fmt.Fprintln(os.Stdout, line)
 		return err
 	}
@@ -804,18 +916,33 @@ func (a *app) emit(structured map[string]any, line string) error {
 }
 
 // noStore satisfies rail.Store for the one command that binds a rail without
-// keeping records: the token check at init reads the chain and nothing else.
+// keeping records: the domain check at init reads the chain and nothing else.
 type noStore struct{}
 
 var errNoStore = errors.New("railctl: this command keeps no records")
 
-func (noStore) PutIntent(rail.Ref, rail.Intent) error      { return errNoStore }
-func (noStore) Intent(rail.Ref) (rail.Intent, bool, error) { return rail.Intent{}, false, errNoStore }
-func (noStore) AppendVariant(rail.Ref, rail.Variant) error { return errNoStore }
-func (noStore) Variants(rail.Ref) ([]rail.Variant, error)  { return nil, errNoStore }
-func (noStore) Abandon(rail.Ref) error                     { return errNoStore }
-func (noStore) Abandoned(rail.Ref) (bool, error)           { return false, errNoStore }
-func (noStore) PutFact(rail.Ref, rail.Fact) error          { return errNoStore }
-func (noStore) Fact(rail.Ref) (rail.Fact, bool, error)     { return rail.Fact{}, false, errNoStore }
-func (noStore) Pending() ([]rail.Ref, error)               { return nil, errNoStore }
-func (noStore) Close() error                               { return nil }
+func (noStore) PutIntent(common.Address, rail.Intent) error { return errNoStore }
+func (noStore) Intent(common.Address, rail.ID) (rail.Intent, bool, error) {
+	return rail.Intent{}, false, errNoStore
+}
+func (noStore) IntentByNonce(common.Address, uint64) (rail.Intent, bool, error) {
+	return rail.Intent{}, false, errNoStore
+}
+func (noStore) Pending(common.Address) ([]rail.Intent, error) { return nil, errNoStore }
+func (noStore) AppendSubmission(common.Address, rail.ID, rail.Submission) error {
+	return errNoStore
+}
+func (noStore) Submissions(common.Address, rail.ID) ([]rail.Submission, error) {
+	return nil, errNoStore
+}
+func (noStore) PutFact(common.Address, rail.ID, rail.Fact) error { return errNoStore }
+func (noStore) Fact(common.Address, rail.ID) (rail.Fact, bool, error) {
+	return rail.Fact{}, false, errNoStore
+}
+func (noStore) PutDeposit(common.Address, rail.Deposit) error   { return errNoStore }
+func (noStore) Deposits(common.Address) ([]rail.Deposit, error) { return nil, errNoStore }
+func (noStore) Cursor(common.Address) (uint64, bool, error)     { return 0, false, errNoStore }
+func (noStore) PutCursor(common.Address, uint64) error          { return errNoStore }
+func (noStore) NonceFloor(common.Address) (uint64, bool, error) { return 0, false, errNoStore }
+func (noStore) PutNonceFloor(common.Address, uint64) error      { return errNoStore }
+func (noStore) Close() error                                    { return nil }

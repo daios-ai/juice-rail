@@ -3,255 +3,314 @@ package rail
 import (
 	"errors"
 	"math/big"
+	"sync"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// memStore is the in-memory Store the other tests run against. It is also the
-// second implementation of the interface, which keeps the contract honest.
+// memStore is a second Store implementation. Keeping one in the tests is what
+// stops the interface quietly meaning "whatever SQLite happens to do".
 type memStore struct {
-	intents   map[Ref]Intent
-	variants  map[Ref][]Variant
-	abandoned map[Ref]bool
-	facts     map[Ref]Fact
-	order     []Ref
+	mu       sync.Mutex
+	intents  map[string]Intent
+	byNonce  map[string]ID
+	order    []string
+	subs     map[string][]Submission
+	facts    map[string]Fact
+	deposits map[string][]Deposit
+	seen     map[string]bool
+	cursor   map[common.Address]uint64
+	floor    map[common.Address]uint64
 }
 
 func newMemStore() *memStore {
 	return &memStore{
-		intents:   map[Ref]Intent{},
-		variants:  map[Ref][]Variant{},
-		abandoned: map[Ref]bool{},
-		facts:     map[Ref]Fact{},
+		intents:  map[string]Intent{},
+		byNonce:  map[string]ID{},
+		subs:     map[string][]Submission{},
+		facts:    map[string]Fact{},
+		deposits: map[string][]Deposit{},
+		seen:     map[string]bool{},
+		cursor:   map[common.Address]uint64{},
+		floor:    map[common.Address]uint64{},
 	}
 }
 
-func (m *memStore) PutIntent(ref Ref, in Intent) error {
-	if existing, ok := m.intents[ref]; ok {
-		if !existing.Terms.Equal(in.Terms) {
+func mkey(a common.Address, id ID) string { return a.Hex() + "/" + id.String() }
+
+func nkey(a common.Address, nonce uint64) string {
+	return a.Hex() + "#" + new(big.Int).SetUint64(nonce).String()
+}
+
+func (s *memStore) PutIntent(account common.Address, in Intent) error {
+	if err := in.Validate(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	k := mkey(account, in.ID)
+	if existing, ok := s.intents[k]; ok {
+		if !existing.SameTerms(in) {
 			return ErrIntentConflict
 		}
 		return nil
 	}
-	m.intents[ref] = in
-	m.order = append(m.order, ref)
+	if _, taken := s.byNonce[nkey(account, in.Nonce)]; taken {
+		return ErrIntentConflict
+	}
+	s.intents[k] = in
+	s.byNonce[nkey(account, in.Nonce)] = in.ID
+	s.order = append(s.order, k)
 	return nil
 }
 
-func (m *memStore) Intent(ref Ref) (Intent, bool, error) {
-	in, ok := m.intents[ref]
+func (s *memStore) Intent(account common.Address, id ID) (Intent, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	in, ok := s.intents[mkey(account, id)]
 	return in, ok, nil
 }
 
-func (m *memStore) AppendVariant(ref Ref, v Variant) error {
-	if m.abandoned[ref] {
-		return ErrAbandoned
+func (s *memStore) IntentByNonce(account common.Address, nonce uint64) (Intent, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.byNonce[nkey(account, nonce)]
+	if !ok {
+		return Intent{}, false, nil
 	}
-	if _, err := MarshalVariant(v); err != nil {
-		return err
-	}
-	m.variants[ref] = append(m.variants[ref], v)
-	return nil
+	return s.intents[mkey(account, id)], true, nil
 }
 
-func (m *memStore) Variants(ref Ref) ([]Variant, error) { return m.variants[ref], nil }
-
-func (m *memStore) Abandon(ref Ref) error { m.abandoned[ref] = true; return nil }
-
-func (m *memStore) Abandoned(ref Ref) (bool, error) { return m.abandoned[ref], nil }
-
-func (m *memStore) PutFact(ref Ref, f Fact) error {
-	if _, ok := m.facts[ref]; ok {
-		return nil
-	}
-	m.facts[ref] = f
-	return nil
-}
-
-func (m *memStore) Fact(ref Ref) (Fact, bool, error) {
-	f, ok := m.facts[ref]
-	return f, ok, nil
-}
-
-func (m *memStore) Pending() ([]Ref, error) {
-	var out []Ref
-	for _, ref := range m.order {
-		if _, done := m.facts[ref]; !done {
-			out = append(out, ref)
+func (s *memStore) Pending(account common.Address) ([]Intent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Intent
+	for _, k := range s.order {
+		in := s.intents[k]
+		if k != mkey(account, in.ID) {
+			continue
+		}
+		if _, done := s.facts[k]; !done {
+			out = append(out, in)
 		}
 	}
 	return out, nil
 }
 
-func (m *memStore) Close() error { return nil }
-
-// --- helpers shared by the package's tests ---
-
-func testID(n byte) ID {
-	var id ID
-	id[31] = n
-	return id
+func (s *memStore) AppendSubmission(account common.Address, id ID, sub Submission) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := mkey(account, id)
+	s.subs[k] = append(s.subs[k], sub)
+	return nil
 }
 
-func addr(n byte) common.Address {
-	var a common.Address
-	a[19] = n
-	return a
+func (s *memStore) Submissions(account common.Address, id ID) ([]Submission, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Submission(nil), s.subs[mkey(account, id)]...), nil
 }
 
-func testTerms(kind Kind, account, party common.Address, amount int64) Terms {
-	return Terms{Kind: kind, Account: account, Party: party, Amount: big.NewInt(amount)}
-}
-
-func testVariant(kind Kind, account, party common.Address, amount, fee int64, relayer common.Address, validBefore uint64) Variant {
-	v := Variant{
-		Terms:       testTerms(kind, account, party, amount),
-		ID:          testID(1),
-		Fee:         big.NewInt(fee),
-		Relayer:     relayer,
-		ValidBefore: validBefore,
-		TermsSig:    make([]byte, 65),
+func (s *memStore) PutFact(account common.Address, id ID, f Fact) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := mkey(account, id)
+	if _, ok := s.facts[k]; !ok {
+		s.facts[k] = f
 	}
-	if kind == KindDeposit {
-		v.AuthSig = make([]byte, 65)
-	}
-	return v
+	return nil
 }
 
-// --- the interface contract ---
+func (s *memStore) Fact(account common.Address, id ID) (Fact, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, ok := s.facts[mkey(account, id)]
+	return f, ok, nil
+}
 
-func TestStoreRecordsAnIntentOnce(t *testing.T) {
+func (s *memStore) PutDeposit(account common.Address, d Deposit) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := account.Hex() + "/" + d.TxHash.Hex() + "#" + new(big.Int).SetUint64(uint64(d.LogIndex)).String()
+	if s.seen[k] {
+		return nil
+	}
+	s.seen[k] = true
+	s.deposits[account.Hex()] = append(s.deposits[account.Hex()], d)
+	return nil
+}
+
+func (s *memStore) Deposits(account common.Address) ([]Deposit, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Deposit(nil), s.deposits[account.Hex()]...), nil
+}
+
+func (s *memStore) Cursor(account common.Address) (uint64, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.cursor[account]
+	return v, ok, nil
+}
+
+func (s *memStore) PutCursor(account common.Address, block uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if block > s.cursor[account] {
+		s.cursor[account] = block
+	}
+	return nil
+}
+
+func (s *memStore) NonceFloor(account common.Address) (uint64, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.floor[account]
+	return v, ok, nil
+}
+
+func (s *memStore) PutNonceFloor(account common.Address, nonce uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.floor[account]; !ok || nonce > cur {
+		s.floor[account] = nonce
+	}
+	return nil
+}
+
+func (s *memStore) Close() error { return nil }
+
+// --- the properties every Store must have ---
+
+func testIntent(id byte, nonce uint64) Intent {
+	return Intent{
+		ID:        ID{id},
+		Kind:      KindTransfer,
+		To:        common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Amount:    big.NewInt(1000),
+		Nonce:     nonce,
+		Calldata:  []byte{0xa9, 0x05, 0x9c, 0xbb, byte(nonce)},
+		FromBlock: 7,
+	}
+}
+
+var testAccount = common.HexToAddress("0x1111111111111111111111111111111111111111")
+
+func TestStoreIntentsAreWriteOnce(t *testing.T) {
 	s := newMemStore()
-	ref := Ref{Account: addr(1), ID: testID(1)}
-	in := Intent{Terms: testTerms(KindTransfer, addr(1), addr(2), 10), FromBlock: 7}
-
-	if err := s.PutIntent(ref, in); err != nil {
-		t.Fatal(err)
+	in := testIntent(1, 0)
+	if err := s.PutIntent(testAccount, in); err != nil {
+		t.Fatalf("record: %v", err)
 	}
-	if err := s.PutIntent(ref, in); err != nil {
-		t.Fatalf("re-recording identical terms must succeed: %v", err)
+	// The same decision recorded twice is the same decision.
+	if err := s.PutIntent(testAccount, in); err != nil {
+		t.Fatalf("re-record: %v", err)
 	}
-	other := in
-	other.Terms.Amount = big.NewInt(11)
-	if err := s.PutIntent(ref, other); !errors.Is(err, ErrIntentConflict) {
-		t.Fatalf("want ErrIntentConflict, got %v", err)
+	changed := in
+	changed.Amount = big.NewInt(2000)
+	if err := s.PutIntent(testAccount, changed); !errors.Is(err, ErrIntentConflict) {
+		t.Fatalf("different terms under one identifier: %v, want conflict", err)
 	}
-
-	got, ok, err := s.Intent(ref)
-	if err != nil || !ok {
-		t.Fatalf("intent missing: %v %v", ok, err)
-	}
-	if !got.Terms.Equal(in.Terms) || got.FromBlock != 7 {
-		t.Fatalf("stored %+v, want %+v", got, in)
+	// One nonce carries one operation, whatever it is called.
+	other := testIntent(2, 0)
+	if err := s.PutIntent(testAccount, other); !errors.Is(err, ErrIntentConflict) {
+		t.Fatalf("second intent on one nonce: %v, want conflict", err)
 	}
 }
 
-// Identifiers are scoped to their account, on chain and here.
-func TestStoreSeparatesAccountsUnderOneIdentifier(t *testing.T) {
+func TestStoreFindsIntentByNonce(t *testing.T) {
 	s := newMemStore()
-	id := testID(1)
-	alice := Ref{Account: addr(1), ID: id}
-	bob := Ref{Account: addr(2), ID: id}
-
-	if err := s.PutIntent(alice, Intent{Terms: testTerms(KindTransfer, addr(1), addr(9), 10)}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.PutIntent(bob, Intent{Terms: testTerms(KindWithdraw, addr(2), addr(9), 99)}); err != nil {
-		t.Fatalf("another account's identifier must not conflict: %v", err)
-	}
-	got, _, _ := s.Intent(bob)
-	if got.Terms.Amount.Int64() != 99 {
-		t.Fatalf("accounts alias: got %v", got.Terms)
-	}
-	if err := s.Abandon(alice); err != nil {
-		t.Fatal(err)
-	}
-	if abandoned, _ := s.Abandoned(bob); abandoned {
-		t.Fatal("abandoning one account's intent abandoned another's")
-	}
-}
-
-func TestStoreAppendsVariantsUntilAbandoned(t *testing.T) {
-	s := newMemStore()
-	ref := Ref{Account: addr(1), ID: testID(1)}
-	v := testVariant(KindTransfer, addr(1), addr(2), 10, 1, addr(3), 100)
-
-	if err := s.AppendVariant(ref, v); err != nil {
-		t.Fatal(err)
-	}
-	v.ValidBefore = 200
-	if err := s.AppendVariant(ref, v); err != nil {
-		t.Fatal(err)
-	}
-	got, err := s.Variants(ref)
-	if err != nil || len(got) != 2 {
-		t.Fatalf("want 2 variants, got %d (%v)", len(got), err)
-	}
-	if got[0].ValidBefore != 100 || got[1].ValidBefore != 200 {
-		t.Fatalf("variants out of order: %v", got)
-	}
-
-	if err := s.Abandon(ref); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.AppendVariant(ref, v); !errors.Is(err, ErrAbandoned) {
-		t.Fatalf("want ErrAbandoned, got %v", err)
-	}
-	// Abandonment kills nothing already signed.
-	if got, _ := s.Variants(ref); len(got) != 2 {
-		t.Fatalf("abandonment dropped variants: %d", len(got))
-	}
-}
-
-func TestStoreCachesFinalizedFactsOnce(t *testing.T) {
-	s := newMemStore()
-	ref := Ref{Account: addr(1), ID: testID(1)}
-	if err := s.PutFact(ref, Fact{BlockNumber: 5, Executed: true}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.PutFact(ref, Fact{BlockNumber: 6, Executed: false}); err != nil {
-		t.Fatal(err)
-	}
-	f, ok, err := s.Fact(ref)
-	if err != nil || !ok {
-		t.Fatal("fact missing")
-	}
-	if f.BlockNumber != 5 || !f.Executed {
-		t.Fatalf("a finalized fact changed: %+v", f)
-	}
-}
-
-func TestStorePendingDropsSettledIntents(t *testing.T) {
-	s := newMemStore()
-	a := Ref{Account: addr(1), ID: testID(1)}
-	b := Ref{Account: addr(1), ID: testID(2)}
-	for _, ref := range []Ref{a, b} {
-		if err := s.PutIntent(ref, Intent{Terms: testTerms(KindTransfer, addr(1), addr(2), 1)}); err != nil {
-			t.Fatal(err)
+	for i := uint64(0); i < 3; i++ {
+		if err := s.PutIntent(testAccount, testIntent(byte(i+1), i)); err != nil {
+			t.Fatalf("record: %v", err)
 		}
 	}
-	if err := s.PutFact(a, Fact{Executed: true}); err != nil {
-		t.Fatal(err)
+	in, ok, err := s.IntentByNonce(testAccount, 1)
+	if err != nil || !ok {
+		t.Fatalf("by nonce: %v %v", ok, err)
 	}
-	pending, err := s.Pending()
-	if err != nil {
-		t.Fatal(err)
+	if in.ID != (ID{2}) {
+		t.Fatalf("nonce 1 belongs to %s", in.ID)
 	}
-	if len(pending) != 1 || pending[0] != b {
-		t.Fatalf("pending %v, want just %v", pending, b)
+	if _, ok, _ := s.IntentByNonce(testAccount, 9); ok {
+		t.Fatal("an unused nonce reported an intent")
 	}
 }
 
-func TestDomainKeyDistinguishesDeployments(t *testing.T) {
-	one := DomainKey(big.NewInt(42161), addr(1))
-	two := DomainKey(big.NewInt(421614), addr(1))
-	three := DomainKey(big.NewInt(42161), addr(2))
-	if one == two || one == three {
-		t.Fatalf("domains collide: %s %s %s", one, two, three)
+func TestStorePendingIsWhatHasNoFact(t *testing.T) {
+	s := newMemStore()
+	for i := uint64(0); i < 3; i++ {
+		if err := s.PutIntent(testAccount, testIntent(byte(i+1), i)); err != nil {
+			t.Fatalf("record: %v", err)
+		}
 	}
-	if DomainKey(big.NewInt(1), common.HexToAddress("0xAbC0000000000000000000000000000000000000")) !=
-		DomainKey(big.NewInt(1), common.HexToAddress("0xabc0000000000000000000000000000000000000")) {
-		t.Fatal("case changes the domain key")
+	if err := s.PutFact(testAccount, ID{2}, Fact{Executed: true}); err != nil {
+		t.Fatalf("fact: %v", err)
+	}
+	pending, err := s.Pending(testAccount)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("pending is %d intents, want 2", len(pending))
+	}
+}
+
+func TestStoreFactsNeverChange(t *testing.T) {
+	s := newMemStore()
+	if err := s.PutFact(testAccount, ID{1}, Fact{Executed: true, BlockNumber: 4}); err != nil {
+		t.Fatalf("fact: %v", err)
+	}
+	if err := s.PutFact(testAccount, ID{1}, Fact{Executed: false, BlockNumber: 9}); err != nil {
+		t.Fatalf("fact again: %v", err)
+	}
+	f, ok, _ := s.Fact(testAccount, ID{1})
+	if !ok || !f.Executed || f.BlockNumber != 4 {
+		t.Fatalf("a finalized fact was overwritten: %+v", f)
+	}
+}
+
+func TestStoreDepositsAreIdentifiedByTheirLog(t *testing.T) {
+	s := newMemStore()
+	d := Deposit{TxHash: common.HexToHash("0xaa"), LogIndex: 3, From: testAccount, Amount: big.NewInt(5)}
+	for i := 0; i < 3; i++ {
+		if err := s.PutDeposit(testAccount, d); err != nil {
+			t.Fatalf("deposit: %v", err)
+		}
+	}
+	all, _ := s.Deposits(testAccount)
+	if len(all) != 1 {
+		t.Fatalf("one transfer recorded %d times", len(all))
+	}
+	d.LogIndex = 4
+	if err := s.PutDeposit(testAccount, d); err != nil {
+		t.Fatalf("deposit: %v", err)
+	}
+	if all, _ = s.Deposits(testAccount); len(all) != 2 {
+		t.Fatalf("two different logs recorded as %d", len(all))
+	}
+}
+
+func TestStoreCursorsOnlyAdvance(t *testing.T) {
+	s := newMemStore()
+	for _, pair := range []struct {
+		set  uint64
+		want uint64
+	}{{10, 10}, {4, 10}, {12, 12}} {
+		if err := s.PutCursor(testAccount, pair.set); err != nil {
+			t.Fatalf("cursor: %v", err)
+		}
+		got, ok, _ := s.Cursor(testAccount)
+		if !ok || got != pair.want {
+			t.Fatalf("after setting %d the cursor is %d, want %d", pair.set, got, pair.want)
+		}
+		if err := s.PutNonceFloor(testAccount, pair.set); err != nil {
+			t.Fatalf("floor: %v", err)
+		}
+		if got, ok, _ = s.NonceFloor(testAccount); !ok || got != pair.want {
+			t.Fatalf("after setting %d the floor is %d, want %d", pair.set, got, pair.want)
+		}
 	}
 }

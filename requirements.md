@@ -1,6 +1,6 @@
 # JUICE-RAIL
 
-Version: 0.2 (only MAJOR.MINOR)
+Version: 0.3 (only MAJOR.MINOR)
 
 INSTRUCTIONS: THIS FILE CONTAINS THE JUICE-RAIL REQUIREMENTS.
 BEFORE ADDING ANYTHING, ALWAYS CHECK WHETHER THE EXISTING TEXT CAN BE REWRITTEN.
@@ -8,362 +8,299 @@ TONE MUST BE TERSE AND ALWAYS MINIMAL.
 
 0. Rules
 
-MINIMALITY IS CRUCIAL HERE TO ALLOW FOR FORMAL VERIFICATION!
+MINIMALITY IS CRUCIAL HERE: ONLY WHAT IS SMALL ENOUGH TO ENUMERATE CAN BE
+TRUSTED WITH MONEY.
 
-`juice-rail` is a minimal, self-contained stablecoin rail: a Go library and
-contracts for host applications, plus a tiny standalone app as test and
-operations harness. Juice is one host among others.
+`juice-rail` is a minimal, self-contained stablecoin rail: a Go library for
+host applications, plus a tiny standalone app as test and operations
+harness. Juice is one host among others.
 
-* The host is authoritative for its own ledger; the rail moves external money
-  and reports finalized facts.
-* A rail account is an Ethereum address.
-* The account holder authorizes money movement; transaction submission grants
-  no authority over funds.
-* No privileged operator is required for continued operation.
-* Ordinary participants never need the chain's native gas currency.
-* Every rail balance is fully backed by stablecoin held by the contract.
-* If there is state, transitions are minimal so they can be verified.
-* Every operation is at-most-once under (account, ID).
-* Resubmitting the executed operation is a harmless replay; conflicting reuse
-  reverts.
-* Retry is the recovery protocol: every retry is safe, every failure loud.
+* The host is authoritative for its own ledger; the rail moves external
+  money and reports finalized facts.
+* A rail account is an EOA holding the stablecoin (money) and the native gas
+  asset (operating reserve). Each account is its own vault.
+* Money movement uses ordinary EVM mechanisms — ERC-20 balances and
+  transfers, EOA nonces — never reproduced in a custom contract.
+* An account funds its own gas from its own stablecoin. One account never
+  pays another account's gas; no relayer, bundler, paymaster, shared
+  treasury or privileged operator exists.
+* Receiving money requires nothing from the recipient.
+* Every operation is at-most-once; retry never duplicates.
+* On any shortage nothing is signed or submitted; the account waits. Blocked
+  is not lost. Every failure is loud.
 * No stored observation of the chain is authoritative; only finalized facts
-  may be cached. Stored decisions (intent, signed operations, abandonment)
-  are authoritative commitments.
-* Prefer established mechanisms over custom protocols.
+  may be cached. Write-ahead records are authoritative commitments.
+* No floating-point accounting or stored exchange-rate state exists inside
+  the rail.
 
-1. Domains and accounting
+1. Domains
 
-A domain is one `JuiceRail` deployment:
-
-```text
-domain = (chain ID, JuiceRail contract address)
-```
-
-Domains have independent balances, IDs and liability. No bridging, netting or
-cross-domain state.
-
-The configured stablecoin is the accounting asset. Amounts use its base units.
-No floating point or exchange rate exists inside JuiceRail.
-
-Per-domain configuration: chain ID, token address, rail contract address, RPC
-and finality mechanism.
-
-2. Accounts and authorization
-
-A JuiceRail account is an Ethereum address. The holder's EOA signature
-(ecrecover) is the only debit authority. EIP-1271 is not supported:
-verification executes no foreign code.
-
-Host identity is outside JuiceRail. A host may bind its own identity to a
-rail address.
-
-Money operations use EIP-712. The domain separator binds (chain ID, contract
-address); each kind is a distinct struct type, so the type hash discriminates
-kinds. Signed terms per kind:
+A domain is one settlement environment:
 
 ```text
-deposit    ID, payer, credited account, amount, fee, relayer, validity
-transfer   ID, sender, recipient, amount, fee, relayer, validity
-withdraw   ID, account, destination, amount, fee, relayer, validity
+domain = (chain ID, stablecoin token address)
 ```
 
-`validity` is a deadline; past it the operation cannot execute.
+Per-domain configuration: RPC, finality mechanism, first block to observe,
+swap venue, gas policy (MIN, MAX, slippage bound s in basis points, refill
+fee bound B, and the gas bounds of a payment and of a refill).
 
-Accepted risk: key loss or compromise is terminal for an account. Rotation is
-a signed transfer of the balance, less its relay fee, to a fresh address.
+Domains have independent balances and state. No bridging or cross-domain
+netting. The configured stablecoin (USDT0) is the accounting asset; amounts
+use its base units.
 
-3. Contract
+2. Accounts and onboarding
 
-One non-upgradeable, adminless artifact `JuiceRail`.
+A rail account is one EOA whose key is local to its participant's client.
+No central service submits its transactions. Host identity is outside the
+rail.
 
-```solidity
-IERC20 public immutable token;
-mapping(address account => uint256) public balanceOf;
-mapping(address account => mapping(bytes32 id => bytes32 termsHash)) public operations;
-```
-
-`operations` is keyed by the authorizing (debited) account, so no other
-account can bind or burn an ID. It is written once, at execution, with the
-EIP-712 struct hash of the executed terms.
-
-The only money operations:
+On chain the account is fully described by:
 
 ```text
-deposit     external stablecoin → account; fee → relayer
-transfer    account → account; fee → relayer
-withdraw    account → signed destination; fee → relayer
+USDT0 balance    the user's money
+ETH balance      the operating reserve
+nonce            serialization of outgoing transactions
 ```
 
-The fee credits the relayer's rail balance. An executing operation emits one
-event with indexed account and ID and full terms; a replay emits nothing.
-There is no stored liability total: solvency is checkable off-chain from
-events.
+There is no rail balance mapping: the token ledger is the ledger.
 
-Invariants:
+Onboarding:
 
 ```text
-held stablecoin >= sum of balances
-deposit increases held and the sum of balances equally
-transfer preserves the sum of balances
-withdraw decreases held and the sum equally
-(account, ID) moves money at most once; conflicting reuse reverts
-an account cannot debit another account
-the transaction sender alone has no debit authority
-direct token transfers credit nothing (the token balance is read only
-  transiently inside deposit to measure the pulled amount)
+1. create the EOA
+2. fund it with USDT0
+3. fund it with ETH >= the reserve minimum
+4. wait for finality
 ```
 
-4. Relaying and gas
+This is the only point where ETH is normally acquired explicitly.
 
-A relayer submits a signed operation and fronts native gas. Only the
-designated relayer may submit; submitting for oneself means naming oneself.
-A signed operation is a bearer instrument until its deadline, so naming its
-carrier keeps a leaked authorization inert to everyone else.
+Accepted risk: key loss or compromise is terminal. Rotation is a transfer
+of both balances to a fresh EOA.
 
-The relayer quotes a stablecoin fee before signing. The account holder signs
-relayer and fee as operation terms; no other relayer can take the fee.
+3. Gas reserve
 
-On success the debited account pays amount + fee and the fee credits the
-relayer's rail balance.
-
-JuiceRail contains no gas oracle, native-token accounting, exchange
-mechanism, fixed fee or fee auction.
-
-Before submission the relayer verifies signature, ID and balance and
-simulates the exact transaction. If execution nevertheless fails, the relayer
-bears the native-gas cost; relayers price this residual risk into fees.
-
-5. Deposit
-
-The payer signs twice:
+ORDINARY MIN/MAX HYSTERESIS, AND NOTHING ELSE:
 
 ```text
-1. EIP-3009 receiveWithAuthorization for amount + fee, payee JuiceRail
-2. the EIP-712 deposit terms
+if ETH >= MIN: execute
+otherwise:     refill to MAX, recheck, then execute
 ```
 
-The payee restriction stops the authorization executing outside deposit and
-stranding funds; `transferWithAuthorization` is rejected. The terms signer
-and the authorization's `from` must be one address; the rail deadline is the
-authorization's `validBefore`, with `validAfter` zero.
+The level is compared to MIN. Nothing is projected, estimated or modelled:
+covering the next transaction is what MIN is for. One threshold, one place, a
+pure function. A second reserve rule anywhere is a defect; delete it. A
+reserve under MIN is not a fault, it is the reorder point doing its job.
 
-The contract checks the (payer, ID) binding, pulls the tokens, checks its own
-balance delta equals amount + fee, credits the account and pays the fee. The
-payer's address never determines the credited account.
+MIN covers the replenishment transactions plus margin at the fee bound B; no
+constant MIN suffices for every fee level, so refill transaction cost <= B is
+a trust-base assumption and external ETH top-up is the recovery beyond it.
+MAX provides runway so the account rarely rebalances.
 
-An exchange deposit is two-stage:
+At most one outgoing transaction is in flight per account.
+
+Refill is maintenance, not a verb. Sizing, from the venue quote:
 
 ```text
-exchange → payer Ethereum address
-payer → JuiceRail by EIP-3009 deposit
+Δ = MAX − (e − g_s)     e ETH balance, g_s swap gas cost
+q = quoted USDT0 input for exactly Δ ETH
+x = q + ⌈q·s / 10000⌉   s slippage bound in basis points
 ```
 
-A bare token transfer to the contract credits no account.
+One transaction: EIP-2612 permit for x plus an exact-output swap of Δ with
+input bound x, pinned addresses, deadline, native-ETH output (unwrapped).
+The allowance residue x − input is at most x, one refill's input bound; it
+is held only against the pinned immutable router and is overwritten by the
+next permit.
 
-The participant needs no native gas currency.
+Gas bounds are configuration, not estimates: estimating requires the ETH the
+policy is deciding whether to buy. Unused gas is not charged, so a generous
+bound costs only a more conservative reserve, and a refill may overshoot MAX
+harmlessly.
 
-6. Transfer
-
-The sender signs the transfer terms; the designated relayer submits.
+Shortages block before signing:
 
 ```text
-sender     -= amount + fee
-recipient  += amount
-relayer    += fee
+ETH   < swap cost           wait for cheaper gas or external top-up
+USDT0 < x + pending amount  wait for a deposit or better conditions
 ```
 
-The transaction sender cannot alter signed terms or debit an account without
-its holder's signature.
-
-7. Withdrawal
-
-The account holder signs the withdrawal, including its external destination;
-an exchange address may be the destination directly.
+Venue requirements: immutable contracts, exact-output swaps, native-ETH
+delivery, deep stablecoin/WETH liquidity on the domain. Pins, Uniswap V3 at
+the 0.05% tier (verified on-chain before use):
 
 ```text
-account      -= amount + fee
-held         -= amount
-destination  receives amount externally
-relayer      += fee
+Arbitrum One      router 0xE592427A0AEce92De3Edee1F18E0157C05861564
+                  quoter 0x61fFE014bA17989E743c5F6cB21bF9697530B21e
+                  WETH   0x82aF49447D8a07e3bd95BD0d56f35241523fBab1
+Arbitrum Sepolia  router 0x101F443B4d1b059569D643917553c771E1b9663E
+                  quoter 0x2779a0CC1c3e0E44D2542EC3e79E3864Ae93Ef0B
+                  WETH   0x980B62Da83eFf3D4576C647993b0c1D7faf17c73
 ```
 
-The destination is a signed term; there is no stored withdrawal-address
-state.
+Arbitrum One carries the first SwapRouter; Arbitrum Sepolia carries
+SwapRouter02, which moves the deadline from the swap parameters into
+multicall. Both encodings are supported and selected per domain. Neither
+pool address is configured: quoting proves both that the pool exists and
+that it has depth.
 
-8. Operation identity, retry and replacement
+Arbitrum Sepolia has no USDT0 and no pool. A one-time bootstrap script
+deploys an EIP-2612 MockUSDT0 and creates and seeds a real pool for it.
 
-Operation identity is (domain, account, ID). The ID binds at execution, to
-the executed terms.
+4. Deposit
+
+A deposit is passive: any external party transfers USDT0 to the account
+address and pays its own gas. The rail watches finalized ERC-20 `Transfer`
+events. Deposit identity is
 
 ```text
-resubmit the executed operation       → no-op
-other terms under a bound (acct, ID)  → revert
+(domain, transaction hash, log index)
 ```
 
-The binding is checked before any other validation: an executed operation's
-replay no-ops even after its deadline or token-nonce consumption.
+so one finalized transfer is recognized exactly once. An exchange
+withdrawal to the account address is a deposit; no second hop exists.
 
-An intent may have several signed variants under one ID, differing only in
-relayer, fee and validity; the write-ahead record (§10) fixes the core terms:
+5. Transfer
 
-```text
-deposit    payer, credited account, amount
-transfer   sender, recipient, amount
-withdraw   account, destination, amount
-``` The contract executes at most one variant, so
-replacing an unresponsive relayer needs no waiting: sign a new variant. A
-losing variant reverts at its relayer's gas cost.
+`USDT0.transfer(recipient, amount)` submitted by the sender's account. The
+sender pays gas; the recipient needs nothing, not even ETH.
 
-9. Confirmation
+6. Withdrawal
 
-Submission and inclusion are not confirmation.
+The same primitive with an external destination, supplied per operation;
+there is no stored withdrawal address. The distinction from transfer is
+semantic: the destination is outside the rail.
 
-`confirmed` means a finalized `JuiceRail` event matching (account, ID) and
-the intent's core terms exists on the exact domain, located by the indexed
-fields regardless of which transaction carried it. True finality only;
-confirmation-count policies are rejected, since confirmed must never revert.
+7. Identity, retry and confirmation
 
-The host alters its ledger only on confirmed and releases reserves only on
-failed.
-
-10. Library
-
-Go. A `Rail` instance binds one domain at construction; a host using several
-domains holds several instances.
+Before signing, the client durably records the intent:
 
 ```text
-account  balance
-prepare / sign / submit   (deposit, transfer, withdrawal)
-status  event observation  finality
+(operation ID, kind, destination, amount, nonce)
 ```
 
-Statuses are properties of the intent (account, ID), never of one submission:
+An intent binds to exactly one nonce. A retry reuses the same nonce and the
+same economic terms; only transaction fee fields may change (Ethereum's
+replacement mechanism). The chain admits one transaction per nonce, so an
+intent executes at most once.
 
 ```text
-unknown     no record of the intent
-pending     may still execute; a revert is not failure
-confirmed   a finalized matching event exists
-failed      the intent can never execute: the ID is finalized-bound to other
-            core terms, or abandonment is recorded AND every signed variant's
-            validity expired past finality
+confirmed   a finalized successful transaction matching the intent
+failed      a finalized revert, or finalized state proves the nonce can no
+            longer carry the intent
+pending     otherwise
 ```
 
-Durable state per intent, write-once or append-only, nothing else:
+An ERC-20 `Transfer` carries no intent ID: the sender reports the
+transaction hash to the host, which confirms against the finalized event.
+
+After a crash or restore, the client assigns no new nonce until every nonce
+below the finalized account nonce is matched to an intent by calldata. One signer per key; concurrent signers are excluded by
+assumption.
+
+8. Library
+
+Go. A `Rail` instance binds one domain at construction; a host using
+several domains holds several instances.
 
 ```text
-1. write-ahead record (account, ID, core terms) before any signature
-2. append-only list of signed variants
-3. abandonment: never sign this intent again; kills nothing already signed
-4. cache of finalized facts
+account   balances (USDT0, ETH reserve)   nonce
+prepare / sign / submit   (transfer, withdrawal, refill)
+deposit observation   status   finality
 ```
 
-A signed variant is durable before submission. Transaction hashes are hints
-for locating events, never status. Storage is an interface over exactly these
-four records; a SQLite implementation ships; hosts may substitute their own.
-
-A separate relayer service is not required: any party with native gas may
-relay a valid operation.
-
-The library reads no file, environment variable or home directory. Inputs
-arrive at construction; configuration discovery belongs to the app.
-
-11. User experience
-
-Normal participants see stablecoin amounts and relay fees only.
+Durable state, write-once or append-only, nothing else:
 
 ```text
-DEPOSIT
-Deposit       100.00
-Fee             0.02
-
-TRANSFER
-Send Bob       10.00
-Fee             0.01
-Total           10.01
-
-WITHDRAW
-Withdraw       20.00
-Fee             0.01
-You receive    20.00
+1. write-ahead intent records: which operation owns which nonce
+2. signed submissions, appended before broadcast
+3. cache of finalized facts, including observed deposits
+4. observation cursors: deposits scanned, nonces reconciled
 ```
 
-Ordinary participants need not understand or hold native gas currency.
+The account key and the gas policy are inputs, not records.
 
-12. Alternatives
+Storage is an interface over exactly these records; a SQLite implementation
+ships; hosts may substitute their own. The library reads no file,
+environment variable or home directory; inputs arrive at construction.
+Configuration discovery belongs to the app.
 
-Safe + ERC-4337 paymaster: rejected; adds Safe, EntryPoint, paymaster,
-allowances and separate gas reserves.
+9. User experience
 
-Separate stablecoin gas reserve: rejected; a funded rail account must not
-depend on a second user balance to transact.
-
-Privileged operator: rejected; disappearance of one party must not freeze
-other accounts.
-
-Fixed gas fee or custom auction: rejected; relayers quote fees externally.
-
-On-chain P2P identity: rejected; identity belongs to the embedding host.
-
-EIP-1271 contract signatures: rejected; authorization must not execute
-foreign code.
-
-Permissionless submission: rejected; only the designated relayer may carry a
-signed operation, and liveness needs no more than signing another variant.
-
-Stored withdrawal address: rejected; the destination is a signed term.
-
-Waiting out a stalled relayer before re-signing: rejected; the write-once
-(account, ID) binding already serializes variants.
-
-Shared exchange deposit address: rejected; a plain token transfer cannot bind
-the deposit to a rail account.
-
-13. User stories
-
-Exactly six. Each runs against the standalone app on a local chain stack.
+Participants see USDT0 amounts; ETH is never shown as money.
 
 ```text
-1. bootstrap         deploy a fresh domain; zero balances; no privileged
-                     operator
-2. deposit           wallet or exchange-originated stablecoin credits an
-                     account; the payer holds no native gas
-3. transfer          A signs payment to B; relayer submits; amount and fee
-                     move exactly once
-4. withdraw          account signs withdrawal to a signed destination; held
-                     and balances drop equally; fee pays the relayer
-5. retry & conflict  resubmission moves nothing twice; a losing variant and
-                     conflicting reuse revert loudly
-6. crash recovery    killed after submission, restart resumes to
-                     exactly-once; an unresponsive relayer is replaced by
-                     signing a new variant, no waiting
+Balance    1,250.00 USDT
+
+Deposit    Transfer    Withdraw
 ```
 
-The standalone app is an operations and test harness, never a wallet product.
+Refill cost appears as a network cost reducing the USDT0 balance. After
+onboarding the user normally never handles ETH.
 
-14. Verification
+10. Alternatives
 
-Off-chain records are write-once or append-only; on-chain, `operations` is
-write-once and only balances mutate. Verification targets transitions and
-invariants, not transition graphs.
+Signed operations carried by designated relayers (V2): rejected; every
+payment depended on an external ETH-holding carrier the design could not
+name — a privileged operator in effect.
+
+Custody contract with internal balances: rejected; duplicates the token's
+ledger and requires contract verification without adding a property.
+
+ERC-4337 / Safe / paymaster / bundler: rejected; a large trusted surface to
+circumvent a gas model this design simply accepts.
+
+Shared gas treasury: rejected; cross-subsidy and a shared liveness
+dependency.
+
+EIP-3009 deposit binding: unnecessary; a deposit is a plain transfer to the
+account's own address.
+
+Unlimited standing swap allowance: rejected; per-refill permit bounds any
+residue to one refill's input bound.
+
+Estimating gas to size the reserve: rejected; the estimate needs the ETH the
+decision is about. Configured bounds only.
+
+11. User stories
+
+Exactly six. Each runs against the standalone app on a local chain stack,
+and the whole sequence is also driven once on a staging domain against a
+real venue.
 
 ```text
-1. JuiceRail    complete verification (Foundry invariants + symbolic
-                checker): 3 transitions, per-account write-once binding,
-                conservation, signature-gated debits, held >= sum of balances
-2. variants     small model: several signed variants under one intent execute
-                at most once; abandonment plus expiry past finality is
-                terminal (no intent parks forever)
-3. trust base   finality is final; the pinned token implements EIP-3009 as
-                specified; the balance-delta check discharges exact incoming
-                amounts; outgoing transfers deliver exact amounts; ecrecover;
-                RPC honest
+1. onboard      create, fund USDT0 + ETH, finality, operational
+2. deposit      external transfer credits exactly once by (tx, log index)
+3. transfer     A pays B; B needs nothing; amounts move exactly once
+4. withdraw     to an external destination
+5. refill       reserve dips below MIN; sized refill executes; insufficient
+                USDT0 blocks loudly with nothing signed
+6. recovery     killed after signing; restart reconciles nonces from
+                finalized history; retry duplicates nothing
 ```
 
-The Go library and app are not formally verified: guarded by the contract,
-exercised by the six stories, tested conventionally.
+The standalone app is an operations and test harness, never a wallet
+product.
 
-15. Plan
+12. Verification
+
+There is no contract to verify. The gas policy is a pure decision function
+over (ETH, USDT0, quote, pending operation) and is tested exhaustively; the
+library is conventionally tested and exercised by the six stories.
+
+Trust base:
+
+```text
+finality is final
+the pinned token is a correct ERC-20 with EIP-2612 permit
+the pinned venue delivers exact output or reverts atomically
+refill transaction cost <= B for liveness; beyond B, external top-up
+one signer per key
+RPC honest
+```
+
+13. Plan
 
 Standalone-first: the library and app prove all six stories before host
 integration.
@@ -371,13 +308,14 @@ integration.
 Layout:
 
 ```text
-contracts/           JuiceRail
-go/                  Rail implementation, signatures, EVM submission,
+go/                  Rail implementation, gas policy, venue, submission,
                      confirmation
 cmd/railctl/         standalone app
-deployments/         per-domain deployment data
+contracts/           test and staging fixtures only; no rail contract
+deployments/         per-domain pinned addresses and gas policy
 integration-tests/   complete local-chain scenarios
 ```
 
-Every Go production file has a corresponding `_test.go`. `go build ./...` and
-`go test ./...` pass without network access once dependencies are fetched.
+Every Go production file has a corresponding `_test.go`. `go build ./...`
+and `go test ./...` pass without network access once dependencies are
+fetched.

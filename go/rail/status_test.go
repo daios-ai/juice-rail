@@ -2,212 +2,167 @@ package rail
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"testing"
-	"time"
-
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// railLog builds the event the contract emits for an executed operation.
-func railLog(kind Kind, ref Ref, party common.Address, amount, fee int64, relayer common.Address, validBefore uint64, block uint64) types.Log {
-	topic := map[Kind]common.Hash{
-		KindDeposit:  topicDeposited,
-		KindTransfer: topicTransferred,
-		KindWithdraw: topicWithdrawn,
-	}[kind]
-	data := make([]byte, 0, 160)
-	data = append(data, common.LeftPadBytes(party.Bytes(), 32)...)
-	data = append(data, common.LeftPadBytes(big.NewInt(amount).Bytes(), 32)...)
-	data = append(data, common.LeftPadBytes(big.NewInt(fee).Bytes(), 32)...)
-	data = append(data, common.LeftPadBytes(relayer.Bytes(), 32)...)
-	data = append(data, common.LeftPadBytes(new(big.Int).SetUint64(validBefore).Bytes(), 32)...)
-	return types.Log{
-		Topics: []common.Hash{
-			topic,
-			common.BytesToHash(ref.Account.Bytes()),
-			ref.ID.Hash(),
-		},
-		Data:        data,
-		BlockNumber: block,
-		TxHash:      common.HexToHash("0xfeed"),
-	}
-}
-
-func TestClassifyIsTheWholeDecision(t *testing.T) {
-	executed := &Fact{Executed: true}
-	foreign := &Fact{Executed: false}
+func TestClassifyReadsOnlyFinalizedFacts(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		known     bool
-		fact      *Fact
-		abandoned bool
-		everyDead bool
-		want      Status
+		name string
+		fact *Fact
+		want Status
 	}{
-		{"no record", false, nil, false, false, StatusUnknown},
-		{"recorded only", true, nil, false, false, StatusPending},
-		{"abandoned but a variant lives", true, nil, true, false, StatusPending},
-		{"dead variants but not abandoned", true, nil, false, true, StatusPending},
-		{"abandoned and every variant dead", true, nil, true, true, StatusFailed},
-		{"finalized under our terms", true, executed, false, false, StatusConfirmed},
-		{"finalized under other terms", true, foreign, false, false, StatusFailed},
-		{"a fact outranks abandonment", true, executed, true, true, StatusConfirmed},
+		{"nothing finalized yet", nil, StatusPending},
+		{"finalized and executed", &Fact{Executed: true}, StatusConfirmed},
+		{"finalized and not executed", &Fact{Executed: false}, StatusFailed},
 	} {
-		if got := classify(tc.known, tc.fact, tc.abandoned, tc.everyDead); got != tc.want {
-			t.Errorf("%s: got %s, want %s", tc.name, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classify(tc.fact); got != tc.want {
+				t.Fatalf("classify is %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
 
-// The contract executes while block.timestamp < validBefore, so a head at the
-// deadline is already too late.
-func TestVariantDeathMatchesTheContractsTest(t *testing.T) {
-	v := testVariant(KindTransfer, addr(1), addr(2), 10, 1, addr(3), 1000)
-	if variantDead(v, 999) {
-		t.Fatal("a variant is alive before its deadline")
-	}
-	if !variantDead(v, 1000) {
-		t.Fatal("a variant at its deadline can never execute")
-	}
-	if !variantDead(v, 1001) {
-		t.Fatal("a variant past its deadline can never execute")
-	}
-}
-
-func TestStatusIsUnknownWithoutARecord(t *testing.T) {
+func TestUnknownIntentIsUnknown(t *testing.T) {
 	r, _, _ := newTestRail(t)
-	got, err := r.Status(context.Background(), testID(1))
+	if status, err := r.Status(context.Background(), id(9)); err != nil || status != StatusUnknown {
+		t.Fatalf("status %s (%v), want unknown", status, err)
+	}
+}
+
+func TestPaymentIsPendingUntilItFinalizes(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+
+	hash, err := r.Send(ctx, id(1))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("send: %v", err)
 	}
-	if got != StatusUnknown {
-		t.Fatalf("got %s, want unknown", got)
+	if status, _ := r.Status(ctx, id(1)); status != StatusPending {
+		t.Fatalf("submitted is %s, want pending", status)
 	}
-}
-
-func TestStatusIsPendingUntilTheEventIsFinalized(t *testing.T) {
-	ctx := context.Background()
-	r, _, chain := newTestRail(t)
-	id := testID(1)
-	if err := r.PrepareTransfer(ctx, id, addr(2), big.NewInt(10)); err != nil {
-		t.Fatal(err)
+	chain.include(t, hash, true, transferLogOf(r.Domain(), r.Account(), bob, big.NewInt(10_000_000)))
+	if status, _ := r.Status(ctx, id(1)); status != StatusPending {
+		t.Fatalf("included but unfinalized is %s, want pending", status)
 	}
-	if got, _ := r.Status(ctx, id); got != StatusPending {
-		t.Fatalf("got %s, want pending", got)
-	}
-
-	// The rail asks for logs only up to the finalized head, so an event that
-	// exists but is not final yet is simply not returned.
-	chain.logs = []types.Log{railLog(KindTransfer, r.ref(id), addr(2), 10, 1, addr(3), 2_000_000, 99)}
-	if got, _ := r.Status(ctx, id); got != StatusConfirmed {
-		t.Fatalf("got %s, want confirmed once the event is finalized", got)
+	chain.finalize()
+	if status, _ := r.Status(ctx, id(1)); status != StatusConfirmed {
+		t.Fatalf("finalized is %s, want confirmed", status)
 	}
 }
 
-func TestStatusConfirmsAnyVariantOfTheIntent(t *testing.T) {
+func TestRevertedIsFailed(t *testing.T) {
 	ctx := context.Background()
-	r, _, chain := newTestRail(t)
-	id := testID(1)
-	if err := r.PrepareTransfer(ctx, id, addr(2), big.NewInt(10)); err != nil {
-		t.Fatal(err)
-	}
-	// A different relayer, fee and deadline: still this intent.
-	chain.logs = []types.Log{railLog(KindTransfer, r.ref(id), addr(2), 10, 99, addr(8), 5, 99)}
-	if got, _ := r.Status(ctx, id); got != StatusConfirmed {
-		t.Fatalf("got %s: a variant differing only in relayer and fee still confirms", got)
-	}
-}
-
-func TestStatusFailsWhenTheIdentifierWentToOtherTerms(t *testing.T) {
-	ctx := context.Background()
-	r, _, chain := newTestRail(t)
-	id := testID(1)
-	if err := r.PrepareTransfer(ctx, id, addr(2), big.NewInt(10)); err != nil {
-		t.Fatal(err)
-	}
-	// The same identifier, but a different recipient: this intent can never
-	// execute now.
-	chain.logs = []types.Log{railLog(KindTransfer, r.ref(id), addr(7), 10, 0, addr(3), 5, 99)}
-	if got, _ := r.Status(ctx, id); got != StatusFailed {
-		t.Fatalf("got %s, want failed", got)
-	}
-}
-
-func TestStatusFailsOnlyWhenAbandonedAndEveryVariantIsDead(t *testing.T) {
-	ctx := context.Background()
-	r, _, chain := newTestRail(t)
-	id := testID(1)
-	if err := r.PrepareTransfer(ctx, id, addr(2), big.NewInt(10)); err != nil {
-		t.Fatal(err)
-	}
-	v, err := r.Sign(ctx, id, big.NewInt(1), addr(3), time.Hour)
+	r, chain, _ := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+	hash, err := r.Send(ctx, id(1))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("send: %v", err)
 	}
-	if err := r.Abandon(ctx, id); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := r.Status(ctx, id); got != StatusPending {
-		t.Fatalf("got %s: abandonment kills nothing already signed", got)
-	}
-
-	// Death is judged against the finalized head, not the latest one: an
-	// unfinalized head can still be reorganised away.
-	chain.headTime = v.ValidBefore + 1
-	if got, _ := r.Status(ctx, id); got != StatusPending {
-		t.Fatalf("got %s: expiry is only terminal once finalized", got)
-	}
-	chain.finalizedTime = v.ValidBefore
-	if got, _ := r.Status(ctx, id); got != StatusFailed {
-		t.Fatalf("got %s, want failed", got)
+	chain.include(t, hash, false)
+	chain.finalize()
+	if status, _ := r.Status(ctx, id(1)); status != StatusFailed {
+		t.Fatalf("a finalized revert is %s, want failed", status)
 	}
 }
 
-func TestStatusCachesTheFinalizedFact(t *testing.T) {
+func TestSuccessWithoutTheTransferIsNotConfirmed(t *testing.T) {
 	ctx := context.Background()
-	r, store, chain := newTestRail(t)
-	id := testID(1)
-	if err := r.PrepareTransfer(ctx, id, addr(2), big.NewInt(10)); err != nil {
-		t.Fatal(err)
+	r, chain, _ := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+	hash, err := r.Send(ctx, id(1))
+	if err != nil {
+		t.Fatalf("send: %v", err)
 	}
-	chain.logs = []types.Log{railLog(KindTransfer, r.ref(id), addr(2), 10, 1, addr(3), 5, 99)}
-	if got, _ := r.Status(ctx, id); got != StatusConfirmed {
-		t.Fatalf("got %s, want confirmed", got)
-	}
-	f, ok, _ := store.Fact(r.ref(id))
-	if !ok || !f.Executed || f.BlockNumber != 99 {
-		t.Fatalf("the finalized fact was not cached: %+v", f)
-	}
-
-	// Once cached, the chain is not consulted again: finalized facts cannot
-	// change, so the cache is the answer.
-	chain.logs = nil
-	if got, _ := r.Status(ctx, id); got != StatusConfirmed {
-		t.Fatalf("got %s: a cached fact must stand on its own", got)
+	// A token that reports failure by returning false rather than reverting.
+	chain.include(t, hash, true)
+	chain.finalize()
+	if status, _ := r.Status(ctx, id(1)); status != StatusFailed {
+		t.Fatalf("success with no transfer is %s, want failed", status)
 	}
 }
 
-func TestDecodeTermsRejectsMalformedEvents(t *testing.T) {
-	good := railLog(KindWithdraw, Ref{Account: addr(1), ID: testID(1)}, addr(2), 10, 1, addr(3), 5, 1)
-	got, err := decodeTerms(good)
-	if err != nil {
-		t.Fatal(err)
+func TestAForeignNonceIsReported(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	// Bind the floor at the current nonce, then let another signer spend one.
+	if err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
-	want := testTerms(KindWithdraw, addr(1), addr(2), 10)
-	if !got.Equal(want) {
-		t.Fatalf("decoded %v, want %v", got, want)
-	}
+	chain.spendNonce(r.Account(), 1)
+	chain.finalize()
 
-	short := good
-	short.Data = good.Data[:128]
-	if _, err := decodeTerms(short); err == nil {
-		t.Fatal("a short event must be refused, not guessed at")
+	if err := r.Reconcile(ctx); !errors.Is(err, ErrUnreconciled) {
+		t.Fatalf("a nonce spent by someone else: %v, want a report", err)
 	}
-	unknown := good
-	unknown.Topics = []common.Hash{common.HexToHash("0x01"), unknown.Topics[1], unknown.Topics[2]}
-	if _, err := decodeTerms(unknown); err == nil {
-		t.Fatal("an unknown event must be refused")
+	if err := r.Prepare(ctx, id(1), KindTransfer, bob, big.NewInt(1)); !errors.Is(err, ErrUnreconciled) {
+		t.Fatalf("acting after an unexplained nonce: %v, want a refusal", err)
+	}
+}
+
+func TestReconcileAcceptsAHistoryItRecorded(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+	hash, err := r.Send(ctx, id(1))
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	chain.include(t, hash, true, transferLogOf(r.Domain(), r.Account(), bob, big.NewInt(10_000_000)))
+	chain.finalize()
+
+	if err := r.Reconcile(ctx); err != nil {
+		t.Fatalf("reconcile over its own history: %v", err)
+	}
+	// And the account can act again afterwards.
+	if err := r.Prepare(ctx, id(2), KindTransfer, bob, big.NewInt(1_000_000)); err != nil {
+		t.Fatalf("prepare after reconciliation: %v", err)
+	}
+}
+
+func TestScanDepositsRecordsIncomingMoneyOnce(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	d := r.Domain()
+	chain.addTransferLog(5, 0, d.Token, bob, r.Account(), big.NewInt(25_000_000))
+	chain.addTransferLog(5, 1, d.Token, exchange, r.Account(), big.NewInt(1_000_000))
+	// Money this account sent itself is not incoming money.
+	chain.addTransferLog(6, 0, d.Token, r.Account(), r.Account(), big.NewInt(7))
+
+	found, err := r.ScanDeposits(ctx)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(found) != 2 {
+		t.Fatalf("found %d deposits, want 2", len(found))
+	}
+	again, err := r.ScanDeposits(ctx)
+	if err != nil || len(again) != 0 {
+		t.Fatalf("rescanning found %d deposits (%v), want none", len(again), err)
+	}
+	all, _ := r.Deposits()
+	if len(all) != 2 {
+		t.Fatalf("recorded %d deposits, want 2", len(all))
+	}
+}
+
+func TestUnfinalizedDepositsAreNotRecorded(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	chain.addTransferLog(9, 0, r.Domain().Token, bob, r.Account(), big.NewInt(5))
+
+	found, err := r.ScanDeposits(ctx)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(found) != 0 {
+		t.Fatal("an unfinalized transfer was recorded as a deposit")
+	}
+	chain.finalize()
+	if found, _ = r.ScanDeposits(ctx); len(found) != 1 {
+		t.Fatalf("after finality found %d deposits, want 1", len(found))
 	}
 }

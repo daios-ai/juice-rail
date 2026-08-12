@@ -1,93 +1,53 @@
 package rail
 
-import (
-	"errors"
-	"math/big"
-	"strings"
+import "github.com/ethereum/go-ethereum/common"
 
-	"github.com/ethereum/go-ethereum/common"
-)
-
-// Intent is the write-ahead record: the decision to pursue an operation,
-// durable before any signature exists. It fixes the core terms, so every
-// variant of the intent moves the same money between the same parties.
-type Intent struct {
-	Terms Terms
-	// FromBlock bounds the log search for this intent's event. It is the chain
-	// head observed when the intent was recorded.
-	FromBlock uint64
-}
-
-// Fact records a finalized chain outcome. Finalized facts cannot change, so
-// this is a cache rather than authority.
-type Fact struct {
-	TxHash      common.Hash
-	BlockNumber uint64
-	// Executed is false when the identifier was finalized under other terms.
-	Executed bool
-}
-
-var (
-	// ErrIntentConflict is returned when an identifier is already recorded
-	// with different core terms.
-	ErrIntentConflict = errors.New("rail: identifier already recorded with different terms")
-	// ErrAbandoned is returned when signing is attempted after abandonment.
-	ErrAbandoned = errors.New("rail: identifier abandoned")
-	// ErrNoIntent is returned when an operation is referenced before its
-	// write-ahead record exists.
-	ErrNoIntent = errors.New("rail: no intent recorded")
-	// ErrWrongDomain is returned when a store bound to one domain is opened
-	// for another.
-	ErrWrongDomain = errors.New("rail: store belongs to a different domain")
-)
-
-// DomainKey names the domain a store serves: the chain and the deployment on
-// it. Identifiers are unique only within one of these.
-func DomainKey(chainID *big.Int, railAddr common.Address) string {
-	chain := "0"
-	if chainID != nil {
-		chain = chainID.String()
-	}
-	return chain + ":" + strings.ToLower(railAddr.Hex())
-}
-
-// Store holds the rail's durable state: four records per intent, each
-// write-once or append-only. Nothing is ever edited in place.
+// Store holds the rail's durable state. Every record is written once or
+// appended, never edited, so a crash can only lose the last write and never
+// corrupt an earlier decision.
 //
-// The rail's own decisions — intent, signed variants, abandonment — are
-// authoritative. Facts are cached observations of a chain that has finalized.
+// The rail's own decisions — which intent owns which nonce — are
+// authoritative. Facts, deposits and the two cursors are cached observations
+// of a chain that has already finalized.
 //
-// Records are keyed by (account, identifier), exactly as the contract keys its
-// bindings, so one store may serve several accounts on one domain.
-//
-// A store serves exactly one domain. Identifiers are only unique within a
-// domain, so a store shared between two would alias their intents and their
-// finalized facts. An implementation must bind itself to a domain and refuse
-// to be reopened under another; see DomainKey.
+// A store serves exactly one domain. Identifiers are unique only within a
+// domain, so a store shared between two would alias their intents. An
+// implementation must bind itself to a domain and refuse to be reopened under
+// another; see DomainKey.
 type Store interface {
-	// PutIntent records an intent. Recording the same core terms twice
-	// succeeds; different terms return ErrIntentConflict.
-	PutIntent(ref Ref, in Intent) error
-	Intent(ref Ref) (Intent, bool, error)
+	// PutIntent records the write-ahead intent. Recording the same terms twice
+	// succeeds; different terms return ErrIntentConflict. A second intent on
+	// the same nonce is also a conflict: one nonce carries one operation.
+	PutIntent(account common.Address, in Intent) error
+	Intent(account common.Address, id ID) (Intent, bool, error)
+	// IntentByNonce finds the intent that owns a nonce, which is how a
+	// finalized nonce is matched back to a decision.
+	IntentByNonce(account common.Address, nonce uint64) (Intent, bool, error)
+	// Pending lists intents with no finalized fact, oldest first.
+	Pending(account common.Address) ([]Intent, error)
 
-	// AppendVariant appends a signed variant. It must fail with ErrAbandoned if
-	// the intent is abandoned, atomically with respect to Abandon, so that a
-	// release can never race a fresh signature.
-	AppendVariant(ref Ref, v Variant) error
-	Variants(ref Ref) ([]Variant, error)
-
-	// Abandon records "never sign this intent again". It is idempotent and
-	// stops future signing; it kills nothing already signed.
-	Abandon(ref Ref) error
-	Abandoned(ref Ref) (bool, error)
+	// AppendSubmission records a signed attempt before it is broadcast, so no
+	// transaction can exist on chain that this account has no record of.
+	AppendSubmission(account common.Address, id ID, s Submission) error
+	Submissions(account common.Address, id ID) ([]Submission, error)
 
 	// PutFact caches a finalized outcome. Idempotent: facts cannot change.
-	PutFact(ref Ref, f Fact) error
-	Fact(ref Ref) (Fact, bool, error)
+	PutFact(account common.Address, id ID, f Fact) error
+	Fact(account common.Address, id ID) (Fact, bool, error)
 
-	// Pending lists intents with no cached fact, so a restart can resume
-	// watching them.
-	Pending() ([]Ref, error)
+	// PutDeposit records one finalized incoming transfer, identified by the log
+	// that carried it. Idempotent.
+	PutDeposit(account common.Address, d Deposit) error
+	Deposits(account common.Address) ([]Deposit, error)
+
+	// Cursor is how far deposit observation has reached. It only advances.
+	Cursor(account common.Address) (uint64, bool, error)
+	PutCursor(account common.Address, block uint64) error
+
+	// NonceFloor is the nonce below which everything is reconciled. It only
+	// advances.
+	NonceFloor(account common.Address) (uint64, bool, error)
+	PutNonceFloor(account common.Address, nonce uint64) error
 
 	Close() error
 }

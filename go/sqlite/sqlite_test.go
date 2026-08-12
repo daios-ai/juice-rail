@@ -12,317 +12,241 @@ import (
 	"github.com/daios-ai/juice-rail/go/rail"
 )
 
-const testDomain = "31337:0x00000000000000000000000000000000000000a1"
+var (
+	account = common.HexToAddress("0x1111111111111111111111111111111111111111")
+	other   = common.HexToAddress("0x2222222222222222222222222222222222222222")
+	payee   = common.HexToAddress("0x3333333333333333333333333333333333333333")
+)
+
+const testDomain = "31337:0x00000000000000000000000000000000000000a0"
 
 func open(t *testing.T) *Store {
 	t.Helper()
 	s, err := Open(filepath.Join(t.TempDir(), "rail.db"), testDomain)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
 }
 
-func addr(n byte) common.Address {
-	var a common.Address
-	a[19] = n
-	return a
-}
-
-func id(n byte) rail.ID {
-	var v rail.ID
-	v[31] = n
-	return v
-}
-
-func ref(account, identifier byte) rail.Ref {
-	return rail.Ref{Account: addr(account), ID: id(identifier)}
-}
-
-func terms(kind rail.Kind, account, party byte, amount int64) rail.Terms {
-	return rail.Terms{Kind: kind, Account: addr(account), Party: addr(party), Amount: big.NewInt(amount)}
-}
-
-func variant(kind rail.Kind, account, party byte, amount, fee int64, validBefore uint64) rail.Variant {
-	v := rail.Variant{
-		Terms:       terms(kind, account, party, amount),
-		ID:          id(1),
-		Fee:         big.NewInt(fee),
-		Relayer:     addr(9),
-		ValidBefore: validBefore,
-		TermsSig:    make([]byte, 65),
+func intent(id byte, nonce uint64, amount int64) rail.Intent {
+	return rail.Intent{
+		ID:        rail.ID{id},
+		Kind:      rail.KindTransfer,
+		To:        payee,
+		Amount:    big.NewInt(amount),
+		Nonce:     nonce,
+		Calldata:  []byte{0xa9, 0x05, 0x9c, 0xbb, id},
+		FromBlock: 12,
 	}
-	for i := range v.TermsSig {
-		v.TermsSig[i] = byte(i)
-	}
-	if kind == rail.KindDeposit {
-		v.AuthSig = make([]byte, 65)
-	}
-	return v
 }
 
-func TestOpenBindsOneDomain(t *testing.T) {
+func TestStoreServesOneDomain(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rail.db")
-
 	s, err := Open(path, testDomain)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open: %v", err)
 	}
 	s.Close()
 
+	if _, err := Open(path, "1:0x00000000000000000000000000000000000000ff"); !errors.Is(err, rail.ErrWrongDomain) {
+		t.Fatalf("reopened for another domain: %v, want a refusal", err)
+	}
 	again, err := Open(path, testDomain)
 	if err != nil {
-		t.Fatalf("reopening the same domain must work: %v", err)
+		t.Fatalf("reopen for its own domain: %v", err)
 	}
 	again.Close()
-
-	if _, err := Open(path, "1:0x00000000000000000000000000000000000000ff"); !errors.Is(err, rail.ErrWrongDomain) {
-		t.Fatalf("want ErrWrongDomain, got %v", err)
-	}
-	if _, err := Open(path, ""); err == nil {
-		t.Fatal("a store must know its domain")
-	}
 }
 
 func TestIntentsAreWriteOnce(t *testing.T) {
 	s := open(t)
-	r := ref(1, 1)
-	in := rail.Intent{Terms: terms(rail.KindTransfer, 1, 2, 10), FromBlock: 42}
-
-	if err := s.PutIntent(r, in); err != nil {
-		t.Fatal(err)
+	in := intent(1, 0, 1000)
+	if err := s.PutIntent(account, in); err != nil {
+		t.Fatalf("record: %v", err)
 	}
-	if err := s.PutIntent(r, in); err != nil {
-		t.Fatalf("identical terms must be accepted again: %v", err)
-	}
-	other := in
-	other.Terms.Party = addr(3)
-	if err := s.PutIntent(r, other); !errors.Is(err, rail.ErrIntentConflict) {
-		t.Fatalf("want ErrIntentConflict, got %v", err)
+	if err := s.PutIntent(account, in); err != nil {
+		t.Fatalf("record the same decision again: %v", err)
 	}
 
-	got, ok, err := s.Intent(r)
+	changed := in
+	changed.Amount = big.NewInt(2000)
+	if err := s.PutIntent(account, changed); !errors.Is(err, rail.ErrIntentConflict) {
+		t.Fatalf("different terms under one identifier: %v, want a conflict", err)
+	}
+	// The original survives the attempt.
+	got, ok, err := s.Intent(account, in.ID)
 	if err != nil || !ok {
-		t.Fatalf("intent missing: %v %v", ok, err)
+		t.Fatalf("read back: %v %v", ok, err)
 	}
-	if !got.Terms.Equal(in.Terms) || got.FromBlock != 42 {
-		t.Fatalf("read back %+v, want %+v", got, in)
-	}
-	if _, ok, _ := s.Intent(ref(1, 2)); ok {
-		t.Fatal("an unrecorded identifier must be unknown")
+	if got.Amount.Cmp(in.Amount) != 0 || got.Nonce != in.Nonce || string(got.Calldata) != string(in.Calldata) {
+		t.Fatalf("the record changed: %+v", got)
 	}
 }
 
-// The contract scopes identifiers to the account that binds them, and so does
-// the store: one store may serve several accounts on one domain.
-func TestRecordsAreScopedToTheirAccount(t *testing.T) {
+func TestOneNonceCarriesOneOperation(t *testing.T) {
 	s := open(t)
-	alice, bob := ref(1, 1), ref(2, 1)
-
-	if err := s.PutIntent(alice, rail.Intent{Terms: terms(rail.KindTransfer, 1, 3, 10)}); err != nil {
-		t.Fatal(err)
+	if err := s.PutIntent(account, intent(1, 7, 100)); err != nil {
+		t.Fatalf("record: %v", err)
 	}
-	if err := s.PutIntent(bob, rail.Intent{Terms: terms(rail.KindWithdraw, 2, 4, 77)}); err != nil {
-		t.Fatalf("the same identifier under another account must not conflict: %v", err)
+	if err := s.PutIntent(account, intent(2, 7, 100)); !errors.Is(err, rail.ErrIntentConflict) {
+		t.Fatalf("second operation on one nonce: %v, want a conflict", err)
 	}
-
-	got, _, _ := s.Intent(bob)
-	if got.Terms.Amount.Int64() != 77 || got.Terms.Account != addr(2) {
-		t.Fatalf("accounts alias: %+v", got.Terms)
-	}
-	if err := s.Abandon(alice); err != nil {
-		t.Fatal(err)
-	}
-	if abandoned, _ := s.Abandoned(bob); abandoned {
-		t.Fatal("abandonment crossed accounts")
-	}
-	if err := s.PutFact(alice, rail.Fact{Executed: true}); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok, _ := s.Fact(bob); ok {
-		t.Fatal("facts crossed accounts")
+	// A different account may use the same nonce: nonces are per account.
+	if err := s.PutIntent(other, intent(3, 7, 100)); err != nil {
+		t.Fatalf("another account on the same nonce: %v", err)
 	}
 }
 
-func TestVariantsAppendUntilAbandoned(t *testing.T) {
+func TestIntentsAreFoundByNonce(t *testing.T) {
 	s := open(t)
-	r := ref(1, 1)
-
-	for _, deadline := range []uint64{100, 200, 300} {
-		if err := s.AppendVariant(r, variant(rail.KindTransfer, 1, 2, 10, 1, deadline)); err != nil {
-			t.Fatal(err)
+	for i := uint64(0); i < 3; i++ {
+		if err := s.PutIntent(account, intent(byte(i+1), i, 100)); err != nil {
+			t.Fatalf("record: %v", err)
 		}
 	}
-	got, err := s.Variants(r)
+	in, ok, err := s.IntentByNonce(account, 2)
+	if err != nil || !ok || in.ID != (rail.ID{3}) {
+		t.Fatalf("nonce 2 belongs to %s (%v %v)", in.ID, ok, err)
+	}
+	if _, ok, _ := s.IntentByNonce(other, 2); ok {
+		t.Fatal("one account's nonce was read as another's")
+	}
+}
+
+func TestPendingIsWhatHasNoFinalizedFact(t *testing.T) {
+	s := open(t)
+	for i := uint64(0); i < 3; i++ {
+		if err := s.PutIntent(account, intent(byte(i+1), i, 100)); err != nil {
+			t.Fatalf("record: %v", err)
+		}
+	}
+	if err := s.PutFact(account, rail.ID{2}, rail.Fact{Executed: true, BlockNumber: 3}); err != nil {
+		t.Fatalf("fact: %v", err)
+	}
+	pending, err := s.Pending(account)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("pending: %v", err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("want 3 variants, got %d", len(got))
+	if len(pending) != 2 || pending[0].Nonce != 0 || pending[1].Nonce != 2 {
+		t.Fatalf("pending is %+v", pending)
 	}
-	for i, want := range []uint64{100, 200, 300} {
-		if got[i].ValidBefore != want {
-			t.Fatalf("variant %d has deadline %d, want %d: order is the record", i, got[i].ValidBefore, want)
+}
+
+func TestFactsAreNeverRewritten(t *testing.T) {
+	s := open(t)
+	first := rail.Fact{TxHash: common.HexToHash("0xaa"), BlockNumber: 4, Executed: true}
+	if err := s.PutFact(account, rail.ID{1}, first); err != nil {
+		t.Fatalf("fact: %v", err)
+	}
+	if err := s.PutFact(account, rail.ID{1}, rail.Fact{BlockNumber: 9}); err != nil {
+		t.Fatalf("fact again: %v", err)
+	}
+	got, ok, _ := s.Fact(account, rail.ID{1})
+	if !ok || got != first {
+		t.Fatalf("a finalized fact was overwritten: %+v", got)
+	}
+}
+
+func TestSubmissionsAreAppendedInOrder(t *testing.T) {
+	s := open(t)
+	for i := 0; i < 3; i++ {
+		sub := rail.Submission{
+			TxHash: common.BigToHash(big.NewInt(int64(i))),
+			Gas:    21000,
+			Tip:    big.NewInt(int64(i + 1)),
+			FeeCap: big.NewInt(int64(100 * (i + 1))),
+		}
+		if err := s.AppendSubmission(account, rail.ID{1}, sub); err != nil {
+			t.Fatalf("append: %v", err)
 		}
 	}
-	if string(got[0].TermsSig) != string(variant(rail.KindTransfer, 1, 2, 10, 1, 100).TermsSig) {
-		t.Fatal("the signature did not survive the round trip")
-	}
-
-	if err := s.Abandon(r); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.AppendVariant(r, variant(rail.KindTransfer, 1, 2, 10, 1, 400)); !errors.Is(err, rail.ErrAbandoned) {
-		t.Fatalf("want ErrAbandoned, got %v", err)
-	}
-	if after, _ := s.Variants(r); len(after) != 3 {
-		t.Fatalf("abandonment killed signed variants: %d remain", len(after))
-	}
-}
-
-func TestDepositVariantsKeepTheirAuthorisation(t *testing.T) {
-	s := open(t)
-	r := ref(1, 1)
-	v := variant(rail.KindDeposit, 1, 2, 10, 1, 100)
-	for i := range v.AuthSig {
-		v.AuthSig[i] = byte(255 - i)
-	}
-	if err := s.AppendVariant(r, v); err != nil {
-		t.Fatal(err)
-	}
-	got, err := s.Variants(r)
-	if err != nil || len(got) != 1 {
-		t.Fatalf("read back %d variants (%v)", len(got), err)
-	}
-	if string(got[0].AuthSig) != string(v.AuthSig) {
-		t.Fatal("a deposit without its token authorisation can pull nothing")
-	}
-}
-
-func TestFactsAreCachedOnce(t *testing.T) {
-	s := open(t)
-	r := ref(1, 1)
-	first := rail.Fact{TxHash: common.HexToHash("0xaa"), BlockNumber: 5, Executed: true}
-	if err := s.PutFact(r, first); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.PutFact(r, rail.Fact{TxHash: common.HexToHash("0xbb"), BlockNumber: 9}); err != nil {
-		t.Fatal(err)
-	}
-	got, ok, err := s.Fact(r)
-	if err != nil || !ok {
-		t.Fatal("fact missing")
-	}
-	if got != first {
-		t.Fatalf("a finalized fact changed: %+v, want %+v", got, first)
-	}
-}
-
-func TestPendingListsWhatIsStillWatched(t *testing.T) {
-	s := open(t)
-	a, b := ref(1, 1), ref(1, 2)
-	for _, r := range []rail.Ref{a, b} {
-		if err := s.PutIntent(r, rail.Intent{Terms: terms(rail.KindTransfer, 1, 2, 1)}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := s.PutFact(a, rail.Fact{Executed: true}); err != nil {
-		t.Fatal(err)
-	}
-	pending, err := s.Pending()
+	subs, err := s.Submissions(account, rail.ID{1})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read: %v", err)
 	}
-	if len(pending) != 1 || pending[0] != b {
-		t.Fatalf("pending %v, want just %v", pending, b)
+	if len(subs) != 3 {
+		t.Fatalf("%d attempts, want 3", len(subs))
+	}
+	for i, sub := range subs {
+		if sub.Tip.Int64() != int64(i+1) || sub.FeeCap.Int64() != int64(100*(i+1)) {
+			t.Fatalf("attempt %d came back as %+v", i, sub)
+		}
 	}
 }
 
-// A release must never race a fresh signature: either the variant is recorded
-// before abandonment, or it is refused.
-func TestConcurrentAppendAndAbandonStaySerialisable(t *testing.T) {
+func TestDepositsAreIdentifiedByTheirLog(t *testing.T) {
 	s := open(t)
-	r := ref(1, 1)
+	d := rail.Deposit{
+		TxHash: common.HexToHash("0xaa"), LogIndex: 2, From: other,
+		Amount: big.NewInt(25_000_000), BlockNumber: 9,
+	}
+	for i := 0; i < 3; i++ {
+		if err := s.PutDeposit(account, d); err != nil {
+			t.Fatalf("deposit: %v", err)
+		}
+	}
+	all, err := s.Deposits(account)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(all) != 1 || all[0].Amount.Cmp(d.Amount) != 0 || all[0].From != other {
+		t.Fatalf("one transfer stored as %+v", all)
+	}
+	// Two logs in one transaction are two deposits.
+	d.LogIndex = 3
+	if err := s.PutDeposit(account, d); err != nil {
+		t.Fatalf("deposit: %v", err)
+	}
+	if all, _ = s.Deposits(account); len(all) != 2 {
+		t.Fatalf("two logs stored as %d deposits", len(all))
+	}
+}
 
+func TestCursorsOnlyAdvance(t *testing.T) {
+	s := open(t)
+	if _, ok, err := s.Cursor(account); ok || err != nil {
+		t.Fatalf("a fresh store reported a cursor (%v)", err)
+	}
+	for _, step := range []struct{ set, want uint64 }{{10, 10}, {4, 10}, {12, 12}} {
+		if err := s.PutCursor(account, step.set); err != nil {
+			t.Fatalf("cursor: %v", err)
+		}
+		got, ok, _ := s.Cursor(account)
+		if !ok || got != step.want {
+			t.Fatalf("after %d the cursor is %d, want %d", step.set, got, step.want)
+		}
+		if err := s.PutNonceFloor(account, step.set); err != nil {
+			t.Fatalf("floor: %v", err)
+		}
+		if got, ok, _ = s.NonceFloor(account); !ok || got != step.want {
+			t.Fatalf("after %d the floor is %d, want %d", step.set, got, step.want)
+		}
+	}
+}
+
+func TestConcurrentWritersStaySerialisable(t *testing.T) {
+	s := open(t)
+	const writers = 8
 	var wg sync.WaitGroup
-	appended := make([]error, 20)
-	for i := 0; i < 20; i++ {
+	errs := make([]error, writers)
+	for i := 0; i < writers; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			appended[i] = s.AppendVariant(r, variant(rail.KindTransfer, 1, 2, 10, 1, uint64(100+i)))
-		}(i)
-	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := s.Abandon(r); err != nil {
-			t.Error(err)
-		}
-	}()
-	wg.Wait()
-
-	stored, err := s.Variants(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	refused := 0
-	for _, err := range appended {
-		if errors.Is(err, rail.ErrAbandoned) {
-			refused++
-		} else if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	}
-	if len(stored)+refused != 20 {
-		t.Fatalf("%d recorded and %d refused, want 20 in total", len(stored), refused)
-	}
-	if abandoned, _ := s.Abandoned(r); !abandoned {
-		t.Fatal("abandonment was lost")
-	}
-	// Nothing may be recorded after the abandonment took effect.
-	if err := s.AppendVariant(r, variant(rail.KindTransfer, 1, 2, 10, 1, 999)); !errors.Is(err, rail.ErrAbandoned) {
-		t.Fatalf("want ErrAbandoned, got %v", err)
-	}
-}
-
-// Recording the same intent twice must always succeed, including when two
-// goroutines do it at once: retry is the recovery protocol, so a retry that
-// agrees with what is already recorded can never be an error.
-func TestConcurrentPutIntentIsIdempotent(t *testing.T) {
-	s := open(t)
-	r := ref(1, 1)
-	in := rail.Intent{Terms: terms(rail.KindTransfer, 1, 2, 10), FromBlock: 42}
-
-	var wg sync.WaitGroup
-	errs := make([]error, 20)
-	for i := range errs {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			errs[i] = s.PutIntent(r, in)
+			// Every writer records the same decision on the same nonce.
+			errs[i] = s.PutIntent(account, intent(1, 0, 100))
 		}(i)
 	}
 	wg.Wait()
-
 	for i, err := range errs {
 		if err != nil {
-			t.Fatalf("recording identical terms was refused (%d): %v", i, err)
+			t.Fatalf("writer %d: %v", i, err)
 		}
 	}
-	got, ok, err := s.Intent(r)
-	if err != nil || !ok {
-		t.Fatalf("intent missing: %v %v", ok, err)
-	}
-	if !got.Terms.Equal(in.Terms) || got.FromBlock != 42 {
-		t.Fatalf("read back %+v, want %+v", got, in)
-	}
-	// Conflicting terms are still refused, whoever asks.
-	other := in
-	other.Terms.Amount = big.NewInt(11)
-	if err := s.PutIntent(r, other); !errors.Is(err, rail.ErrIntentConflict) {
-		t.Fatalf("want ErrIntentConflict, got %v", err)
+	if _, ok, _ := s.Intent(account, rail.ID{1}); !ok {
+		t.Fatal("the record went missing under concurrency")
 	}
 }

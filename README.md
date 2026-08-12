@@ -1,264 +1,373 @@
 # juice-rail
 
-juice-rail moves real money between accounts on an Ethereum-style network.
-The money is a dollar-pegged token such as **USDT0**. juice-rail is three
-things: a **vault**, a program deployed on the network that holds the tokens
-and keeps one balance per account; a **Go library** that drives the vault;
-and a small command-line tool, **`railctl`**, for using it by hand.
+A small money rail. Each participant has one ordinary blockchain account that
+holds a stablecoin as money, and pays its own way. There is no rail contract,
+no operator, and nobody who can freeze anyone else.
 
-**One vault, many participants.** Independent installations (different
-companies, different machines, no trust between them) each hold an account
-in the same vault and pay each other through it. A payment one side made and
-the other side received cannot be denied by either, because the referee is
-the network itself, not anyone's server.
+Three things you can do: **deposit**, **transfer**, **withdraw**.
 
-Your money is always in one of two pockets: tokens sitting **at your own
-address**, like cash in hand, or a balance **inside the vault**, like money
-on account. It moves three ways: **deposit** (your hand → your vault
-balance), **transfer** (your vault balance → another participant's),
-**withdraw** (vault → any address you name).
+---
 
-Your account is just an ordinary Ethereum address. You sign what you want to
-happen; someone else delivers it.
+## 1. The words
 
-**Nobody is in charge.** Every movement of money needs the account holder's
-signature and nothing else. The vault has no owner, no administrator and no
-off switch. Whoever deployed it has no more power over your balance than a
-stranger does.
+Each term below is used by the ones after it, so read them in order.
 
-**You never need ETH.** Delivering a signed instruction to the network costs
-the network's own fuel, ETH, which ordinary participants should never have to
-think about. So a **relayer** pays that cost and is paid back in the token
-itself, out of the same operation. You name your relayer and agree its fee
-before you sign; nobody else can carry your instruction, and nobody can
-change what it says. Being a relayer takes no permission and no contract: it
-is anyone holding ETH who is willing to be named.
+**Chain.** A public ledger of accounts and balances. We use Ethereum-style
+chains: Arbitrum, and a throwaway local one for testing.
+
+**Transaction.** The only way to change anything on a chain. Someone signs one
+and sends it to the network.
+
+**Gas.** What a transaction costs. It is always paid in the chain's own
+currency — ETH on Ethereum and Arbitrum. You cannot pay gas in anything else.
+
+**Token.** A balance sheet kept by a contract on the chain. Sending tokens is
+an ordinary transaction, so the sender pays gas for it. The receiver does
+nothing and pays nothing.
+
+**Stablecoin.** A token meant to hold a steady value. Ours is USDT0. It is the
+money in this system; amounts are in it and nothing else.
+
+**Account.** One address on the chain, controlled by one private key. In
+juice-rail an account holds two things:
 
 ```text
-you sign        amount, who gets it, the fee, and which relayer may deliver it
-relayer pays    the network fee, in ETH, up front
-the vault pays  the relayer its fee, in tokens, out of your balance
+stablecoin   the money
+gas currency the fuel it needs to send transactions
 ```
 
-Every operation carries an identifier the vault remembers: repeating an
-operation is a safe no-op, and reusing its identifier for different terms is
-refused. No money can ever move twice.
+That is the whole design. Each account is its own vault.
 
-`requirements.md` is the specification. This file is how to run it.
+**Domain.** One chain plus one stablecoin on it:
 
-## Install
-
-```sh
-git clone --recurse-submodules https://github.com/daios-ai/juice-rail
-cd juice-rail && go build ./...
+```text
+domain = (chain, token address)
 ```
 
-| | |
-|---|---|
-| Go | 1.22 or later |
-| [Foundry](https://getfoundry.sh) | contract tools: `forge`, `cast`, `anvil` |
-| [Halmos](https://github.com/a16z/halmos) | optional, only for the formal proofs |
+Two domains are two separate worlds. Money on one is not money on the other,
+and there is no bridge here.
 
-Already cloned without submodules? `git submodule update --init --recursive`.
+**Finality.** A chain can briefly reorganise: a block that looked settled can
+disappear. Finality is the point past which it cannot. juice-rail treats
+nothing as real before finality — not a submitted transaction, not one already
+included in a block.
 
-## Try it locally first
+---
 
-You need no real network, no real money and no account with any provider.
-This command creates a pretend network on your machine, puts the vault on it,
-and acts out the six scenarios: a deposit, a payment, a withdrawal, a
-repeated operation, a reused identifier with different terms, and a crash
-halfway through.
+## 2. The three things you can do
+
+**Deposit** is money arriving. Someone — an exchange, a wallet, another
+participant — sends the stablecoin to your address. You do nothing. You send no
+transaction and you need no gas. Once it finalizes, juice-rail records it.
+
+**Transfer** is paying another participant. Your account sends the stablecoin
+to theirs. You pay the gas; they pay nothing and need nothing.
+
+**Withdraw** is the same transaction sent somewhere outside the rail — an
+exchange, a wallet. The only difference is who is on the other end, so the
+difference is a label, not a mechanism.
+
+---
+
+## 3. Gas, and why an account looks after its own
+
+Only the account sending a transaction can pay for it. There are systems that
+hide this by having somebody else submit your transactions for you, but then
+you cannot pay unless that somebody is online and willing. juice-rail takes the
+other trade: you fund your account once with a little gas currency, and after
+that it keeps itself topped up. Nobody else is ever needed.
+
+**Reserve.** The gas currency in your account. It is fuel, not money, and it is
+never shown as part of your balance.
+
+**Refill.** When the reserve runs low, the account sells a little of its own
+stablecoin for gas currency and keeps going. This is maintenance, not a fourth
+thing you can do, and the amounts are small.
+
+**Venue.** Where the refill trades: a Uniswap V3 pool, named in the domain's
+configuration. juice-rail keeps no prices of its own; it asks the venue.
+
+**Quote.** What the venue says the gas will cost, asked fresh each time.
+
+**Slippage.** The price can move between the quote and the trade. The refill
+carries a limit — "spend at most this much" — and reverts rather than exceed
+it.
+
+The rule, in full:
+
+```text
+if the reserve is at or above MIN:     send it
+otherwise, if a refill is affordable:  buy gas up to MAX, then send it
+otherwise:                             wait, and say why
+```
+
+Waiting is a real outcome and always says which of two things is short:
+
+```text
+not enough stablecoin  wait for money to come in
+not enough gas         someone must send gas currency from outside
+```
+
+Nothing is signed when the account waits. Blocked is not lost.
+
+Two honest limits. No fixed reserve survives every gas price, so there is a
+configured ceiling on what a refill may cost, and above it the account waits.
+And if the reserve ever empties completely, the only way back is somebody
+sending gas currency in, exactly as at the start.
+
+---
+
+## 4. Doing the same thing twice
+
+**Identifier.** You name each payment with a 32-byte identifier of your own
+choosing. Running the same command twice with the same identifier is the same
+payment, not two.
+
+**Nonce.** Every account has a counter. Each transaction it sends carries the
+next number, and the chain accepts one transaction per number, ever. juice-rail
+writes down which payment owns which number *before* it signs anything.
+
+That is the whole safety argument. A payment owns one number; the chain admits
+one transaction per number; so a payment can happen at most once, no matter how
+many times you retry, and no matter when the program is killed.
+
+**Retry.** If a transaction is stuck, retry it. It goes out again with the same
+number and the same amount to the same person — only the fee is raised, which
+is how the network is meant to replace a stuck transaction.
+
+**Status.** Always about the payment, never about one attempt:
+
+```text
+unknown    never heard of it
+pending    it may still happen
+confirmed  it happened, and finality says so
+failed     it can never happen
+```
+
+Only the last two are permanent.
+
+---
+
+## 5. Try it locally
+
+You need [Go](https://go.dev) 1.22+ and [Foundry](https://getfoundry.sh)
+(`forge`, `anvil`).
 
 ```sh
+git clone --recurse-submodules <this repo> && cd juice-rail
+go build ./...
 cd contracts && forge build && cd ..
-go test -tags integration ./integration-tests/
+go test ./...                                  # the library
+go test -tags integration ./integration-tests  # the six stories on a local chain
 ```
 
-It finishes in seconds and checks itself. Nothing leaves your machine. The
-scenario code, `integration-tests/stories_test.go`, shows `railctl` doing
-everything it can do.
+The stories start their own throwaway chain, deploy a mock token and a mock
+venue, and drive the real `railctl` binary through onboarding, a deposit, a
+payment, a withdrawal, a refill and a crash.
 
-## A local playground
+---
 
-To drive it by hand, start a pretend network and leave it running:
+## 6. Using it: railctl
+
+`railctl` is the operations tool. It is not a wallet product.
+
+### Create an account
+
+Copy a domain file from `deployments/` and fill in its `rpc` — that is the one
+field the chain does not fix for you. Then:
 
 ```sh
-anvil
+railctl init alice my-domain.json
 ```
 
-In another terminal, deploy a play token and the vault. `anvil` prints ten
-funded test keys; use the first as `$DEPLOYER_KEY`.
+This makes a key, checks the domain really works, and prints your address with
+what to send it:
+
+```text
+profile alice on domain arbitrum-sepolia, account 0x3B06...E4fD
+
+to make this account operational, fund it:
+  1. send the stablecoin to 0x3B06...E4fD
+  2. send at least 0.0004 of the native currency to the same address
+  3. wait for finality
+```
+
+Step 2 is the only time you handle gas currency by hand.
+
+### Everyday use
 
 ```sh
-cd contracts
-export RPC=http://127.0.0.1:8545
-forge create test/MockUSDT0.sol:MockUSDT0 --rpc-url $RPC --private-key $DEPLOYER_KEY --broadcast
-export TOKEN=<address it printed>
-forge script script/Deploy.s.sol --rpc-url $RPC --private-key $DEPLOYER_KEY --broadcast
+railctl balance                       # money, and the reserve, separately
+railctl deposits                      # money that arrived and finalized
+railctl transfer <id> <address> 25.00
+railctl withdraw <id> <address> 25.00
+railctl status <id>
+railctl retry <id>                    # if a payment is stuck
 ```
 
-Write the domain file, which is all anyone needs to join:
+Identifiers are yours to pick; `openssl rand -hex 32` is fine.
+
+Amounts are written the way you say them: `25.00`, `0.50`, `1250`. There is no
+floating point anywhere inside — amounts are whole numbers of the token's
+smallest unit throughout.
+
+When the reserve is too low, a payment does not go through. Instead the account
+buys gas and tells you to come back:
+
+```text
+reserve low: refill 0x82295988... submitted 0x5eb29983...;
+run the payment again once it is confirmed
+```
+
+Run the same command again after finality and it goes through. Add
+`-no-refill` if you would rather it just refused.
+
+Add `-json` to any command for machine-readable output.
+
+### Where things are kept
+
+```text
+~/.juice-rail/config.json       domains and profiles
+~/.juice-rail/credentials.json  keys, and nothing else (mode 600)
+~/.juice-rail/<profile>.db      the records for one account
+```
+
+For automation, pass everything instead and the home directory is never read:
+`-config <file> -store <file>` and `RAILCTL_KEY=<hex>`.
+
+---
+
+## 7. Configuring a domain
+
+A domain file, field by field:
 
 ```json
 {
-  "name": "local",
-  "chainId": 31337,
-  "rpc": "http://127.0.0.1:8545",
-  "rail": "<the JuiceRail address>",
-  "token": "<the MockUSDT0 address>",
-  "finality": "finalized"
+  "name": "arbitrum-sepolia",
+  "chainId": 421614,
+  "rpc": "https://...",
+  "token": "0x8e87...d568",
+  "decimals": 6,
+  "finality": "finalized",
+  "fromBlock": 297184700,
+  "venue": {
+    "router":   "0x101F...663E",
+    "quoter":   "0x2779...Ef0B",
+    "weth":     "0x980B...c973",
+    "feeTier":  500,
+    "router02": true
+  },
+  "gas": {
+    "min":         "200000000000000",
+    "max":         "400000000000000",
+    "feeBound":    "100000000000000",
+    "slippageBps": 500,
+    "paymentGas":  300000,
+    "swapGas":     1500000
+  }
 }
 ```
 
-Create two participants and one relayer. `init` makes a fresh key, checks the
-token can carry signed authorisations, and remembers everything under
-`~/.juice-rail`:
+- `finality` must be `finalized`. Counting confirmations is not supported,
+  because something reported as confirmed must never come undone.
+- `fromBlock` is where the search for deposits starts. Set it to the block your
+  account was created in; there is nothing before that to find.
+- `venue.router02` says which version of the Uniswap router is deployed. The
+  two encode a swap slightly differently. Arbitrum One has the first;
+  Arbitrum Sepolia has SwapRouter02.
+- `gas.min` / `gas.max` are the reserve band, in wei. The account refills when
+  a payment would take it below `min`, and buys back up to `max`.
+- `gas.feeBound` is the most a refill may cost. Above it the account waits.
+  It must be no larger than `min`, or the reserve could fall to a level from
+  which it cannot pay for its own refill.
+- `gas.slippageBps` is how far past the quote a refill may go, in hundredths
+  of a percent. `500` is 5%.
+- `gas.paymentGas` / `gas.swapGas` bound the gas of a payment and of a refill.
+  These are bounds, not estimates: unused gas is not charged, and an estimate
+  would need the account to already hold the gas we are deciding whether to
+  buy. Chains that charge for data, like rollups, need larger numbers.
 
-```sh
-railctl init alice local.json
-railctl init bob   local.json
-railctl -key-file anvil-second-key.txt init relayer local.json
-```
+`deployments/` holds a file per domain with everything but the `rpc`, which is
+yours to fill in.
 
-Flags go before the command, always.
-
-The relayer is the only one that needs ETH, because it is the only one that
-talks to the network directly. Alice and Bob need none, ever.
-
-Give Alice some play money and put it in the vault. She signs; the relayer
-delivers:
-
-```sh
-cast send $TOKEN "mint(address,uint256)" $(railctl -profile alice account) 100000000 \
-  --rpc-url $RPC --private-key $DEPLOYER_KEY
-
-ID=0x$(openssl rand -hex 32)
-railctl -profile alice -fee 20000 -relayer $(railctl -profile relayer account) \
-        -out deposit.json deposit $ID $(railctl -profile alice account) 60000000
-railctl -profile relayer relay deposit.json
-```
-
-Amounts are in the token's smallest unit; USDT0 has six decimals, so
-`60000000` is 60.00 and the fee above is 0.02.
-
-`deposit.json` is the signed instruction. It is worth reading: it says exactly
-what will happen and who may make it happen.
-
-Check on it, pay Bob, and let Bob take his money out to any address:
-
-```sh
-railctl -profile alice status $ID          # pending until the network finalises it
-railctl -profile alice balance
-
-PAY=0x$(openssl rand -hex 32)
-railctl -profile alice -fee 10000 -relayer $(railctl -profile relayer account) \
-        -out pay.json transfer $PAY $(railctl -profile bob account) 10000000
-railctl -profile relayer relay pay.json
-
-OUT=0x$(openssl rand -hex 32)
-railctl -profile bob -fee 10000 -relayer $(railctl -profile relayer account) \
-        -out out.json withdraw $OUT 0xSomeExchangeDepositAddress 5000000
-railctl -profile relayer relay out.json
-```
-
-On a real network, `pending` turns into `confirmed` by itself once the
-network finalises the block, which on Arbitrum takes about twenty minutes.
-That wait is the safety model working, not a hang: money that is only
-probably yours is not yours.
-
-## Going live
-
-The same steps, minus the play token. Deploy the vault against the real
-stablecoin:
+Arbitrum Sepolia has no USDT0 and no pool to buy gas from, so there is a
+one-time setup script for staging:
 
 ```sh
 cd contracts
-TOKEN=0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9 \
-  forge script script/Deploy.s.sol --rpc-url $RPC --private-key $YOUR_KEY --broadcast
+forge script script/SepoliaBootstrap.s.sol --rpc-url $RPC --broadcast --private-key $KEY
 ```
 
-Fill `rail` into a copy of `deployments/arbitrum-one.json` and hand that file
-to whoever is joining. That is the whole of it: no operator contract, no
-sponsorship to fund, nothing to keep running. Deploying costs you gas once,
-and afterwards you have no power over anyone's money, including your own
-users'.
+It deploys a mock token and seeds a real Uniswap V3 pool, then prints the
+addresses to put in the domain file.
 
-Someone has to relay. That can be you, a participant, or several unrelated
-parties competing; every operation names the one that may carry it. A relayer
-needs ETH at its address, and earns its quoted fee in tokens when the
-operation executes.
+---
 
-## Use railctl
+## 8. Embedding the library
 
-| command | what it does |
-|---|---|
-| `init <profile> <domain-file>` | join a domain: make a key, remember the settings |
-| `account` | your address on this domain |
-| `balance [address]` | vault balance and tokens in hand |
-| `deposit <id> <account> <amount>` | put tokens into the vault, crediting any account |
-| `transfer <id> <recipient> <amount>` | pay another account inside the vault |
-| `withdraw <id> <destination> <amount>` | send tokens out to any address |
-| `relay <file>` | deliver someone's signed instruction, paying its gas |
-| `status <id>` | what happened to an operation |
-| `abandon <id>` | stop signing anything further for this operation |
+`go/rail` is the whole thing. One `Rail` is one account on one domain.
 
-Flags go **before** the command. The ones that matter:
+```go
+r, err := rail.New(domain, store, chainClient, key)
 
-| flag | |
-|---|---|
-| `-fee n` | what the relayer earns, in token units |
-| `-relayer addr` | who may deliver it (default: yourself, which needs ETH) |
-| `-valid-for d` | how long the signature lives (default 1h) |
-| `-out path` | write the signed instruction instead of sending it; `-` for stdout |
-| `-profile name` | act as another identity |
-| `-json` | machine-readable output |
-
-Identifiers must be fresh and unguessable: `openssl rand -hex 32`. Re-running
-any command with the same identifier and the same terms is safe.
-
-State lives in `~/.juice-rail`: `config.json` (domains and profiles),
-`credentials.json` (keys, mode 0600), and one database per profile. For
-automation, `-config`, `-store` and `RAILCTL_KEY` replace all of it, and then
-no home directory is read at all.
-
-## Operate it
-
-| status | meaning |
-|---|---|
-| `unknown` | never heard of this identifier |
-| `pending` | may still happen; a failed attempt is not a failure |
-| `confirmed` | it happened, and the network can no longer change its mind |
-| `failed` | it can never happen; whatever you reserved can be released |
-
-Only `confirmed` and `failed` are final. Retry is always safe, so retry is the
-whole recovery procedure. If a relayer takes your instruction and disappears,
-sign another one naming a different relayer and send that instead; the vault
-executes at most one of them, so there is no waiting and no risk of paying
-twice.
-
-Check a relayer's fuel with `cast balance <address> --rpc-url $RPC`.
-
-## Verify the build
-
-```sh
-go build ./... && go test ./...            # library, records, CLI, state machine
-go test -race ./...
-cd contracts && forge test                 # unit, fuzz and invariant tests
-FOUNDRY_PROFILE=deep forge test            # the same, much harder
-halmos --contract JuiceRailSymbolicTest    # nine proofs about the vault
-go test -tags integration ./integration-tests/
+r.Balances(ctx)                                    // money, reserve
+r.ScanDeposits(ctx)                                // newly finalized money in
+r.Prepare(ctx, id, rail.KindTransfer, to, amount)  // decide and write down
+r.Send(ctx, id)                                    // sign and broadcast
+r.Retry(ctx, id)                                   // same nonce, higher fee
+r.Status(ctx, id)                                  // from finalized facts only
+r.Refill(ctx, reserve)                             // buy gas, when asked to
 ```
 
-The scenario tests are opt-in and fail loudly if `anvil` is missing, rather
-than passing quietly. `go test ./...` needs no network.
+`Prepare` returns `ErrNeedRefill` when the reserve is short, and having written
+nothing down. Call `Refill`, wait for finality, then call `Prepare` again.
 
-## Layout
+The library reads no file, no environment variable and no home directory.
+Everything arrives at construction; finding configuration is the app's job.
+
+It keeps four kinds of record, through a `Store` interface you can implement
+over your own database — a SQLite one ships:
 
 ```text
-contracts/           JuiceRail, its tests, invariants and proofs
-go/rail/             the library: intents, signing, relaying, confirmation
-go/sqlite/           the durable records
-cmd/railctl/         the command-line tool
-deployments/         one file per domain
-integration-tests/   the six scenarios, on a local network
+intents      which payment owns which nonce, written before signing
+submissions  each signed attempt, written before broadcasting
+facts        finalized outcomes, cached because they cannot change
+deposits     finalized money in, one record per log
+```
+
+One rule the library cannot enforce for you: **one signer per key.** Nonces are
+chain state, so two programs holding the same key would race for them. If
+juice-rail ever finds a spent nonce it has no record of, it stops and says so
+rather than guessing.
+
+---
+
+## 9. What is checked
+
+- The gas rule is a pure function of balances, costs and one quote. It is
+  checked exhaustively — every combination on a grid, against a second
+  implementation written independently.
+- The lifecycle of a payment is enumerated: every shape its history can take,
+  checking that a settled status never moves again.
+- The six stories run against the compiled tool on a real chain.
+- The whole flow has been run on Arbitrum Sepolia against a real Uniswap V3
+  pool, including a refill.
+
+What is assumed, and not checked here: finality is final, the token is a
+correct ERC-20 with EIP-2612 permits, the venue delivers what it quotes or
+reverts, gas stays below the configured bound, one signer per key, and the RPC
+tells the truth.
+
+---
+
+## 10. Layout
+
+```text
+go/rail/          the library: accounts, the gas rule, the venue, status
+go/sqlite/        the shipped record store
+cmd/railctl/      the operations tool
+contracts/        test and staging fixtures only; no rail contract exists
+deployments/      one file per domain
+integration-tests/ the six stories
+requirements.md   what this is meant to be, and why
 ```

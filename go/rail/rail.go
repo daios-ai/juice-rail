@@ -3,7 +3,6 @@ package rail
 import (
 	"context"
 	"crypto/ecdsa"
-	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -11,578 +10,380 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum"
-	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
-const (
-	// The three money calls, plus the two reads a relayer needs. The parameter
-	// names are ours; the selector depends only on the types, which are the
-	// contract's.
-	railABIJSON = `[
-      {"type":"function","name":"deposit","inputs":[
-        {"name":"t","type":"tuple","components":[
-          {"name":"id","type":"bytes32"},{"name":"account","type":"address"},{"name":"party","type":"address"},
-          {"name":"amount","type":"uint256"},{"name":"fee","type":"uint256"},{"name":"relayer","type":"address"},
-          {"name":"validBefore","type":"uint256"}]},
-        {"name":"termsSig","type":"bytes"},{"name":"authSig","type":"bytes"}]},
-      {"type":"function","name":"transfer","inputs":[
-        {"name":"t","type":"tuple","components":[
-          {"name":"id","type":"bytes32"},{"name":"account","type":"address"},{"name":"party","type":"address"},
-          {"name":"amount","type":"uint256"},{"name":"fee","type":"uint256"},{"name":"relayer","type":"address"},
-          {"name":"validBefore","type":"uint256"}]},
-        {"name":"sig","type":"bytes"}]},
-      {"type":"function","name":"withdraw","inputs":[
-        {"name":"t","type":"tuple","components":[
-          {"name":"id","type":"bytes32"},{"name":"account","type":"address"},{"name":"party","type":"address"},
-          {"name":"amount","type":"uint256"},{"name":"fee","type":"uint256"},{"name":"relayer","type":"address"},
-          {"name":"validBefore","type":"uint256"}]},
-        {"name":"sig","type":"bytes"}]},
-      {"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address"}],
-        "outputs":[{"type":"uint256"}],"stateMutability":"view"},
-      {"type":"function","name":"operations","inputs":[
-        {"name":"account","type":"address"},{"name":"id","type":"bytes32"}],
-        "outputs":[{"type":"bytes32"}],"stateMutability":"view"}]`
+// refillWindow is how long a signed refill stays valid.
+const refillWindow = time.Hour
 
-	tokenABIJSON = `[
-      {"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address"}],
-        "outputs":[{"type":"uint256"}],"stateMutability":"view"},
-      {"type":"function","name":"DOMAIN_SEPARATOR","inputs":[],
-        "outputs":[{"type":"bytes32"}],"stateMutability":"view"},
-      {"type":"function","name":"authorizationState","inputs":[
-        {"name":"authorizer","type":"address"},{"name":"nonce","type":"bytes32"}],
-        "outputs":[{"type":"bool"}],"stateMutability":"view"}]`
-)
-
-var (
-	railABI  = mustABI(railABIJSON)
-	tokenABI = mustABI(tokenABIJSON)
-)
-
-func mustABI(s string) abi.ABI {
-	a, err := abi.JSON(strings.NewReader(s))
-	if err != nil {
-		panic(fmt.Sprintf("rail: bad ABI: %v", err))
-	}
-	return a
-}
-
-// termsTuple is the contract's terms struct. The three kinds share this shape.
-type termsTuple struct {
-	Id          [32]byte
-	Account     common.Address
-	Party       common.Address
-	Amount      *big.Int
-	Fee         *big.Int
-	Relayer     common.Address
-	ValidBefore *big.Int
-}
-
-// DefaultValidFor is how long a signed variant lives unless told otherwise. It
-// bounds how long a stalled relayer can hold an intent, and nothing else: a
-// replacement may be signed at once.
-const DefaultValidFor = time.Hour
-
-var (
-	// ErrExecuted is returned when the intent has already executed under these
-	// exact terms. Nothing is wrong: the money moved once.
-	ErrExecuted = errors.New("rail: operation already executed")
-	// ErrConflict is returned when the identifier is bound to other terms.
-	ErrConflict = errors.New("rail: identifier bound to different terms")
-	// ErrExpired is returned when a variant's deadline has passed.
-	ErrExpired = errors.New("rail: variant deadline has passed")
-	// ErrNotRelayer is returned when asked to carry a variant naming someone
-	// else. Only the named relayer may submit.
-	ErrNotRelayer = errors.New("rail: the variant names a different relayer")
-	// ErrForeignDomain is returned for a variant signed for another domain.
-	ErrForeignDomain = errors.New("rail: variant belongs to a different domain")
-	// ErrBadSignature is returned when a variant is not signed by the account
-	// it debits.
-	ErrBadSignature = errors.New("rail: variant is not signed by its account")
-)
-
-// Domain is one JuiceRail deployment: (chain id, contract address), plus how
-// to reach it. One Rail instance serves one domain, so no method takes a
-// network argument and domains cannot be mixed.
-type Domain struct {
-	Name    string
-	ChainID *big.Int
-	Rail    common.Address
-	Token   common.Address
-	// Finality names the mechanism that makes a fact permanent. Only true
-	// finality is supported, because a confirmed fact must never revert.
-	Finality string
-}
-
-// Validate checks that the domain is completely and safely configured.
-func (d Domain) Validate() error {
-	if d.ChainID == nil || d.ChainID.Sign() <= 0 {
-		return fmt.Errorf("domain %q: chain id must be set", d.Name)
-	}
-	if d.Rail == (common.Address{}) {
-		return fmt.Errorf("domain %q: rail address must be set", d.Name)
-	}
-	if d.Token == (common.Address{}) {
-		return fmt.Errorf("domain %q: token address must be set", d.Name)
-	}
-	if d.Finality != "finalized" {
-		return fmt.Errorf("domain %q: finality %q unsupported: only true finality (\"finalized\") is safe here", d.Name, d.Finality)
-	}
-	return nil
-}
-
-// Chain is everything the rail needs from a node: reads to decide status, and
-// the plain transaction machinery a relayer uses. *ethclient.Client satisfies
-// it.
+// Chain is everything the rail needs from a node: the reads that decide
+// status, and plain transaction machinery. *ethclient.Client satisfies it.
 type Chain interface {
 	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
 	FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error)
 	CallContract(ctx context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
-	BlockNumber(ctx context.Context) (uint64, error)
+	BalanceAt(ctx context.Context, account common.Address, block *big.Int) (*big.Int, error)
+	NonceAt(ctx context.Context, account common.Address, block *big.Int) (uint64, error)
 	PendingNonceAt(ctx context.Context, account common.Address) (uint64, error)
 	SuggestGasTipCap(ctx context.Context) (*big.Int, error)
-	EstimateGas(ctx context.Context, call ethereum.CallMsg) (uint64, error)
 	SendTransaction(ctx context.Context, tx *types.Transaction) error
+	TransactionReceipt(ctx context.Context, hash common.Hash) (*types.Receipt, error)
 }
 
-// Rail moves money on one domain and reports finalized facts. The host stays
-// authoritative for its own ledger.
+// Rail is one account on one domain. It holds the stablecoin as money and the
+// chain's native currency as an operating reserve, and needs no other party to
+// move either.
 //
-// A Rail may be used from several goroutines: signing and relaying serialise
-// on one instance, which is what keeps two concurrent operations from picking
-// the same transaction nonce. Two things it cannot do for you, because neither
-// lives inside this process: one relayer key must be driven by one process,
-// since nonces are chain state; and a transaction that sticks or is replaced
-// needs handling above the library. For parallelism, hold one Rail per key,
-// which is the natural shape anyway since each already holds exactly one.
+// A Rail may be used from several goroutines: everything from reconciliation
+// through nonce assignment to submission serialises on one instance. One thing
+// it cannot do for you, because it does not live inside this process: a key
+// must be driven by exactly one signer. Nonces are chain state, and two
+// signers would race for them.
 type Rail struct {
-	domain Domain
-	store  Store
-	chain  Chain
-	key    *ecdsa.PrivateKey
+	domain  Domain
+	store   Store
+	chain   Chain
+	key     *ecdsa.PrivateKey
+	address common.Address
 
-	address   common.Address
-	separator common.Hash
-
-	// mu serialises this rail's own operations: nonce selection through
-	// submission, the token domain cache, and the read-then-append that
-	// decides whether a fresh variant is needed.
-	mu          sync.Mutex
-	tokenDomain common.Hash // read once from the token, then fixed
+	// mu serialises reconciliation, the reserve decision, nonce assignment and
+	// submission: the sequence that must not interleave with itself.
+	mu sync.Mutex
 }
 
-// New binds a rail to one domain. The key authorises this account's money and
-// pays gas when the rail relays.
+// New binds a rail to one domain. The key both spends the money and pays the
+// gas: they are the same account.
 func New(d Domain, s Store, chain Chain, key *ecdsa.PrivateKey) (*Rail, error) {
 	if err := d.Validate(); err != nil {
 		return nil, err
 	}
 	if s == nil || chain == nil || key == nil {
-		return nil, errors.New("rail: store, chain and key are required")
+		return nil, fmt.Errorf("%w: store, chain and key are required", ErrBadInput)
 	}
 	return &Rail{
-		domain:    d,
-		store:     s,
-		chain:     chain,
-		key:       key,
-		address:   crypto.PubkeyToAddress(key.PublicKey),
-		separator: DomainSeparator(d.ChainID, d.Rail),
+		domain:  d,
+		store:   s,
+		chain:   chain,
+		key:     key,
+		address: crypto.PubkeyToAddress(key.PublicKey),
 	}, nil
 }
 
 // Domain returns the domain this rail is bound to.
 func (r *Rail) Domain() Domain { return r.domain }
 
-// Account is the rail's address on this domain: an ordinary Ethereum address,
-// which is also where its withdrawals may be sent.
+// Account is the rail's address: an ordinary Ethereum address, which is also
+// where anyone may send it money.
 func (r *Rail) Account() common.Address { return r.address }
 
-func (r *Rail) ref(id ID) Ref { return Ref{Account: r.address, ID: id} }
-
-// Balance reads an account's rail balance.
-func (r *Rail) Balance(ctx context.Context, account common.Address) (*big.Int, error) {
-	return callUint256(ctx, r.chain, r.domain.Rail, railABI, "balanceOf", account)
+// Balances reports the account's money and its operating reserve.
+func (r *Rail) Balances(ctx context.Context) (token, gas *big.Int, err error) {
+	if token, err = tokenUint(ctx, r.chain, r.domain.Token, "balanceOf", r.address); err != nil {
+		return nil, nil, err
+	}
+	if gas, err = r.chain.BalanceAt(ctx, r.address, nil); err != nil {
+		return nil, nil, fmt.Errorf("read reserve: %w", err)
+	}
+	return token, gas, nil
 }
 
-// TokenBalance reads a plain token balance, for funding and verification.
-func (r *Rail) TokenBalance(ctx context.Context, account common.Address) (*big.Int, error) {
-	return callUint256(ctx, r.chain, r.domain.Token, tokenABI, "balanceOf", account)
-}
-
-// binding reads the terms an identifier is bound to, or zero if unbound.
-func (r *Rail) binding(ctx context.Context, account common.Address, id ID) (common.Hash, error) {
-	out, err := call(ctx, r.chain, r.domain.Rail, railABI, "operations", account, id.Hash())
-	if err != nil {
-		return common.Hash{}, err
+// CheckDomain proves the domain is usable before any money depends on it: the
+// token answers, it carries EIP-2612 permits, and the venue can price a
+// refill. A domain that fails this can never keep an account in gas.
+func (r *Rail) CheckDomain(ctx context.Context) error {
+	if _, err := tokenUint(ctx, r.chain, r.domain.Token, "balanceOf", r.address); err != nil {
+		return fmt.Errorf("token %s is not an ERC-20 here: %w", r.domain.Token, err)
 	}
-	if len(out) != 32 {
-		return common.Hash{}, fmt.Errorf("operations: want 32 bytes, got %d", len(out))
+	if _, err := callWord(ctx, r.chain, r.domain.Token, tokenABI, "DOMAIN_SEPARATOR"); err != nil {
+		return fmt.Errorf("token %s does not implement EIP-2612: %w", r.domain.Token, err)
 	}
-	return common.BytesToHash(out), nil
-}
-
-// tokenSeparator reads the token's EIP-712 domain, which the deposit
-// authorisation is signed under. Reading it from the token means no name or
-// version has to be configured, and no domain can be misconfigured.
-func (r *Rail) tokenSeparator(ctx context.Context) (common.Hash, error) {
-	if r.tokenDomain != (common.Hash{}) {
-		return r.tokenDomain, nil
+	if _, err := tokenUint(ctx, r.chain, r.domain.Token, "nonces", r.address); err != nil {
+		return fmt.Errorf("token %s does not implement EIP-2612: %w", r.domain.Token, err)
 	}
-	out, err := call(ctx, r.chain, r.domain.Token, tokenABI, "DOMAIN_SEPARATOR")
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("read token domain: %w", err)
-	}
-	if len(out) != 32 {
-		return common.Hash{}, fmt.Errorf("read token domain: want 32 bytes, got %d", len(out))
-	}
-	r.tokenDomain = common.BytesToHash(out)
-	return r.tokenDomain, nil
-}
-
-// CheckToken verifies that the domain's token exposes the EIP-3009 surface a
-// deposit depends on. It proves the read surface is there, not that the token
-// verifies authorisations correctly, which stays a trust base assumption; a
-// token that fails this can never take a deposit at all.
-func (r *Rail) CheckToken(ctx context.Context) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	separator, err := r.tokenSeparator(ctx)
-	if err != nil {
-		return err
-	}
-	if separator == (common.Hash{}) {
-		return fmt.Errorf("token %s reports an empty EIP-712 domain", r.domain.Token)
-	}
-	if _, err := call(ctx, r.chain, r.domain.Token, tokenABI, "authorizationState",
-		common.Address{}, common.Hash{}); err != nil {
-		return fmt.Errorf("token %s does not implement EIP-3009: %w", r.domain.Token, err)
+	if _, err := quoteRefill(ctx, r.chain, r.domain, r.domain.Gas.Min); err != nil {
+		return fmt.Errorf("swap venue %s cannot price a refill: %w", r.domain.Venue.Router, err)
 	}
 	return nil
 }
 
-func call(ctx context.Context, chain Chain, to common.Address, a abi.ABI, method string, args ...any) ([]byte, error) {
-	in, err := a.Pack(method, args...)
-	if err != nil {
-		return nil, err
+// Prepare runs the reserve policy and records the write-ahead intent. Nothing
+// is signed, so after it returns the identifier durably owns one account nonce
+// and no transaction exists yet.
+//
+// If the reserve is too low it returns ErrNeedRefill and records nothing: call
+// Refill, wait for it to finalize, then Prepare again. If money is short it
+// returns a shortage error, also having recorded nothing. Blocked is not lost.
+//
+// Preparing the same identifier twice with the same terms is a no-op, so a
+// repeated command never pays twice.
+func (r *Rail) Prepare(ctx context.Context, id ID, kind Kind, to common.Address, amount *big.Int) error {
+	if kind != KindTransfer && kind != KindWithdraw {
+		return fmt.Errorf("%w: %s is not a payment", ErrBadInput, kind)
 	}
-	out, err := chain.CallContract(ctx, ethereum.CallMsg{To: &to, Data: in}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", method, err)
+	if to == (common.Address{}) {
+		return fmt.Errorf("%w: destination must be set", ErrBadInput)
 	}
-	return out, nil
-}
+	if amount == nil || amount.Sign() <= 0 {
+		return fmt.Errorf("%w: amount must be positive", ErrBadInput)
+	}
 
-func callUint256(ctx context.Context, chain Chain, to common.Address, a abi.ABI, method string, args ...any) (*big.Int, error) {
-	out, err := call(ctx, chain, to, a, method, args...)
-	if err != nil {
-		return nil, err
-	}
-	if len(out) != 32 {
-		return nil, fmt.Errorf("%s: want 32 bytes, got %d", method, len(out))
-	}
-	return new(big.Int).SetBytes(out), nil
-}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-// --- intents ---
-
-// Prepare records the intent. Nothing is signed and nothing is submitted, so
-// after this returns the identifier is durably ours and its core terms are
-// fixed.
-func (r *Rail) Prepare(ctx context.Context, id ID, t Terms) error {
-	if err := t.Validate(); err != nil {
+	if in, ok, err := r.store.Intent(r.address, id); err != nil {
+		return err
+	} else if ok {
+		if in.Kind != kind || in.To != to || in.Amount.Cmp(amount) != 0 {
+			return fmt.Errorf("%w: %s", ErrIntentConflict, id)
+		}
+		return nil
+	}
+	if err := r.ready(ctx); err != nil {
 		return err
 	}
-	if t.Account != r.address {
-		return fmt.Errorf("rail: intent debits %s, but this rail is %s", t.Account, r.address)
-	}
-	head, err := r.chain.BlockNumber(ctx)
+
+	head, _, feeCap, err := r.fees(ctx)
 	if err != nil {
-		return fmt.Errorf("read head: %w", err)
+		return err
 	}
-	return r.store.PutIntent(r.ref(id), Intent{Terms: t, FromBlock: head})
+	in, err := r.policyInput(ctx, feeCap, amount)
+	if err != nil {
+		return err
+	}
+	switch d := Decide(r.domain.Gas, in); d.Action {
+	case ActionWait:
+		return r.shortage(d.Reason, in, amount)
+	case ActionQuote, ActionRefill:
+		return fmt.Errorf("%w: reserve is %s, minimum is %s", ErrNeedRefill, in.Gas, r.domain.Gas.Min)
+	}
+
+	data, err := transferCalldata(to, amount)
+	if err != nil {
+		return err
+	}
+	if err := r.simulate(ctx, r.domain.Token, data, r.gasLimit(kind)); err != nil {
+		return err
+	}
+	// Only the nonce is bound here. Fees belong to a submission, not to the
+	// intent, because a retry may raise them and nothing else.
+	nonce, err := r.nextNonce(ctx)
+	if err != nil {
+		return err
+	}
+	return r.store.PutIntent(r.address, Intent{
+		ID: id, Kind: kind, To: to, Amount: new(big.Int).Set(amount),
+		Nonce: nonce, Calldata: data, FromBlock: head.Number.Uint64(),
+	})
 }
 
-// PrepareDeposit records a deposit intent crediting account with amount. The
-// rail's own address pays; the credited account may be anyone.
-func (r *Rail) PrepareDeposit(ctx context.Context, id ID, account common.Address, amount *big.Int) error {
-	return r.Prepare(ctx, id, Terms{Kind: KindDeposit, Account: r.address, Party: account, Amount: amount})
-}
-
-// PrepareTransfer records a payment to another account on this domain.
-func (r *Rail) PrepareTransfer(ctx context.Context, id ID, recipient common.Address, amount *big.Int) error {
-	return r.Prepare(ctx, id, Terms{Kind: KindTransfer, Account: r.address, Party: recipient, Amount: amount})
-}
-
-// PrepareWithdrawal records a withdrawal to an address outside the rail.
-func (r *Rail) PrepareWithdrawal(ctx context.Context, id ID, destination common.Address, amount *big.Int) error {
-	return r.Prepare(ctx, id, Terms{Kind: KindWithdraw, Account: r.address, Party: destination, Amount: amount})
-}
-
-// Sign returns a signed variant of a recorded intent, signing a fresh one
-// unless a live variant with the same relayer and fee already exists. The
-// variant is durable before it is returned, so a crash can never leave an
-// operation we signed but hold no record of.
+// Refill buys native currency with the account's own stablecoin, topping the
+// reserve up towards its maximum. reserve is the payment the refill must leave
+// affordable; pass zero when topping up for its own sake.
 //
-// Replacing an unresponsive relayer needs no waiting: sign another variant.
-// The contract executes at most one, and a loser reverts at its own relayer's
-// cost.
-func (r *Rail) Sign(ctx context.Context, id ID, fee *big.Int, relayer common.Address, validFor time.Duration) (Variant, error) {
+// It records and submits in one call because the identifier is derived from
+// the nonce, not chosen by the caller: maintenance is not a banking verb.
+func (r *Rail) Refill(ctx context.Context, reserve *big.Int) (ID, common.Hash, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.sign(ctx, id, fee, relayer, validFor)
+
+	if err := r.ready(ctx); err != nil {
+		return ID{}, common.Hash{}, err
+	}
+	head, tip, feeCap, err := r.fees(ctx)
+	if err != nil {
+		return ID{}, common.Hash{}, err
+	}
+	in, err := r.policyInput(ctx, feeCap, reserve)
+	if err != nil {
+		return ID{}, common.Hash{}, err
+	}
+
+	d := Decide(r.domain.Gas, in)
+	if d.Action == ActionExecute {
+		return ID{}, common.Hash{}, fmt.Errorf("%w: %s held, minimum is %s", ErrNoRefillNeeded, in.Gas, r.domain.Gas.Min)
+	}
+	if d.Action == ActionQuote {
+		quote, err := quoteRefill(ctx, r.chain, r.domain, d.Delta)
+		if err != nil {
+			return ID{}, common.Hash{}, err
+		}
+		in.Quote = quote
+		d = Decide(r.domain.Gas, in)
+	}
+	if d.Action != ActionRefill {
+		return ID{}, common.Hash{}, r.shortage(d.Reason, in, reserve)
+	}
+
+	deadline := head.Time + uint64(refillWindow.Seconds())
+	data, err := refillCalldata(ctx, r.chain, r.domain, r.key, r.address, d.Delta, d.MaxInput, deadline)
+	if err != nil {
+		return ID{}, common.Hash{}, err
+	}
+	if err := r.simulate(ctx, r.domain.Venue.Router, data, r.gasLimit(KindRefill)); err != nil {
+		return ID{}, common.Hash{}, err
+	}
+	nonce, err := r.nextNonce(ctx)
+	if err != nil {
+		return ID{}, common.Hash{}, err
+	}
+	intent := Intent{
+		ID: refillID(r.address, nonce), Kind: KindRefill, To: r.domain.Venue.Router,
+		Amount: d.MaxInput, Delta: d.Delta, Nonce: nonce, Calldata: data,
+		FromBlock: head.Number.Uint64(),
+	}
+	if err := r.store.PutIntent(r.address, intent); err != nil {
+		return ID{}, common.Hash{}, err
+	}
+	hash, err := r.submit(ctx, intent, Submission{Gas: r.gasLimit(KindRefill), Tip: tip, FeeCap: feeCap})
+	return intent.ID, hash, err
 }
 
-func (r *Rail) sign(ctx context.Context, id ID, fee *big.Int, relayer common.Address, validFor time.Duration) (Variant, error) {
-	ref := r.ref(id)
-	abandoned, err := r.store.Abandoned(ref)
-	if err != nil {
-		return Variant{}, err
+// Send signs a recorded intent at its recorded nonce and broadcasts it.
+//
+// It is idempotent: signing is deterministic and the fees of an existing
+// attempt are reused, so calling it again reproduces the same transaction
+// rather than making a second one.
+func (r *Rail) Send(ctx context.Context, id ID) (common.Hash, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	in, live, err := r.unresolved(id)
+	if err != nil || !live {
+		return common.Hash{}, err
 	}
-	if abandoned {
-		return Variant{}, fmt.Errorf("%w: %s", ErrAbandoned, id)
-	}
-	in, ok, err := r.store.Intent(ref)
+	subs, err := r.store.Submissions(r.address, id)
 	if err != nil {
-		return Variant{}, err
+		return common.Hash{}, err
+	}
+	if len(subs) > 0 {
+		return r.submit(ctx, in, subs[len(subs)-1])
+	}
+	_, tip, feeCap, err := r.fees(ctx)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	return r.submit(ctx, in, Submission{Gas: r.gasLimit(in.Kind), Tip: tip, FeeCap: feeCap})
+}
+
+// Retry re-sends a recorded intent under the same nonce and the same economic
+// terms, raising only the transaction fees. That is Ethereum's own replacement
+// rule, and it is why a stuck payment never becomes two payments.
+func (r *Rail) Retry(ctx context.Context, id ID) (common.Hash, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	in, live, err := r.unresolved(id)
+	if err != nil || !live {
+		return common.Hash{}, err
+	}
+	subs, err := r.store.Submissions(r.address, id)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	_, tip, feeCap, err := r.fees(ctx)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	next := Submission{Gas: r.gasLimit(in.Kind), Tip: tip, FeeCap: feeCap}
+	if len(subs) > 0 {
+		last := subs[len(subs)-1]
+		next.Gas = last.Gas
+		next.Tip = maxInt(next.Tip, bump(last.Tip))
+		next.FeeCap = maxInt(next.FeeCap, bump(last.FeeCap))
+	}
+	return r.submit(ctx, in, next)
+}
+
+// Pending lists intents with no finalized outcome, oldest first.
+func (r *Rail) Pending() ([]Intent, error) { return r.store.Pending(r.address) }
+
+// Intent returns a recorded intent.
+func (r *Rail) Intent(id ID) (Intent, bool, error) { return r.store.Intent(r.address, id) }
+
+// --- internals ---
+
+// ready brings the rail up to date and refuses to start anything while
+// something is still in flight. One outgoing transaction at a time is what
+// keeps two operations from projecting the same reserve twice.
+func (r *Rail) ready(ctx context.Context) error {
+	if err := r.reconcile(ctx); err != nil {
+		return err
+	}
+	if err := r.settle(ctx); err != nil {
+		return err
+	}
+	pending, err := r.store.Pending(r.address)
+	if err != nil {
+		return err
+	}
+	if len(pending) > 0 {
+		return fmt.Errorf("%w: %s %s", ErrInFlight, pending[0].Kind, pending[0].ID)
+	}
+	return nil
+}
+
+// unresolved loads an intent that still needs sending. An intent that has
+// already finalized is reported as not live, so callers read its outcome
+// instead of acting on it again.
+func (r *Rail) unresolved(id ID) (Intent, bool, error) {
+	in, ok, err := r.store.Intent(r.address, id)
+	if err != nil {
+		return Intent{}, false, err
 	}
 	if !ok {
-		return Variant{}, fmt.Errorf("%w: %s", ErrNoIntent, id)
+		return Intent{}, false, fmt.Errorf("%w: %s", ErrNoIntent, id)
 	}
-	if fee == nil {
-		fee = new(big.Int)
+	if _, done, err := r.store.Fact(r.address, id); err != nil {
+		return Intent{}, false, err
+	} else if done {
+		return Intent{}, false, nil
 	}
-	if relayer == (common.Address{}) {
-		relayer = r.address
-	}
-	if validFor <= 0 {
-		validFor = DefaultValidFor
-	}
+	return in, true, nil
+}
 
-	// Liveness here is measured against the latest head: that is what decides
-	// whether a variant can still be included. Death, which is a durable
-	// judgement, is measured against the finalized head instead.
+// policyInput gathers what the reserve decision depends on. Costs are fee cap
+// times a fixed gas limit: an upper bound, so the decision errs towards
+// keeping the account able to act.
+func (r *Rail) policyInput(ctx context.Context, feeCap, pending *big.Int) (PolicyInput, error) {
+	token, gas, err := r.Balances(ctx)
+	if err != nil {
+		return PolicyInput{}, err
+	}
+	_, swap := r.domain.Gas.limits()
+	return PolicyInput{
+		Gas:           gas,
+		Token:         token,
+		SwapCost:      new(big.Int).Mul(feeCap, new(big.Int).SetUint64(swap)),
+		PendingAmount: pending,
+	}, nil
+}
+
+// shortage turns a policy refusal into an error that says what is missing.
+func (r *Rail) shortage(reason Reason, in PolicyInput, pending *big.Int) error {
+	switch reason {
+	case ReasonNeedToken:
+		return fmt.Errorf("%w: holding %s, need %s plus the cost of a refill", ErrInsufficientToken, in.Token, orZero(pending))
+	case ReasonNeedGas:
+		return fmt.Errorf("%w: holding %s, a refill costs %s", ErrInsufficientGas, in.Gas, in.SwapCost)
+	case ReasonFeesAboveBound:
+		return fmt.Errorf("%w: a refill would cost %s, the bound is %s", ErrFeesAboveBound, in.SwapCost, r.domain.Gas.FeeBound)
+	default:
+		return fmt.Errorf("%w: refused with no reason", ErrBadInput)
+	}
+}
+
+// fees reads the head and prices a transaction from it. The cap covers a few
+// blocks of base fee growth, so a transaction stays includable while it waits.
+func (r *Rail) fees(ctx context.Context) (*types.Header, *big.Int, *big.Int, error) {
 	head, err := r.chain.HeaderByNumber(ctx, nil)
 	if err != nil {
-		return Variant{}, fmt.Errorf("read head: %w", err)
-	}
-	existing, err := r.store.Variants(ref)
-	if err != nil {
-		return Variant{}, err
-	}
-	for i := len(existing) - 1; i >= 0; i-- {
-		v := existing[i]
-		if !variantDead(v, head.Time) && v.Relayer == relayer && v.Fee.Cmp(fee) == 0 {
-			return v, nil
-		}
-	}
-
-	v := Variant{
-		Terms:       in.Terms,
-		ID:          id,
-		Fee:         fee,
-		Relayer:     relayer,
-		ValidBefore: head.Time + uint64(validFor.Seconds()),
-	}
-	h, err := TermsHash(v)
-	if err != nil {
-		return Variant{}, err
-	}
-	if v.TermsSig, err = signDigest(r.key, digest(r.separator, h)); err != nil {
-		return Variant{}, err
-	}
-	if v.Kind == KindDeposit {
-		tokenDomain, err := r.tokenSeparator(ctx)
-		if err != nil {
-			return Variant{}, err
-		}
-		// The authorisation is payable only to the rail, expires with the
-		// operation, and uses the terms hash as its nonce, which is what ties
-		// the two signatures to one deposit.
-		d, err := authDigest(tokenDomain, v.Account, r.domain.Rail, v.Total(), v.ValidBefore, h)
-		if err != nil {
-			return Variant{}, err
-		}
-		if v.AuthSig, err = signDigest(r.key, d); err != nil {
-			return Variant{}, err
-		}
-	}
-	if err := v.Validate(); err != nil {
-		return Variant{}, err
-	}
-	if err := r.store.AppendVariant(ref, v); err != nil {
-		return Variant{}, err
-	}
-	return v, nil
-}
-
-// Accept checks that an envelope was signed for this domain and returns its
-// variant. The domain is inside the signature too, so this only turns a
-// foreign variant into a clear refusal.
-func (r *Rail) Accept(env Envelope) (Variant, error) {
-	if env.ChainID == nil || env.ChainID.Cmp(r.domain.ChainID) != 0 || env.Rail != r.domain.Rail {
-		return Variant{}, fmt.Errorf("%w: signed for (%s, %s), this rail is (%s, %s)",
-			ErrForeignDomain, env.ChainID, env.Rail, r.domain.ChainID, r.domain.Rail)
-	}
-	return env.Variant, nil
-}
-
-// Relay verifies a signed variant and submits it, paying gas from the rail's
-// own key. It touches no durable state, so it serves variants signed by anyone
-// — being a relayer requires nothing but native gas.
-func (r *Rail) Relay(ctx context.Context, v Variant) (common.Hash, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.relay(ctx, v)
-}
-
-func (r *Rail) relay(ctx context.Context, v Variant) (common.Hash, error) {
-	if err := v.Validate(); err != nil {
-		return common.Hash{}, err
-	}
-	if v.Relayer != r.address {
-		return common.Hash{}, fmt.Errorf("%w: names %s, this rail is %s", ErrNotRelayer, v.Relayer, r.address)
-	}
-	h, err := TermsHash(v)
-	if err != nil {
-		return common.Hash{}, err
-	}
-	signer, err := RecoverSigner(digest(r.separator, h), v.TermsSig)
-	if err != nil {
-		return common.Hash{}, err
-	}
-	if signer != v.Account {
-		return common.Hash{}, fmt.Errorf("%w: recovers to %s, not %s", ErrBadSignature, signer, v.Account)
-	}
-	if v.Kind == KindDeposit {
-		tokenDomain, err := r.tokenSeparator(ctx)
-		if err != nil {
-			return common.Hash{}, err
-		}
-		d, err := authDigest(tokenDomain, v.Account, r.domain.Rail, v.Total(), v.ValidBefore, h)
-		if err != nil {
-			return common.Hash{}, err
-		}
-		authSigner, err := RecoverSigner(d, v.AuthSig)
-		if err != nil {
-			return common.Hash{}, err
-		}
-		if authSigner != v.Account {
-			return common.Hash{}, fmt.Errorf("%w: the token authorisation recovers to %s, not %s",
-				ErrBadSignature, authSigner, v.Account)
-		}
-	}
-
-	// Reading the binding first separates "already executed" from "will
-	// execute": a simulation succeeds for both, and only one is worth gas.
-	bound, err := r.binding(ctx, v.Account, v.ID)
-	if err != nil {
-		return common.Hash{}, err
-	}
-	switch bound {
-	case h:
-		return common.Hash{}, fmt.Errorf("%w: %s", ErrExecuted, v.Ref())
-	case common.Hash{}:
-	default:
-		return common.Hash{}, fmt.Errorf("%w: %s", ErrConflict, v.Ref())
-	}
-
-	head, err := r.chain.HeaderByNumber(ctx, nil)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("read head: %w", err)
-	}
-	if variantDead(v, head.Time) {
-		return common.Hash{}, fmt.Errorf("%w: %s", ErrExpired, v.Ref())
-	}
-	if v.Kind != KindDeposit {
-		balance, err := r.Balance(ctx, v.Account)
-		if err != nil {
-			return common.Hash{}, err
-		}
-		if balance.Cmp(v.Total()) < 0 {
-			return common.Hash{}, fmt.Errorf("rail: %s holds %s, needs %s", v.Account, balance, v.Total())
-		}
-	}
-
-	data, err := callData(v)
-	if err != nil {
-		return common.Hash{}, err
-	}
-	return r.send(ctx, data, head)
-}
-
-// Submit signs a variant naming this rail as its own relayer and submits it.
-// It is the path for an account that holds gas; an account that does not signs
-// and hands the variant to a relayer instead.
-func (r *Rail) Submit(ctx context.Context, id ID, fee *big.Int, validFor time.Duration) (common.Hash, error) {
-	// One lock across both halves: the nonce this picks must not be picked
-	// again before the transaction is on its way.
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	v, err := r.sign(ctx, id, fee, r.address, validFor)
-	if err != nil {
-		return common.Hash{}, err
-	}
-	return r.relay(ctx, v)
-}
-
-// Abandon records that the rail will never sign this intent again. It does not
-// kill variants already signed, so the host must still wait for `failed`
-// before releasing anything.
-func (r *Rail) Abandon(_ context.Context, id ID) error {
-	return r.store.Abandon(r.ref(id))
-}
-
-// Variants lists the signed variants of an intent, newest last.
-func (r *Rail) Variants(id ID) ([]Variant, error) {
-	return r.store.Variants(r.ref(id))
-}
-
-// callData builds the exact contract call for a variant.
-func callData(v Variant) ([]byte, error) {
-	t := termsTuple{
-		Id:          v.ID,
-		Account:     v.Account,
-		Party:       v.Party,
-		Amount:      v.Amount,
-		Fee:         v.Fee,
-		Relayer:     v.Relayer,
-		ValidBefore: new(big.Int).SetUint64(v.ValidBefore),
-	}
-	switch v.Kind {
-	case KindDeposit:
-		return railABI.Pack("deposit", t, v.TermsSig, v.AuthSig)
-	case KindTransfer:
-		return railABI.Pack("transfer", t, v.TermsSig)
-	case KindWithdraw:
-		return railABI.Pack("withdraw", t, v.TermsSig)
-	default:
-		return nil, fmt.Errorf("%w: unknown kind", errBadTerms)
-	}
-}
-
-// send simulates the exact call, then submits it. Simulating first is what
-// keeps a relayer from burning gas on an operation that cannot execute.
-func (r *Rail) send(ctx context.Context, data []byte, head *types.Header) (common.Hash, error) {
-	to := r.domain.Rail
-	msg := ethereum.CallMsg{From: r.address, To: &to, Data: data}
-	if _, err := r.chain.CallContract(ctx, msg, nil); err != nil {
-		return common.Hash{}, fmt.Errorf("simulate: %w", err)
-	}
-	gas, err := r.chain.EstimateGas(ctx, msg)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("estimate gas: %w", err)
-	}
-	nonce, err := r.chain.PendingNonceAt(ctx, r.address)
-	if err != nil {
-		return common.Hash{}, fmt.Errorf("read nonce: %w", err)
+		return nil, nil, nil, fmt.Errorf("read head: %w", err)
 	}
 	tip, err := r.chain.SuggestGasTipCap(ctx)
 	if err != nil {
-		return common.Hash{}, fmt.Errorf("suggest gas tip: %w", err)
+		return nil, nil, nil, fmt.Errorf("suggest gas tip: %w", err)
 	}
 	if tip == nil || tip.Sign() == 0 {
 		tip = big.NewInt(1)
@@ -591,23 +392,128 @@ func (r *Rail) send(ctx context.Context, data []byte, head *types.Header) (commo
 	if head.BaseFee != nil {
 		feeCap.Add(feeCap, new(big.Int).Mul(head.BaseFee, big.NewInt(2)))
 	}
+	return head, tip, feeCap, nil
+}
 
+// nextNonce assigns the account's next nonce, refusing if the chain shows a
+// transaction this rail has no record of. Nonces are the whole exactly-once
+// mechanism, so a surprise there is reported rather than worked around.
+func (r *Rail) nextNonce(ctx context.Context) (uint64, error) {
+	pending, err := r.chain.PendingNonceAt(ctx, r.address)
+	if err != nil {
+		return 0, fmt.Errorf("read nonce: %w", err)
+	}
+	finalized, err := r.chain.NonceAt(ctx, r.address, finalizedBlockArg)
+	if err != nil {
+		return 0, fmt.Errorf("read finalized nonce: %w", err)
+	}
+	if pending != finalized {
+		return 0, fmt.Errorf("%w: nonce %d is finalized but %d is already in use", ErrUnreconciled, finalized, pending)
+	}
+	return pending, nil
+}
+
+func (r *Rail) gasLimit(kind Kind) uint64 {
+	payment, swap := r.domain.Gas.limits()
+	if kind == KindRefill {
+		return swap
+	}
+	return payment
+}
+
+// target is where a recorded operation's transaction goes. A refill uses the
+// venue recorded with it: its permit names that venue as the spender, so
+// sending the same calldata to a venue configuration has since moved to would
+// authorise nothing and revert. The token cannot move the same way — it is half
+// the domain's identity, so a different one is a different store.
+func (r *Rail) target(in Intent) common.Address {
+	if in.Kind == KindRefill {
+		return in.To
+	}
+	return r.domain.Token
+}
+
+// simulate runs the exact call, under the exact gas bound the transaction will
+// carry, before anything is recorded. A call that cannot execute never consumes
+// a nonce, and a configured bound that is too small is caught here rather than
+// by an out-of-gas transaction that spends one.
+func (r *Rail) simulate(ctx context.Context, to common.Address, data []byte, gas uint64) error {
+	msg := ethereum.CallMsg{From: r.address, To: &to, Data: data, Gas: gas}
+	if _, err := r.chain.CallContract(ctx, msg, nil); err != nil {
+		return fmt.Errorf("simulate under a gas bound of %d: %w", gas, err)
+	}
+	return nil
+}
+
+// submit signs and broadcasts one attempt. The attempt is durable before it is
+// broadcast, so no transaction can exist on chain that this account holds no
+// record of.
+func (r *Rail) submit(ctx context.Context, in Intent, sub Submission) (common.Hash, error) {
+	to := r.target(in)
 	tx := types.NewTx(&types.DynamicFeeTx{
 		ChainID:   r.domain.ChainID,
-		Nonce:     nonce,
-		GasTipCap: tip,
-		GasFeeCap: feeCap,
-		Gas:       gas + gas/5,
+		Nonce:     in.Nonce,
+		GasTipCap: sub.Tip,
+		GasFeeCap: sub.FeeCap,
+		Gas:       sub.Gas,
 		To:        &to,
-		Data:      data,
+		Data:      in.Calldata,
 	})
 	signed, err := types.SignTx(tx, types.LatestSignerForChainID(r.domain.ChainID), r.key)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("sign transaction: %w", err)
 	}
-	if err := r.chain.SendTransaction(ctx, signed); err != nil {
+	// Signing is deterministic, so re-sending a recorded attempt reproduces it
+	// exactly and appends nothing.
+	if sub.TxHash != signed.Hash() {
+		sub.TxHash = signed.Hash()
+		if err := r.store.AppendSubmission(r.address, in.ID, sub); err != nil {
+			return common.Hash{}, err
+		}
+	}
+	if err := r.chain.SendTransaction(ctx, signed); err != nil && !alreadySettled(err) {
 		return common.Hash{}, fmt.Errorf("submit: %w", err)
 	}
-	// The hash is a hint for finding the event, never a status.
+	// The hash locates the transaction. It is never a status.
 	return signed.Hash(), nil
+}
+
+// alreadySettled reports whether the node is refusing a transaction because the
+// work is already done: it holds this very transaction, or the nonce has
+// already been spent. Neither is a failure — both mean the outcome is on the
+// chain rather than in this call, which is where status comes from anyway.
+func alreadySettled(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "already known") ||
+		strings.Contains(s, "known transaction") ||
+		strings.Contains(s, "nonce too low")
+}
+
+// bump raises a fee by the 12.5% a node requires before it will accept a
+// replacement.
+func bump(v *big.Int) *big.Int {
+	if v == nil {
+		return big.NewInt(1)
+	}
+	out := new(big.Int).Mul(v, big.NewInt(9))
+	out.Div(out, big.NewInt(8))
+	return out.Add(out, big.NewInt(1))
+}
+
+func maxInt(a, b *big.Int) *big.Int {
+	if orZero(a).Cmp(orZero(b)) >= 0 {
+		return orZero(a)
+	}
+	return orZero(b)
+}
+
+// refillID names a refill from the nonce it owns, so a refill interrupted
+// before it was sent is resumed rather than duplicated, and a caller's own
+// identifiers are never taken.
+func refillID(account common.Address, nonce uint64) ID {
+	var n [8]byte
+	for i := 0; i < 8; i++ {
+		n[7-i] = byte(nonce >> (8 * i))
+	}
+	return ID(crypto.Keccak256Hash([]byte("juice-rail/refill"), account.Bytes(), n[:]))
 }

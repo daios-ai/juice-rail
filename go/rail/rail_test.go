@@ -4,675 +4,896 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"errors"
+	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"reflect"
 )
 
-// fakeChain answers exactly what the rail asks a node, and records what it
-// submits. Nothing here reaches a network.
+// fakeChain is a node small enough to reason about: blocks are made by the
+// test, and nothing finalizes until the test says so.
 type fakeChain struct {
-	headTime      uint64
-	headNumber    uint64
-	finalizedTime uint64
-	finalizedNum  uint64
-	baseFee       *big.Int
+	mu sync.Mutex
 
-	railBalances  map[common.Address]*big.Int
-	tokenBalances map[common.Address]*big.Int
-	bindings      map[Ref]common.Hash
-	tokenDomain   common.Hash
-	noAuthState   bool
-
-	mu        sync.Mutex
-	logs      []types.Log
-	sent      []*types.Transaction
-	simulate  error
-	estimated uint64
-	nonce     uint64
+	domain     Domain
+	head       uint64
+	finalized  uint64
+	baseFee    *big.Int
+	tip        *big.Int
+	gas        map[common.Address]*big.Int
+	token      map[common.Address]*big.Int
+	minedNonce map[common.Address]uint64
+	finalNonce map[common.Address]uint64
+	nextNonce  map[common.Address]uint64
+	receipts   map[common.Hash]*types.Receipt
+	sent       map[common.Hash]*types.Transaction
+	order      []common.Hash
+	logs       []types.Log
+	// price is token base units per 1e18 of native currency.
+	price   *big.Int
+	sendErr error
+	callErr error
+	// receiptErr stands in for a node that cannot answer, as distinct from one
+	// answering "no such transaction".
+	receiptErr error
+	// gasFloor is what a call really needs; a bound below it runs out, exactly
+	// as the transaction would.
+	gasFloor uint64
+	filtered []string
+	// filterErrAfter makes the nth log query onwards fail, standing in for a
+	// node that gives up part way through a wide scan.
+	filterErrAfter int
 }
 
-func newFakeChain() *fakeChain {
+func newFakeChain(d Domain) *fakeChain {
 	return &fakeChain{
-		headTime:      1_000_000,
-		headNumber:    100,
-		finalizedTime: 1_000_000,
-		finalizedNum:  98,
-		baseFee:       big.NewInt(1_000_000_000),
-		railBalances:  map[common.Address]*big.Int{},
-		tokenBalances: map[common.Address]*big.Int{},
-		bindings:      map[Ref]common.Hash{},
-		tokenDomain:   common.HexToHash("0xd0d0"),
-		estimated:     120_000,
+		domain:     d,
+		head:       10,
+		finalized:  8,
+		baseFee:    big.NewInt(1_000_000_000),
+		tip:        big.NewInt(1),
+		gas:        map[common.Address]*big.Int{},
+		token:      map[common.Address]*big.Int{},
+		minedNonce: map[common.Address]uint64{},
+		finalNonce: map[common.Address]uint64{},
+		nextNonce:  map[common.Address]uint64{},
+		receipts:   map[common.Hash]*types.Receipt{},
+		sent:       map[common.Hash]*types.Transaction{},
+		price:      big.NewInt(3_000_000_000), // 3000 token units per unit of gas currency
 	}
 }
 
-func sel(sig string) string { return string(crypto.Keccak256([]byte(sig))[:4]) }
-
-var (
-	selBalanceOf   = sel("balanceOf(address)")
-	selOperations  = sel("operations(address,bytes32)")
-	selTokenDomain = sel("DOMAIN_SEPARATOR()")
-	selAuthState   = sel("authorizationState(address,bytes32)")
-)
-
-func (f *fakeChain) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
-	if number != nil && number.Cmp(finalizedBlockArg) == 0 {
-		return &types.Header{Number: new(big.Int).SetUint64(f.finalizedNum), Time: f.finalizedTime}, nil
+func (c *fakeChain) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := c.head
+	if number != nil && number.Sign() < 0 {
+		n = c.finalized
+	} else if number != nil {
+		n = number.Uint64()
 	}
-	return &types.Header{Number: new(big.Int).SetUint64(f.headNumber), Time: f.headTime, BaseFee: f.baseFee}, nil
+	return &types.Header{
+		Number:  new(big.Int).SetUint64(n),
+		Time:    1_700_000_000 + n*12,
+		BaseFee: new(big.Int).Set(c.baseFee),
+	}, nil
 }
 
-func (f *fakeChain) BlockNumber(context.Context) (uint64, error) { return f.headNumber, nil }
-
-func (f *fakeChain) FilterLogs(context.Context, ethereum.FilterQuery) ([]types.Log, error) {
-	return f.logs, nil
+func (c *fakeChain) BlockNumber(context.Context) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.head, nil
 }
 
-func (f *fakeChain) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {
-	if len(call.Data) < 4 {
-		return nil, errors.New("short call")
+func (c *fakeChain) BalanceAt(_ context.Context, account common.Address, _ *big.Int) (*big.Int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return orZero(c.gas[account]), nil
+}
+
+func (c *fakeChain) NonceAt(_ context.Context, account common.Address, block *big.Int) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if block == nil {
+		return c.nextNonce[account], nil
 	}
-	switch string(call.Data[:4]) {
-	case selBalanceOf:
-		who := common.BytesToAddress(call.Data[4:36])
-		set := f.railBalances
-		if call.To != nil && *call.To == testDomain().Token {
-			set = f.tokenBalances
-		}
-		v, ok := set[who]
-		if !ok {
-			v = new(big.Int)
-		}
-		return common.LeftPadBytes(v.Bytes(), 32), nil
-	case selOperations:
-		ref := Ref{
-			Account: common.BytesToAddress(call.Data[4:36]),
-			ID:      ID(common.BytesToHash(call.Data[36:68])),
-		}
-		return f.bindings[ref].Bytes(), nil
-	case selTokenDomain:
-		return f.tokenDomain.Bytes(), nil
-	case selAuthState:
-		if f.noAuthState {
-			return nil, errors.New("execution reverted")
-		}
-		return make([]byte, 32), nil
-	default:
-		// A money call: this is the relayer's simulation.
-		return nil, f.simulate
+	// A nonce is only spent, as far as anyone may rely on it, once the block
+	// that spent it has finalized.
+	return c.finalNonce[account], nil
+}
+
+func (c *fakeChain) PendingNonceAt(_ context.Context, account common.Address) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nextNonce[account], nil
+}
+
+func (c *fakeChain) SuggestGasTipCap(context.Context) (*big.Int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return new(big.Int).Set(c.tip), nil
+}
+
+func (c *fakeChain) SendTransaction(_ context.Context, tx *types.Transaction) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sendErr != nil {
+		return c.sendErr
 	}
-}
-
-// PendingNonceAt counts what this fake has already accepted, the way a node
-// counts its pending pool. Two relays that select a nonce without serialising
-// therefore collide, exactly as they would on a real chain.
-func (f *fakeChain) PendingNonceAt(context.Context, common.Address) (uint64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.nonce + uint64(len(f.sent)), nil
-}
-
-func (f *fakeChain) SuggestGasTipCap(context.Context) (*big.Int, error) { return big.NewInt(0), nil }
-
-func (f *fakeChain) EstimateGas(context.Context, ethereum.CallMsg) (uint64, error) {
-	return f.estimated, nil
-}
-
-func (f *fakeChain) SendTransaction(_ context.Context, tx *types.Transaction) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.sent = append(f.sent, tx)
+	from, err := types.Sender(types.LatestSignerForChainID(c.domain.ChainID), tx)
+	if err != nil {
+		return err
+	}
+	if _, seen := c.sent[tx.Hash()]; seen {
+		return errors.New("already known")
+	}
+	c.sent[tx.Hash()] = tx
+	c.order = append(c.order, tx.Hash())
+	if tx.Nonce() >= c.nextNonce[from] {
+		c.nextNonce[from] = tx.Nonce() + 1
+	}
 	return nil
 }
 
-func (f *fakeChain) submitted() []*types.Transaction {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]*types.Transaction(nil), f.sent...)
+func (c *fakeChain) TransactionReceipt(_ context.Context, hash common.Hash) (*types.Receipt, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.receiptErr != nil {
+		return nil, c.receiptErr
+	}
+	r, ok := c.receipts[hash]
+	if !ok {
+		return nil, ethereum.NotFound
+	}
+	return r, nil
+}
+
+func (c *fakeChain) FilterLogs(_ context.Context, q ethereum.FilterQuery) ([]types.Log, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.filtered = append(c.filtered, fmt.Sprintf("%s-%s", q.FromBlock, q.ToBlock))
+	if c.filterErrAfter > 0 && len(c.filtered) > c.filterErrAfter {
+		return nil, errors.New("query returned more than 10000 results")
+	}
+	var out []types.Log
+	for _, lg := range c.logs {
+		if q.FromBlock != nil && lg.BlockNumber < q.FromBlock.Uint64() {
+			continue
+		}
+		if q.ToBlock != nil && lg.BlockNumber > q.ToBlock.Uint64() {
+			continue
+		}
+		if len(q.Topics) > 2 && len(q.Topics[2]) > 0 && lg.Topics[2] != q.Topics[2][0] {
+			continue
+		}
+		out = append(out, lg)
+	}
+	return out, nil
+}
+
+// CallContract answers the reads the rail makes, decoding the real calldata so
+// the encoding is under test too.
+func (c *fakeChain) CallContract(_ context.Context, msg ethereum.CallMsg, _ *big.Int) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.callErr != nil {
+		return nil, c.callErr
+	}
+	if msg.To == nil || len(msg.Data) < 4 {
+		return nil, errors.New("malformed call")
+	}
+	if msg.Gas != 0 && msg.Gas < c.gasFloor {
+		return nil, errors.New("execution reverted: out of gas")
+	}
+	selector := string(msg.Data[:4])
+	switch *msg.To {
+	case c.domain.Token:
+		switch selector {
+		case string(tokenABI.Methods["balanceOf"].ID):
+			args, err := tokenABI.Methods["balanceOf"].Inputs.Unpack(msg.Data[4:])
+			if err != nil {
+				return nil, err
+			}
+			return common.LeftPadBytes(orZero(c.token[args[0].(common.Address)]).Bytes(), 32), nil
+		case string(tokenABI.Methods["nonces"].ID):
+			return common.LeftPadBytes(nil, 32), nil
+		case string(tokenABI.Methods["DOMAIN_SEPARATOR"].ID):
+			return crypto.Keccak256([]byte("token domain")), nil
+		case string(tokenABI.Methods["transfer"].ID):
+			args, err := tokenABI.Methods["transfer"].Inputs.Unpack(msg.Data[4:])
+			if err != nil {
+				return nil, err
+			}
+			if orZero(c.token[msg.From]).Cmp(args[1].(*big.Int)) < 0 {
+				return nil, errors.New("execution reverted: transfer amount exceeds balance")
+			}
+			return common.LeftPadBytes([]byte{1}, 32), nil
+		}
+	case c.domain.Venue.Quoter:
+		if selector == string(quoterABI.Methods["quoteExactOutputSingle"].ID) {
+			args, err := quoterABI.Methods["quoteExactOutputSingle"].Inputs.Unpack(msg.Data[4:])
+			if err != nil {
+				return nil, err
+			}
+			params := args[0].(struct {
+				TokenIn           common.Address `json:"tokenIn"`
+				TokenOut          common.Address `json:"tokenOut"`
+				Amount            *big.Int       `json:"amount"`
+				Fee               *big.Int       `json:"fee"`
+				SqrtPriceLimitX96 *big.Int       `json:"sqrtPriceLimitX96"`
+			})
+			return quoterABI.Methods["quoteExactOutputSingle"].Outputs.Pack(
+				c.quote(params.Amount), new(big.Int), uint32(0), new(big.Int))
+		}
+	case c.domain.Venue.Router:
+		// A refill simulates cleanly as long as the account can pay for it.
+		return nil, nil
+	}
+	return nil, fmt.Errorf("unexpected call to %s", msg.To)
+}
+
+func (c *fakeChain) quote(amountOut *big.Int) *big.Int {
+	q := new(big.Int).Mul(amountOut, c.price)
+	q.Add(q, big.NewInt(1e18-1))
+	return q.Div(q, big.NewInt(1e18))
+}
+
+// --- test-side chain control ---
+
+// include mines the transaction into a new block.
+func (c *fakeChain) include(t *testing.T, hash common.Hash, success bool, logs ...*types.Log) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tx, ok := c.sent[hash]
+	if !ok {
+		t.Fatalf("no such transaction %s", hash)
+	}
+	from, err := types.Sender(types.LatestSignerForChainID(c.domain.ChainID), tx)
+	if err != nil {
+		t.Fatalf("sender: %v", err)
+	}
+	c.head++
+	status := types.ReceiptStatusFailed
+	if success {
+		status = types.ReceiptStatusSuccessful
+	}
+	c.receipts[hash] = &types.Receipt{
+		Status: status, TxHash: hash, BlockNumber: new(big.Int).SetUint64(c.head), Logs: logs,
+	}
+	if tx.Nonce() >= c.minedNonce[from] {
+		c.minedNonce[from] = tx.Nonce() + 1
+	}
+}
+
+func (c *fakeChain) finalize() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.finalized = c.head
+	for account, nonce := range c.minedNonce {
+		c.finalNonce[account] = nonce
+	}
+}
+
+// spendNonce mines a transaction this account never recorded.
+func (c *fakeChain) spendNonce(account common.Address, upTo uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.head++
+	c.minedNonce[account] = upTo
+	if upTo > c.nextNonce[account] {
+		c.nextNonce[account] = upTo
+	}
+}
+
+func (c *fakeChain) addTransferLog(block uint64, index uint, token, from, to common.Address, amount *big.Int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.logs = append(c.logs, types.Log{
+		Address: token,
+		Topics: []common.Hash{
+			topicTransfer,
+			common.BytesToHash(from.Bytes()),
+			common.BytesToHash(to.Bytes()),
+		},
+		Data:        common.LeftPadBytes(amount.Bytes(), 32),
+		BlockNumber: block,
+		TxHash:      common.BigToHash(new(big.Int).SetUint64(block*100 + uint64(index))),
+		Index:       index,
+	})
 }
 
 // --- fixtures ---
 
-func testKey(t *testing.T, n byte) *ecdsa.PrivateKey {
-	t.Helper()
-	b := make([]byte, 32)
-	b[31] = n
-	key, err := crypto.ToECDSA(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return key
-}
+var (
+	bob      = common.HexToAddress("0x2222222222222222222222222222222222222222")
+	exchange = common.HexToAddress("0x3333333333333333333333333333333333333333")
+)
 
 func testDomain() Domain {
 	return Domain{
 		Name:     "test",
 		ChainID:  big.NewInt(31337),
-		Rail:     common.HexToAddress("0x00000000000000000000000000000000000000A1"),
-		Token:    common.HexToAddress("0x00000000000000000000000000000000000000B2"),
+		Token:    common.HexToAddress("0x00000000000000000000000000000000000000a0"),
 		Finality: "finalized",
+		Venue: Venue{
+			Router:  common.HexToAddress("0x00000000000000000000000000000000000000b0"),
+			Quoter:  common.HexToAddress("0x00000000000000000000000000000000000000c0"),
+			WETH:    common.HexToAddress("0x00000000000000000000000000000000000000d0"),
+			FeeTier: 500,
+		},
+		Gas: GasPolicy{
+			Min:         big.NewInt(20_000_000_000_000_000), // 0.02
+			Max:         big.NewInt(50_000_000_000_000_000), // 0.05
+			SlippageBps: 50,
+			FeeBound:    big.NewInt(10_000_000_000_000_000), // 0.01
+			PaymentGas:  120_000,
+			SwapGas:     400_000,
+		},
 	}
 }
 
-func newTestRail(t *testing.T) (*Rail, *memStore, *fakeChain) {
+func newTestRail(t *testing.T) (*Rail, *fakeChain, *memStore) {
 	t.Helper()
-	store, chain := newMemStore(), newFakeChain()
-	r, err := New(testDomain(), store, chain, testKey(t, 1))
+	d := testDomain()
+	chain := newFakeChain(d)
+	store := newMemStore()
+	key, err := crypto.HexToECDSA("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("key: %v", err)
 	}
-	return r, store, chain
+	r, err := New(d, store, chain, key)
+	if err != nil {
+		t.Fatalf("new rail: %v", err)
+	}
+	// A funded, operational account: money and a full reserve.
+	chain.token[r.Account()] = big.NewInt(1_000_000_000) // 1000 units
+	chain.gas[r.Account()] = big.NewInt(100_000_000_000_000_000)
+	return r, chain, store
 }
 
-// --- construction ---
+func id(n byte) ID { return ID{n} }
+
+func mustPrepare(t *testing.T, r *Rail, i ID, to common.Address, amount int64) {
+	t.Helper()
+	if err := r.Prepare(context.Background(), i, KindTransfer, to, big.NewInt(amount)); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+}
+
+func transferLogOf(d Domain, from, to common.Address, amount *big.Int) *types.Log {
+	return &types.Log{
+		Address: d.Token,
+		Topics: []common.Hash{
+			topicTransfer,
+			common.BytesToHash(from.Bytes()),
+			common.BytesToHash(to.Bytes()),
+		},
+		Data: common.LeftPadBytes(amount.Bytes(), 32),
+	}
+}
+
+// --- tests ---
+
+func TestPreparingTwiceRecordsOneOperation(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+
+	if _, ok, _ := store.IntentByNonce(r.Account(), 1); ok {
+		t.Fatal("a repeated command took a second nonce")
+	}
+	// Sending twice reproduces the same transaction rather than making another.
+	first, err := r.Send(ctx, id(1))
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	second, err := r.Send(ctx, id(1))
+	if err != nil {
+		t.Fatalf("send again: %v", err)
+	}
+	if first != second {
+		t.Fatalf("resending produced %s then %s", first, second)
+	}
+	subs, _ := store.Submissions(r.Account(), id(1))
+	if len(subs) != 1 {
+		t.Fatalf("%d attempts recorded, want 1", len(subs))
+	}
+	if len(chain.order) != 1 {
+		t.Fatalf("%d transactions broadcast, want 1", len(chain.order))
+	}
+}
+
+func TestDifferentTermsUnderOneIdentifierAreRefused(t *testing.T) {
+	ctx := context.Background()
+	r, _, _ := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+	err := r.Prepare(ctx, id(1), KindTransfer, exchange, big.NewInt(10_000_000))
+	if !errors.Is(err, ErrIntentConflict) {
+		t.Fatalf("reused identifier: %v, want a conflict", err)
+	}
+}
+
+func TestOneOperationAtATime(t *testing.T) {
+	ctx := context.Background()
+	r, _, _ := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+	if _, err := r.Send(ctx, id(1)); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	err := r.Prepare(ctx, id(2), KindTransfer, bob, big.NewInt(1_000_000))
+	if !errors.Is(err, ErrInFlight) {
+		t.Fatalf("second operation while one is unresolved: %v, want in flight", err)
+	}
+}
+
+func TestShortOfMoneySignsNothing(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	chain.token[r.Account()] = big.NewInt(5)
+
+	err := r.Prepare(ctx, id(1), KindTransfer, bob, big.NewInt(10_000_000))
+	if !errors.Is(err, ErrInsufficientToken) {
+		t.Fatalf("paying more than it holds: %v, want a shortage", err)
+	}
+	if _, ok, _ := store.Intent(r.Account(), id(1)); ok {
+		t.Fatal("a blocked payment left a record behind")
+	}
+	if len(chain.order) != 0 {
+		t.Fatal("a blocked payment broadcast something")
+	}
+}
+
+func TestLowReserveAsksForARefillAndRecordsNothing(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	chain.gas[r.Account()] = big.NewInt(10_000_000_000_000_000) // below the minimum
+
+	err := r.Prepare(ctx, id(1), KindTransfer, bob, big.NewInt(10_000_000))
+	if !errors.Is(err, ErrNeedRefill) {
+		t.Fatalf("payment on a low reserve: %v, want a refill first", err)
+	}
+	if _, ok, _ := store.Intent(r.Account(), id(1)); ok {
+		t.Fatal("a payment needing a refill left a record behind")
+	}
+}
+
+func TestRefillBuysGasWithTheAccountsOwnMoney(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	chain.gas[r.Account()] = big.NewInt(10_000_000_000_000_000)
+
+	refill, hash, err := r.Refill(ctx, big.NewInt(10_000_000))
+	if err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	in, ok, _ := store.Intent(r.Account(), refill)
+	if !ok {
+		t.Fatal("the refill was not recorded before it was sent")
+	}
+	if in.Kind != KindRefill || in.To != r.Domain().Venue.Router {
+		t.Fatalf("refill went to %s as %s", in.To, in.Kind)
+	}
+	// It buys back up to the maximum, counting its own gas as spent.
+	if in.Delta.Sign() <= 0 || in.Delta.Cmp(r.Domain().Gas.Max) > 0 {
+		t.Fatalf("refill buys %s, outside (0, %s]", in.Delta, r.Domain().Gas.Max)
+	}
+	// The input bound is the quote plus the slippage margin, and no more.
+	quote := chain.quote(in.Delta)
+	if want := withSlippage(quote, r.Domain().Gas.SlippageBps); in.Amount.Cmp(want) != 0 {
+		t.Fatalf("input bound is %s, want %s", in.Amount, want)
+	}
+	if hash == (common.Hash{}) {
+		t.Fatal("the refill was not broadcast")
+	}
+	// A refill takes the caller's nonce but never the caller's identifier.
+	if refill == id(1) {
+		t.Fatal("the refill claimed a caller identifier")
+	}
+}
+
+func TestRefillIsRefusedWhenTheReserveIsFull(t *testing.T) {
+	r, _, _ := newTestRail(t)
+	if _, _, err := r.Refill(context.Background(), big.NewInt(0)); !errors.Is(err, ErrNoRefillNeeded) {
+		t.Fatalf("refill on a full reserve: %v, want a refusal", err)
+	}
+}
+
+func TestRefillWillNotSpendThePaymentItEnables(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	chain.gas[r.Account()] = big.NewInt(10_000_000_000_000_000)
+	// Enough for the payment, not enough for the payment and the gas it needs.
+	chain.token[r.Account()] = big.NewInt(60_000_000)
+
+	_, _, err := r.Refill(ctx, big.NewInt(59_000_000))
+	if !errors.Is(err, ErrInsufficientToken) {
+		t.Fatalf("refill that would eat the payment: %v, want a shortage", err)
+	}
+	if pending, _ := store.Pending(r.Account()); len(pending) != 0 {
+		t.Fatal("a blocked refill left a record behind")
+	}
+	if len(chain.order) != 0 {
+		t.Fatal("a blocked refill broadcast something")
+	}
+}
+
+func TestRefillWaitsWhenGasCostsMoreThanTheBound(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	chain.gas[r.Account()] = big.NewInt(10_000_000_000_000_000)
+	chain.baseFee = big.NewInt(1_000_000_000_000) // a very expensive chain
+
+	_, _, err := r.Refill(ctx, big.NewInt(0))
+	if !errors.Is(err, ErrFeesAboveBound) {
+		t.Fatalf("refill above the fee bound: %v, want a wait", err)
+	}
+}
+
+func TestReserveTooLowToRefillIsReportedNotHidden(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	chain.gas[r.Account()] = big.NewInt(1) // cannot pay for anything
+
+	_, _, err := r.Refill(ctx, big.NewInt(0))
+	if !errors.Is(err, ErrInsufficientGas) {
+		t.Fatalf("refill with no gas at all: %v, want an external top-up", err)
+	}
+}
+
+func TestRetryKeepsTheNonceAndRaisesOnlyFees(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+	if _, err := r.Send(ctx, id(1)); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if _, err := r.Retry(ctx, id(1)); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	subs, _ := store.Submissions(r.Account(), id(1))
+	if len(subs) != 2 {
+		t.Fatalf("%d attempts recorded, want 2", len(subs))
+	}
+	if subs[1].FeeCap.Cmp(subs[0].FeeCap) <= 0 || subs[1].Tip.Cmp(subs[0].Tip) <= 0 {
+		t.Fatalf("a retry did not raise its fees: %s then %s", subs[0].FeeCap, subs[1].FeeCap)
+	}
+	first, second := chain.sent[subs[0].TxHash], chain.sent[subs[1].TxHash]
+	if first.Nonce() != second.Nonce() {
+		t.Fatalf("a retry moved to nonce %d from %d", second.Nonce(), first.Nonce())
+	}
+	if string(first.Data()) != string(second.Data()) || *first.To() != *second.To() {
+		t.Fatal("a retry changed the operation, not only its fees")
+	}
+}
+
+func TestRestartResumesAnUnsentIntent(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+
+	// A crash between recording and sending: the intent exists, nothing was
+	// broadcast. A fresh instance over the same records finishes the job.
+	restarted, err := New(r.Domain(), store, chain, testKey(t))
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	hash, err := restarted.Send(ctx, id(1))
+	if err != nil {
+		t.Fatalf("send after restart: %v", err)
+	}
+	in, _, _ := store.Intent(r.Account(), id(1))
+	if chain.sent[hash].Nonce() != in.Nonce {
+		t.Fatalf("resumed at nonce %d, recorded %d", chain.sent[hash].Nonce(), in.Nonce)
+	}
+	if len(chain.order) != 1 {
+		t.Fatalf("%d transactions broadcast, want 1", len(chain.order))
+	}
+}
+
+func TestBalancesReportMoneyAndReserveSeparately(t *testing.T) {
+	r, chain, _ := newTestRail(t)
+	token, gas, err := r.Balances(context.Background())
+	if err != nil {
+		t.Fatalf("balances: %v", err)
+	}
+	if token.Cmp(chain.token[r.Account()]) != 0 || gas.Cmp(chain.gas[r.Account()]) != 0 {
+		t.Fatalf("balances are %s and %s", token, gas)
+	}
+}
 
 func TestNewRefusesAnIncompleteDomain(t *testing.T) {
-	store, chain := newMemStore(), newFakeChain()
-	key := testKey(t, 1)
-
-	bad := testDomain()
-	bad.Finality = "12-confirmations"
-	if _, err := New(bad, store, chain, key); err == nil {
-		t.Fatal("a confirmation-count policy must be refused: confirmed may never revert")
-	}
-	bad = testDomain()
-	bad.Token = common.Address{}
-	if _, err := New(bad, store, chain, key); err == nil {
-		t.Fatal("a domain without a token must be refused")
-	}
-	if _, err := New(testDomain(), nil, chain, key); err == nil {
-		t.Fatal("a rail without a store must be refused")
-	}
-}
-
-func TestAccountIsTheKeysOwnAddress(t *testing.T) {
-	r, _, _ := newTestRail(t)
-	if want := crypto.PubkeyToAddress(testKey(t, 1).PublicKey); r.Account() != want {
-		t.Fatalf("account %s, want %s", r.Account(), want)
-	}
-}
-
-// --- intents ---
-
-func TestPrepareRefusesAnIntentDebitingAnotherAccount(t *testing.T) {
-	r, _, _ := newTestRail(t)
-	err := r.Prepare(context.Background(), testID(1),
-		testTerms(KindTransfer, addr(9), addr(2), 10))
-	if err == nil {
-		t.Fatal("a rail must not record an intent that debits someone else")
-	}
-}
-
-func TestSignIsDurableBeforeItReturns(t *testing.T) {
-	ctx := context.Background()
-	r, store, _ := newTestRail(t)
-	if err := r.PrepareTransfer(ctx, testID(1), addr(2), big.NewInt(10)); err != nil {
-		t.Fatal(err)
-	}
-	v, err := r.Sign(ctx, testID(1), big.NewInt(1), addr(3), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stored, _ := store.Variants(r.ref(testID(1)))
-	if len(stored) != 1 {
-		t.Fatalf("the variant must be durable before it is returned, got %d records", len(stored))
-	}
-	if stored[0].ValidBefore != v.ValidBefore || stored[0].Relayer != v.Relayer {
-		t.Fatalf("stored %+v, returned %+v", stored[0], v)
-	}
-}
-
-func TestSignReusesALiveVariantAndReplacesADeadOne(t *testing.T) {
-	ctx := context.Background()
-	r, store, chain := newTestRail(t)
-	id := testID(1)
-	if err := r.PrepareTransfer(ctx, id, addr(2), big.NewInt(10)); err != nil {
-		t.Fatal(err)
-	}
-
-	first, err := r.Sign(ctx, id, big.NewInt(1), addr(3), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	again, err := r.Sign(ctx, id, big.NewInt(1), addr(3), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if again.ValidBefore != first.ValidBefore {
-		t.Fatal("a live variant with the same relayer and fee must be reused")
-	}
-
-	// A different relayer is a different variant, signed at once: replacing an
-	// unresponsive relayer never waits.
-	other, err := r.Sign(ctx, id, big.NewInt(2), addr(4), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if other.Relayer != addr(4) || other.Fee.Int64() != 2 {
-		t.Fatalf("wanted a fresh variant, got %+v", other)
-	}
-	if stored, _ := store.Variants(r.ref(id)); len(stored) != 2 {
-		t.Fatalf("want 2 recorded variants, got %d", len(stored))
-	}
-
-	// Once the deadline passes, the same request signs a fresh variant.
-	chain.headTime = first.ValidBefore + 1
-	fresh, err := r.Sign(ctx, id, big.NewInt(1), addr(3), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fresh.ValidBefore <= first.ValidBefore {
-		t.Fatal("a dead variant must not be reused")
-	}
-}
-
-func TestSignRefusesWithoutAnIntentOrAfterAbandonment(t *testing.T) {
-	ctx := context.Background()
-	r, _, _ := newTestRail(t)
-	if _, err := r.Sign(ctx, testID(7), nil, addr(3), time.Hour); !errors.Is(err, ErrNoIntent) {
-		t.Fatalf("want ErrNoIntent, got %v", err)
-	}
-	if err := r.PrepareTransfer(ctx, testID(1), addr(2), big.NewInt(10)); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Abandon(ctx, testID(1)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Sign(ctx, testID(1), nil, addr(3), time.Hour); !errors.Is(err, ErrAbandoned) {
-		t.Fatalf("want ErrAbandoned, got %v", err)
-	}
-}
-
-func TestSignedVariantsRecoverToTheAccount(t *testing.T) {
-	ctx := context.Background()
-	r, _, _ := newTestRail(t)
-
+	store, chain := newMemStore(), newFakeChain(testDomain())
 	for _, tc := range []struct {
-		name    string
-		prepare func() error
+		name  string
+		spoil func(*Domain)
 	}{
-		{"transfer", func() error { return r.PrepareTransfer(ctx, testID(1), addr(2), big.NewInt(10)) }},
-		{"withdraw", func() error { return r.PrepareWithdrawal(ctx, testID(2), addr(5), big.NewInt(10)) }},
-		{"deposit", func() error { return r.PrepareDeposit(ctx, testID(3), addr(6), big.NewInt(10)) }},
+		{"no finality", func(d *Domain) { d.Finality = "12 confirmations" }},
+		{"no token", func(d *Domain) { d.Token = common.Address{} }},
+		{"no venue", func(d *Domain) { d.Venue.Router = common.Address{} }},
+		{"reserve below its own fee bound", func(d *Domain) { d.Gas.Min = big.NewInt(1) }},
+		{"maximum below minimum", func(d *Domain) { d.Gas.Max = big.NewInt(1) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.prepare(); err != nil {
-				t.Fatal(err)
-			}
-			id := testID(map[string]byte{"transfer": 1, "withdraw": 2, "deposit": 3}[tc.name])
-			v, err := r.Sign(ctx, id, big.NewInt(3), addr(4), time.Hour)
-			if err != nil {
-				t.Fatal(err)
-			}
-			h, err := TermsHash(v)
-			if err != nil {
-				t.Fatal(err)
-			}
-			signer, err := RecoverSigner(digest(DomainSeparator(testDomain().ChainID, testDomain().Rail), h), v.TermsSig)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if signer != r.Account() {
-				t.Fatalf("terms recover to %s, want %s", signer, r.Account())
-			}
-			if tc.name != "deposit" {
-				if len(v.AuthSig) != 0 {
-					t.Fatal("only a deposit carries a token authorisation")
-				}
-				return
-			}
-			// The token authorisation is for amount + fee, payable to the rail
-			// only, and its nonce is the terms hash.
-			d, err := authDigest(common.HexToHash("0xd0d0"), v.Account, testDomain().Rail, v.Total(), v.ValidBefore, h)
-			if err != nil {
-				t.Fatal(err)
-			}
-			authSigner, err := RecoverSigner(d, v.AuthSig)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if authSigner != r.Account() {
-				t.Fatalf("authorisation recovers to %s, want %s", authSigner, r.Account())
+			d := testDomain()
+			tc.spoil(&d)
+			if _, err := New(d, store, chain, testKey(t)); err == nil {
+				t.Fatal("an unsafe domain was accepted")
 			}
 		})
 	}
 }
 
-// --- relaying ---
-
-// signedFor builds a variant signed by one rail and naming another as relayer.
-func signedFor(t *testing.T, signer *Rail, kind Kind, party common.Address, amount, fee int64, relayer common.Address) Variant {
+func testKey(t *testing.T) *ecdsa.PrivateKey {
 	t.Helper()
-	ctx := context.Background()
-	id := testID(1)
-	if err := signer.Prepare(ctx, id, Terms{
-		Kind: kind, Account: signer.Account(), Party: party, Amount: big.NewInt(amount),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	v, err := signer.Sign(ctx, id, big.NewInt(fee), relayer, time.Hour)
+	key, err := crypto.HexToECDSA("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("key: %v", err)
 	}
-	return v
+	return key
 }
 
-func TestRelayRefusesAVariantNamingAnotherRelayer(t *testing.T) {
-	r, _, _ := newTestRail(t)
-	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, addr(9))
-	if _, err := r.Relay(context.Background(), v); !errors.Is(err, ErrNotRelayer) {
-		t.Fatalf("want ErrNotRelayer, got %v", err)
-	}
-}
-
-func TestRelayRefusesATamperedVariant(t *testing.T) {
-	r, _, _ := newTestRail(t)
-	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
-	v.Amount = big.NewInt(11) // the signature no longer covers the terms
-	if _, err := r.Relay(context.Background(), v); !errors.Is(err, ErrBadSignature) {
-		t.Fatalf("want ErrBadSignature, got %v", err)
-	}
-}
-
-func TestRelayRefusesADepositAuthorisedByAnotherAccount(t *testing.T) {
-	r, _, chain := newTestRail(t)
-	v := signedFor(t, r, KindDeposit, addr(2), 10, 1, r.Account())
-
-	// A well-formed authorisation for exactly these terms, signed by someone
-	// else: the tokens are not the payer's to move.
-	h, err := TermsHash(v)
-	if err != nil {
-		t.Fatal(err)
-	}
-	d, err := authDigest(chain.tokenDomain, v.Account, testDomain().Rail, v.Total(), v.ValidBefore, h)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.AuthSig, err = signDigest(testKey(t, 2), d); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Relay(context.Background(), v); !errors.Is(err, ErrBadSignature) {
-		t.Fatalf("want ErrBadSignature, got %v", err)
-	}
-}
-
-func TestRelayTellsExecutedApartFromConflicting(t *testing.T) {
-	ctx := context.Background()
-	r, _, chain := newTestRail(t)
-	chain.railBalances[r.Account()] = big.NewInt(1000)
-	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
-	h, err := TermsHash(v)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	chain.bindings[v.Ref()] = h
-	if _, err := r.Relay(ctx, v); !errors.Is(err, ErrExecuted) {
-		t.Fatalf("want ErrExecuted, got %v", err)
-	}
-	if len(chain.submitted()) != 0 {
-		t.Fatal("an executed operation must cost no gas")
-	}
-
-	chain.bindings[v.Ref()] = common.HexToHash("0xbeef")
-	if _, err := r.Relay(ctx, v); !errors.Is(err, ErrConflict) {
-		t.Fatalf("want ErrConflict, got %v", err)
-	}
-	if len(chain.submitted()) != 0 {
-		t.Fatal("a conflicting binding must cost no gas")
-	}
-}
-
-func TestRelayRefusesAnExpiredVariant(t *testing.T) {
-	ctx := context.Background()
-	r, _, chain := newTestRail(t)
-	chain.railBalances[r.Account()] = big.NewInt(1000)
-	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
-
-	chain.headTime = v.ValidBefore // the contract's test is strict: >= is dead
-	if _, err := r.Relay(ctx, v); !errors.Is(err, ErrExpired) {
-		t.Fatalf("want ErrExpired, got %v", err)
-	}
-}
-
-func TestRelayRefusesAnUnfundedOperation(t *testing.T) {
-	ctx := context.Background()
-	r, _, chain := newTestRail(t)
-	chain.railBalances[r.Account()] = big.NewInt(10) // the fee tips it over
-	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
-	if _, err := r.Relay(ctx, v); err == nil {
-		t.Fatal("the balance must cover amount + fee")
-	}
-	if len(chain.submitted()) != 0 {
-		t.Fatal("an unfunded operation must cost no gas")
-	}
-}
-
-func TestRelaySimulatesBeforeSpendingGas(t *testing.T) {
-	ctx := context.Background()
-	r, _, chain := newTestRail(t)
-	chain.railBalances[r.Account()] = big.NewInt(1000)
-	chain.simulate = errors.New("execution reverted")
-	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
-
-	if _, err := r.Relay(ctx, v); err == nil {
-		t.Fatal("a failing simulation must stop the submission")
-	}
-	if len(chain.submitted()) != 0 {
-		t.Fatal("gas was spent on an operation that cannot execute")
-	}
-}
-
-func TestRelaySubmitsTheExactSignedCall(t *testing.T) {
-	ctx := context.Background()
-	r, _, chain := newTestRail(t)
-	chain.railBalances[r.Account()] = big.NewInt(1000)
-	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
-
-	hash, err := r.Relay(ctx, v)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(chain.submitted()) != 1 {
-		t.Fatalf("want 1 transaction, got %d", len(chain.submitted()))
-	}
-	tx := chain.submitted()[0]
-	if tx.Hash() != hash {
-		t.Fatal("the reported hash is not the transaction's")
-	}
-	if *tx.To() != testDomain().Rail {
-		t.Fatalf("submitted to %s, want the rail", tx.To())
-	}
-	method, err := railABI.MethodById(tx.Data()[:4])
-	if err != nil || method.Name != "transfer" {
-		t.Fatalf("wrong method %v (%v)", method, err)
-	}
-	args, err := method.Inputs.Unpack(tx.Data()[4:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	terms := reflect.ValueOf(args[0])
-	field := func(name string) any { return terms.FieldByName(name).Interface() }
-	if field("Account") != v.Account || field("Party") != v.Party ||
-		field("Relayer") != v.Relayer ||
-		field("Amount").(*big.Int).Cmp(v.Amount) != 0 ||
-		field("Fee").(*big.Int).Cmp(v.Fee) != 0 ||
-		field("ValidBefore").(*big.Int).Uint64() != v.ValidBefore ||
-		field("Id").([32]byte) != [32]byte(v.ID) {
-		t.Fatalf("the submitted terms are not the signed terms: %+v", args[0])
-	}
-	if got := args[1].([]byte); string(got) != string(v.TermsSig) {
-		t.Fatal("the submitted signature is not the signed one")
-	}
-	if tx.Gas() <= chain.estimated {
-		t.Fatal("the gas limit must leave room above the estimate")
-	}
-	if tx.GasTipCap().Sign() == 0 {
-		t.Fatal("a zero tip can stall on a busy chain")
-	}
-}
-
-func TestSubmitSignsAndRelaysForItself(t *testing.T) {
-	ctx := context.Background()
-	r, _, chain := newTestRail(t)
-	chain.railBalances[r.Account()] = big.NewInt(1000)
-	if err := r.PrepareTransfer(ctx, testID(1), addr(2), big.NewInt(10)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Submit(ctx, testID(1), big.NewInt(1), time.Hour); err != nil {
-		t.Fatal(err)
-	}
-	if len(chain.submitted()) != 1 {
-		t.Fatalf("want 1 transaction, got %d", len(chain.submitted()))
-	}
-	variants, _ := r.Variants(testID(1))
-	if len(variants) != 1 || variants[0].Relayer != r.Account() {
-		t.Fatalf("submit must name itself as relayer: %+v", variants)
-	}
-}
-
-// The selectors are the contract's, computed from the canonical signatures.
-func TestCallDataSelectorsMatchTheContract(t *testing.T) {
-	const tuple = "(bytes32,address,address,uint256,uint256,address,uint256)"
-	for name, signature := range map[string]string{
-		"deposit":  "deposit(" + tuple + ",bytes,bytes)",
-		"transfer": "transfer(" + tuple + ",bytes)",
-		"withdraw": "withdraw(" + tuple + ",bytes)",
+func TestANodeThatAlreadyHasTheWorkIsNotAFailure(t *testing.T) {
+	for _, tc := range []struct {
+		message string
+		benign  bool
+	}{
+		{"already known", true},
+		{"known transaction: 0xabc", true},
+		{"nonce too low", true},
+		{"replacement transaction underpriced", false},
+		{"insufficient funds for gas * price + value", false},
 	} {
-		want := crypto.Keccak256([]byte(signature))[:4]
-		method, ok := railABI.Methods[name]
-		if !ok {
-			t.Fatalf("no method %s", name)
-		}
-		if string(method.ID) != string(want) {
-			t.Fatalf("%s selector %x, want %x (signature %s)", name, method.ID, want, signature)
+		if got := alreadySettled(errors.New(tc.message)); got != tc.benign {
+			t.Fatalf("%q treated as benign=%v", tc.message, got)
 		}
 	}
 }
 
-func TestAcceptRefusesAForeignDomain(t *testing.T) {
-	r, _, _ := newTestRail(t)
-	v := signedFor(t, r, KindTransfer, addr(2), 10, 1, r.Account())
-
-	other := testDomain()
-	other.ChainID = big.NewInt(1)
-	if _, err := r.Accept(Envelope{ChainID: other.ChainID, Rail: other.Rail, Variant: v}); !errors.Is(err, ErrForeignDomain) {
-		t.Fatalf("want ErrForeignDomain for another chain, got %v", err)
-	}
-	if _, err := r.Accept(Envelope{ChainID: testDomain().ChainID, Rail: addr(8), Variant: v}); !errors.Is(err, ErrForeignDomain) {
-		t.Fatalf("want ErrForeignDomain for another deployment, got %v", err)
-	}
-	if _, err := r.Accept(Envelope{ChainID: testDomain().ChainID, Rail: testDomain().Rail, Variant: v}); err != nil {
-		t.Fatalf("own domain refused: %v", err)
-	}
-}
-
-func TestCheckTokenRequiresTheDepositSurface(t *testing.T) {
+func TestSendingAfterSettlementDoesNothing(t *testing.T) {
 	ctx := context.Background()
-	r, _, _ := newTestRail(t)
-	if err := r.CheckToken(ctx); err != nil {
-		t.Fatalf("a token with the EIP-3009 surface must pass: %v", err)
-	}
-
-	r2, _, chain2 := newTestRail(t)
-	chain2.noAuthState = true
-	if err := r2.CheckToken(ctx); err == nil {
-		t.Fatal("a token without EIP-3009 must be refused: it can never take a deposit")
-	}
-
-	r3, _, chain3 := newTestRail(t)
-	chain3.tokenDomain = common.Hash{}
-	if err := r3.CheckToken(ctx); err == nil {
-		t.Fatal("a token with an empty EIP-712 domain must be refused")
-	}
-}
-
-// A host embeds this library and drives it from goroutines, so two relays on
-// one rail must never choose the same transaction nonce: the loser would be
-// rejected by the node or, worse, silently replace the winner.
-func TestConcurrentRelaysNeverShareANonce(t *testing.T) {
-	ctx := context.Background()
-	r, _, chain := newTestRail(t)
-	chain.railBalances[r.Account()] = big.NewInt(1_000_000)
-
-	const operations = 12
-	variants := make([]Variant, operations)
-	for i := range variants {
-		id := testID(byte(i + 1))
-		if err := r.PrepareTransfer(ctx, id, addr(2), big.NewInt(10)); err != nil {
-			t.Fatal(err)
-		}
-		v, err := r.Sign(ctx, id, big.NewInt(1), r.Account(), time.Hour)
-		if err != nil {
-			t.Fatal(err)
-		}
-		variants[i] = v
-	}
-
-	var wg sync.WaitGroup
-	errs := make([]error, operations)
-	for i, v := range variants {
-		wg.Add(1)
-		go func(i int, v Variant) {
-			defer wg.Done()
-			_, errs[i] = r.Relay(ctx, v)
-		}(i, v)
-	}
-	wg.Wait()
-
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("relay %d: %v", i, err)
-		}
-	}
-	sent := chain.submitted()
-	if len(sent) != operations {
-		t.Fatalf("%d transactions submitted, want %d", len(sent), operations)
-	}
-	seen := map[uint64]bool{}
-	for _, tx := range sent {
-		if seen[tx.Nonce()] {
-			t.Fatalf("nonce %d was used twice", tx.Nonce())
-		}
-		seen[tx.Nonce()] = true
-	}
-}
-
-// Signing concurrently on one intent must not produce two variants where one
-// would do: the loser would only burn its relayer's gas.
-func TestConcurrentSigningReusesOneVariant(t *testing.T) {
-	ctx := context.Background()
-	r, store, _ := newTestRail(t)
-	id := testID(1)
-	if err := r.PrepareTransfer(ctx, id, addr(2), big.NewInt(10)); err != nil {
-		t.Fatal(err)
-	}
-
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if _, err := r.Sign(ctx, id, big.NewInt(1), addr(3), time.Hour); err != nil {
-				t.Error(err)
-			}
-		}()
-	}
-	wg.Wait()
-
-	stored, err := store.Variants(r.ref(id))
+	r, chain, store := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+	hash, err := r.Send(ctx, id(1))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("send: %v", err)
 	}
-	if len(stored) != 1 {
-		t.Fatalf("%d variants signed for one intent, want 1", len(stored))
+	chain.include(t, hash, true, transferLogOf(r.Domain(), r.Account(), bob, big.NewInt(10_000_000)))
+	chain.finalize()
+	if status, _ := r.Status(ctx, id(1)); status != StatusConfirmed {
+		t.Fatal("the payment did not confirm")
+	}
+
+	// Sending or retrying a settled operation is a no-op, reported as a zero
+	// hash rather than a second transaction.
+	for _, again := range []func() (common.Hash, error){
+		func() (common.Hash, error) { return r.Send(ctx, id(1)) },
+		func() (common.Hash, error) { return r.Retry(ctx, id(1)) },
+	} {
+		got, err := again()
+		if err != nil {
+			t.Fatalf("after settlement: %v", err)
+		}
+		if got != (common.Hash{}) {
+			t.Fatalf("a settled operation was sent again as %s", got)
+		}
+	}
+	subs, _ := store.Submissions(r.Account(), id(1))
+	if len(subs) != 1 {
+		t.Fatalf("%d attempts recorded, want 1", len(subs))
+	}
+	if len(chain.order) != 1 {
+		t.Fatalf("%d transactions broadcast, want 1", len(chain.order))
+	}
+}
+
+func TestTheZeroIdentifierIsAnOrdinaryIdentifier(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	var zero ID
+
+	// Nothing recorded under it yet.
+	if _, err := r.Send(ctx, zero); !errors.Is(err, ErrNoIntent) {
+		t.Fatalf("sending an unrecorded operation: %v, want no intent", err)
+	}
+	if err := r.Prepare(ctx, zero, KindTransfer, bob, big.NewInt(10_000_000)); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	hash, err := r.Send(ctx, zero)
+	if err != nil || hash == (common.Hash{}) {
+		t.Fatalf("send: %s %v", hash, err)
+	}
+	chain.include(t, hash, true, transferLogOf(r.Domain(), r.Account(), bob, big.NewInt(10_000_000)))
+	chain.finalize()
+	if status, _ := r.Status(ctx, zero); status != StatusConfirmed {
+		t.Fatalf("status is %s, want confirmed", status)
+	}
+	// Settled: nothing more goes out, and no attempt is invented.
+	if again, err := r.Send(ctx, zero); err != nil || again != (common.Hash{}) {
+		t.Fatalf("resending a settled operation: %s %v", again, err)
+	}
+	subs, _ := store.Submissions(r.Account(), zero)
+	if len(subs) != 1 || len(chain.order) != 1 {
+		t.Fatalf("%d attempts and %d transactions, want 1 and 1", len(subs), len(chain.order))
+	}
+}
+
+func TestANodeThatCannotAnswerIsNotAFinalizedFailure(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+	hash, err := r.Send(ctx, id(1))
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	chain.include(t, hash, true, transferLogOf(r.Domain(), r.Account(), bob, big.NewInt(10_000_000)))
+	chain.finalize()
+
+	// The nonce is spent, but the node cannot say what spent it.
+	chain.receiptErr = errors.New("context deadline exceeded")
+	if _, err := r.Status(ctx, id(1)); err == nil {
+		t.Fatal("an unanswerable node produced a status instead of an error")
+	}
+	if _, cached, _ := store.Fact(r.Account(), id(1)); cached {
+		t.Fatal("a permanent fact was written from an unanswered question")
+	}
+
+	// Once it can answer, the truth is the truth.
+	chain.receiptErr = nil
+	if status, err := r.Status(ctx, id(1)); err != nil || status != StatusConfirmed {
+		t.Fatalf("status is %s (%v), want confirmed", status, err)
+	}
+}
+
+func TestAGasBoundTooSmallIsCaughtBeforeAnythingIsRecorded(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	// The chain needs more gas for a transfer than the policy allows for one.
+	chain.gasFloor = 200_000
+
+	err := r.Prepare(ctx, id(1), KindTransfer, bob, big.NewInt(10_000_000))
+	if err == nil {
+		t.Fatal("a gas bound below what the call needs was accepted")
+	}
+	if !strings.Contains(err.Error(), "gas bound") {
+		t.Fatalf("refused with %v, which does not name the bound", err)
+	}
+	if _, ok, _ := store.Intent(r.Account(), id(1)); ok {
+		t.Fatal("an operation that cannot run took a nonce")
+	}
+	if len(chain.order) != 0 {
+		t.Fatal("an operation that cannot run was broadcast")
+	}
+}
+
+func TestDepositScanningWalksTheChainInSpans(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	d := r.Domain()
+
+	// A range far wider than one query may cover, with money at both ends.
+	chain.head, chain.finalized = 25_000, 25_000
+	chain.addTransferLog(1, 0, d.Token, bob, r.Account(), big.NewInt(1_000_000))
+	chain.addTransferLog(24_999, 0, d.Token, exchange, r.Account(), big.NewInt(2_000_000))
+
+	found, err := r.ScanDeposits(ctx)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(found) != 2 {
+		t.Fatalf("found %d deposits across the range, want 2", len(found))
+	}
+	if len(chain.filtered) < 3 {
+		t.Fatalf("scanned 25000 blocks in %d queries; the span bound is %d", len(chain.filtered), maxScanSpan)
+	}
+	if cursor, ok, _ := store.Cursor(r.Account()); !ok || cursor != 25_000 {
+		t.Fatalf("cursor ended at %d, want 25000", cursor)
+	}
+	// And nothing is found twice.
+	if again, _ := r.ScanDeposits(ctx); len(again) != 0 {
+		t.Fatalf("rescanning found %d deposits", len(again))
+	}
+}
+
+func TestAnInterruptedScanResumesWhereItStopped(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	d := r.Domain()
+	chain.head, chain.finalized = 25_000, 25_000
+	chain.addTransferLog(5, 0, d.Token, bob, r.Account(), big.NewInt(1_000_000))
+
+	// Fail after the first span has been recorded.
+	chain.filterErrAfter = 1
+	if _, err := r.ScanDeposits(ctx); err == nil {
+		t.Fatal("a failing scan reported success")
+	}
+	cursor, ok, _ := store.Cursor(r.Account())
+	if !ok || cursor != maxScanSpan-1 {
+		t.Fatalf("cursor is %d after one span, want %d", cursor, maxScanSpan-1)
+	}
+	// The money already seen is not lost, and is not recorded twice later.
+	if all, _ := r.Deposits(); len(all) != 1 {
+		t.Fatalf("%d deposits recorded before the failure, want 1", len(all))
+	}
+	chain.filterErrAfter = 0
+	if _, err := r.ScanDeposits(ctx); err != nil {
+		t.Fatalf("resumed scan: %v", err)
+	}
+	if all, _ := r.Deposits(); len(all) != 1 {
+		t.Fatalf("%d deposits after resuming, want 1", len(all))
+	}
+}
+
+func TestARefillGoesWhereItWasRecordedToGo(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	chain.gas[r.Account()] = big.NewInt(10_000_000_000_000_000)
+
+	refill, _, err := r.Refill(ctx, big.NewInt(0))
+	if err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	recorded, _, _ := store.Intent(r.Account(), refill)
+
+	// Configuration moves to a different venue while the refill is unresolved.
+	// The permit inside the recorded calldata names the old one as spender, so
+	// the transaction must still go there.
+	moved := r.Domain()
+	moved.Venue.Router = common.HexToAddress("0x00000000000000000000000000000000000000ff")
+	after, err := New(moved, store, chain, testKey(t))
+	if err != nil {
+		t.Fatalf("rebind: %v", err)
+	}
+	if got := after.target(recorded); got != recorded.To {
+		t.Fatalf("a recorded refill would be sent to %s, not the venue %s it was signed for", got, recorded.To)
+	}
+}
+
+func TestAPaymentMayLeaveTheReserveUnderMinimumAndTheNextOneRefills(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	min := r.Domain().Gas.Min
+
+	// Just above the reorder point: the payment goes, whatever it costs.
+	chain.gas[r.Account()] = new(big.Int).Add(min, big.NewInt(1))
+	if err := r.Prepare(ctx, id(1), KindTransfer, bob, big.NewInt(1_000_000)); err != nil {
+		t.Fatalf("a reserve above the minimum refused a payment: %v", err)
+	}
+	hash, err := r.Send(ctx, id(1))
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	chain.include(t, hash, true, transferLogOf(r.Domain(), r.Account(), bob, big.NewInt(1_000_000)))
+	chain.finalize()
+
+	// Paying for it dropped the reserve under the minimum. That is the reorder
+	// point doing its job, not a fault.
+	chain.gas[r.Account()] = new(big.Int).Sub(min, big.NewInt(1))
+	if status, _ := r.Status(ctx, id(1)); status != StatusConfirmed {
+		t.Fatalf("the payment is %s, want confirmed", status)
+	}
+
+	// The next one refills first.
+	err = r.Prepare(ctx, id(2), KindTransfer, bob, big.NewInt(1_000_000))
+	if !errors.Is(err, ErrNeedRefill) {
+		t.Fatalf("below the minimum the next payment says %v, want a refill first", err)
+	}
+	refill, _, err := r.Refill(ctx, big.NewInt(1_000_000))
+	if err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	// It buys back to the maximum, counting its own gas as spent.
+	in, _, _ := r.Intent(refill)
+	landing := new(big.Int).Add(chain.gas[r.Account()], in.Delta)
+	if landing.Cmp(r.Domain().Gas.Max) < 0 {
+		t.Fatalf("a refill of %s lands the reserve at %s, short of the maximum %s",
+			in.Delta, landing, r.Domain().Gas.Max)
 	}
 }
