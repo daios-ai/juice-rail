@@ -234,7 +234,7 @@ nothing else; logic a host has to write is logic missing from the library.
 ```text
 account   balances (USDT0, ETH reserve)   nonce
 pay (transfer, withdrawal), retry        prepare / send / refill beneath it
-deposit observation   status   finality
+deposit observation   status   finality   refill cost
 domain check   amount parsing and formatting   funding checklist
 ```
 

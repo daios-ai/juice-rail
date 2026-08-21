@@ -5,6 +5,10 @@ import (
 	"errors"
 	"math/big"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 func TestClassifyReadsOnlyFinalizedFacts(t *testing.T) {
@@ -165,4 +169,165 @@ func TestUnfinalizedDepositsAreNotRecorded(t *testing.T) {
 	if found, _ = r.ScanDeposits(ctx); len(found) != 1 {
 		t.Fatalf("after finality found %d deposits, want 1", len(found))
 	}
+}
+
+// refillReceiptLogs is what a real refill emits, taken from an Arbitrum
+// Sepolia receipt: the permit's approval, the wrapped-currency legs, the pool's
+// own event, and — the one that matters — the stablecoin leaving the account
+// for the pool, not for the router.
+func refillReceiptLogs(d Domain, account, pool common.Address, spent *big.Int) []*types.Log {
+	weth := d.Venue.WETH
+	bought := big.NewInt(271_584_001_500_000)
+	return []*types.Log{
+		{Address: d.Token, Topics: []common.Hash{
+			crypto.Keccak256Hash([]byte("Approval(address,address,uint256)")),
+			common.BytesToHash(account.Bytes()),
+			common.BytesToHash(d.Venue.Router.Bytes()),
+		}, Data: common.LeftPadBytes(big.NewInt(9_999_999).Bytes(), 32)},
+		{Address: weth, Topics: []common.Hash{
+			topicTransfer,
+			common.BytesToHash(pool.Bytes()),
+			common.BytesToHash(d.Venue.Router.Bytes()),
+		}, Data: common.LeftPadBytes(bought.Bytes(), 32)},
+		{Address: d.Token, Topics: []common.Hash{
+			topicTransfer,
+			common.BytesToHash(account.Bytes()),
+			common.BytesToHash(pool.Bytes()),
+		}, Data: common.LeftPadBytes(spent.Bytes(), 32)},
+		{Address: pool, Topics: []common.Hash{crypto.Keccak256Hash([]byte("Swap()"))}},
+		{Address: weth, Topics: []common.Hash{
+			topicTransfer,
+			common.BytesToHash(d.Venue.Router.Bytes()),
+			common.Hash{},
+		}, Data: common.LeftPadBytes(bought.Bytes(), 32)},
+	}
+}
+
+var testPool = common.HexToAddress("0x00000000000000000000000000000000000000e0")
+
+// settledRefill drives a refill through to a finalized receipt carrying spent.
+func settledRefill(t *testing.T, r *Rail, chain *fakeChain, spent *big.Int) ID {
+	t.Helper()
+	ctx := context.Background()
+	chain.gas[r.Account()] = big.NewInt(10_000_000_000_000_000)
+	refill, hash, err := r.Refill(ctx, new(big.Int))
+	if err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	chain.include(t, hash, true, refillReceiptLogs(r.Domain(), r.Account(), testPool, spent)...)
+	chain.finalize()
+	return refill
+}
+
+func TestRefillCostIsWhatWasSpentNotWhatWasAllowed(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	spent := big.NewInt(1_219_400)
+	refill := settledRefill(t, r, chain, spent)
+
+	// The bound and the spend must differ, or the test proves nothing.
+	in, _, _ := store.Intent(r.Account(), refill)
+	if in.Amount.Cmp(spent) <= 0 {
+		t.Fatalf("the recorded bound %s is not above the spend %s", in.Amount, spent)
+	}
+
+	got, err := r.RefillCost(ctx, refill)
+	if err != nil {
+		t.Fatalf("refill cost: %v", err)
+	}
+	if got.Cmp(spent) != 0 {
+		t.Fatalf("the refill cost %s, want %s", got, spent)
+	}
+	if got.Cmp(in.Amount) == 0 {
+		t.Fatal("it reported the ceiling instead of the cost")
+	}
+}
+
+func TestRefillCostAnswersEvenIfNobodyLookedBefore(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	spent := big.NewInt(1_219_400)
+	refill := settledRefill(t, r, chain, spent)
+
+	// A fresh instance over the same records, having never asked for a status:
+	// no fact is cached. That the refill finalized long ago must still be found.
+	restarted, err := New(r.Domain(), store, chain, testKey(t))
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if _, cached, _ := store.Fact(r.Account(), refill); cached {
+		t.Fatal("the fixture cached a fact; this test needs none")
+	}
+	got, err := restarted.RefillCost(ctx, refill)
+	if err != nil {
+		t.Fatalf("refill cost with nothing cached: %v", err)
+	}
+	if got.Cmp(spent) != 0 {
+		t.Fatalf("the refill cost %s, want %s", got, spent)
+	}
+}
+
+func TestRefillCostRefusesWhatItCannotKnow(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("still pending", func(t *testing.T) {
+		r, chain, _ := newTestRail(t)
+		chain.gas[r.Account()] = big.NewInt(10_000_000_000_000_000)
+		refill, _, err := r.Refill(ctx, new(big.Int))
+		if err != nil {
+			t.Fatalf("refill: %v", err)
+		}
+		if _, err := r.RefillCost(ctx, refill); !errors.Is(err, ErrInFlight) {
+			t.Fatalf("cost of an unfinalized refill: %v, want a refusal", err)
+		}
+	})
+
+	t.Run("reverted", func(t *testing.T) {
+		r, chain, _ := newTestRail(t)
+		chain.gas[r.Account()] = big.NewInt(10_000_000_000_000_000)
+		refill, hash, err := r.Refill(ctx, new(big.Int))
+		if err != nil {
+			t.Fatalf("refill: %v", err)
+		}
+		chain.include(t, hash, false)
+		chain.finalize()
+		got, err := r.RefillCost(ctx, refill)
+		if err != nil || got.Sign() != 0 {
+			t.Fatalf("a reverted refill cost %v (%v), want nothing", got, err)
+		}
+	})
+
+	t.Run("ambiguous receipt", func(t *testing.T) {
+		r, chain, _ := newTestRail(t)
+		chain.gas[r.Account()] = big.NewInt(10_000_000_000_000_000)
+		refill, hash, err := r.Refill(ctx, new(big.Int))
+		if err != nil {
+			t.Fatalf("refill: %v", err)
+		}
+		// Two payments from the account in one receipt: which one was the cost?
+		logs := refillReceiptLogs(r.Domain(), r.Account(), testPool, big.NewInt(1_219_400))
+		logs = append(logs, logs[2])
+		chain.include(t, hash, true, logs...)
+		chain.finalize()
+		if _, err := r.RefillCost(ctx, refill); !errors.Is(err, ErrBadInput) {
+			t.Fatalf("an ambiguous receipt gave %v, want a refusal rather than a guess", err)
+		}
+	})
+
+	t.Run("not a refill", func(t *testing.T) {
+		r, _, _ := newTestRail(t)
+		if err := r.Prepare(ctx, id(1), KindTransfer, bob, big.NewInt(10_000_000)); err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+		if _, err := r.RefillCost(ctx, id(1)); !errors.Is(err, ErrBadInput) {
+			t.Fatalf("cost of a payment: %v, want a refusal", err)
+		}
+	})
+
+	t.Run("unknown", func(t *testing.T) {
+		r, _, _ := newTestRail(t)
+		if _, err := r.RefillCost(ctx, id(9)); !errors.Is(err, ErrNoIntent) {
+			t.Fatalf("cost of nothing: %v, want a refusal", err)
+		}
+	})
 }

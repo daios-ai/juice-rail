@@ -328,6 +328,7 @@ r.Pay(ctx, id, rail.KindTransfer, to, amount)   // the whole payment flow
 r.WithdrawAll(ctx, id, to)                      // send the whole balance out
 r.Retry(ctx, id)                                // same nonce, higher fee
 r.Status(ctx, id)                               // from finalized facts only
+r.RefillCost(ctx, refillID)                     // what buying gas actually cost
 ```
 
 `Pay` returns an `Outcome`. Either the payment went out, or the reserve was
@@ -343,6 +344,10 @@ if out.Refilled() {
 Nothing else is needed to run a rail. The steps behind `Pay` —
 `Prepare`, `Send`, `Refill` — stay public for hosts that want to stop between
 them, but no host has to reimplement the flow, and none should.
+
+A refill's recorded amount is the most it was allowed to spend, not what it
+spent. If you keep your own ledger and need to book the cost of gas against a
+user, ask `RefillCost` — it reads the winning transaction and answers exactly.
 
 Amounts are the domain's business, not yours: `domain.ParseAmount("12.50")`,
 `domain.FormatAmount(v)` and `rail.FormatNative(v)` handle units, and every

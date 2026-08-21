@@ -88,8 +88,9 @@ type Intent struct {
 	// To is the payee for a transfer or withdrawal, and the swap venue for a
 	// refill.
 	To common.Address
-	// Amount is the token amount paid; for a refill it is the maximum input the
-	// swap may consume.
+	// Amount is the token amount paid; for a refill it is the most the swap was
+	// allowed to consume. A refill's ceiling is not its cost — booking this as
+	// the cost overstates it. RefillCost reports what was actually spent.
 	Amount *big.Int
 	// Delta is the exact amount of native currency a refill buys. Zero
 	// otherwise.

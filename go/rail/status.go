@@ -93,6 +93,74 @@ func (r *Rail) status(ctx context.Context, in Intent) (Status, error) {
 	return classify(&f), nil
 }
 
+// RefillCost reports the stablecoin a finalized refill actually consumed.
+//
+// The intent records the most it was allowed to spend — the venue's quote plus
+// the slippage margin. This is what it did spend, read from the transaction
+// that won. A host keeping its own ledger needs the second figure, not the
+// first, and it is the only amount the rail handles that its records do not
+// already state exactly.
+//
+// Nothing is stored. The chain keeps receipts, so the answer is always
+// recoverable, and a number a ledger will book should not be frozen in a
+// durable record where a mistake could never be corrected.
+func (r *Rail) RefillCost(ctx context.Context, id ID) (*big.Int, error) {
+	in, ok, err := r.store.Intent(r.address, id)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNoIntent, id)
+	}
+	if in.Kind != KindRefill {
+		return nil, fmt.Errorf("%w: %s is a %s, not a refill", ErrBadInput, id, in.Kind)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Ask what finalized rather than reading the cache. A fact is derived when
+	// somebody looks, so its absence means nobody has looked — not that
+	// nothing has happened.
+	status, err := r.status(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	switch status {
+	case StatusConfirmed:
+	case StatusPending:
+		return nil, fmt.Errorf("%w: refill %s has not finalized", ErrInFlight, id)
+	case StatusFailed:
+		// A refill that reverted moved no stablecoin. It burned native
+		// currency, which is fuel rather than money and shows in the reserve.
+		return new(big.Int), nil
+	default:
+		return nil, fmt.Errorf("%w: refill %s is %s", ErrBadInput, id, status)
+	}
+
+	f, cached, err := r.store.Fact(r.address, id)
+	if err != nil {
+		return nil, err
+	}
+	if !cached || f.TxHash == (common.Hash{}) {
+		return nil, fmt.Errorf("%w: refill %s confirmed with no transaction recorded", ErrUnreconciled, id)
+	}
+	receipt, err := r.chain.TransactionReceipt(ctx, f.TxHash)
+	if err != nil {
+		return nil, fmt.Errorf("read receipt %s: %w", f.TxHash, err)
+	}
+	if receipt == nil {
+		return nil, fmt.Errorf("read receipt %s: no receipt", f.TxHash)
+	}
+	spent := sentTransferValues(receipt.Logs, r.domain.Token, r.address)
+	if len(spent) != 1 {
+		// Never guess a figure a ledger will book.
+		return nil, fmt.Errorf("%w: refill %s paid the venue in %d transfers, expected one",
+			ErrBadInput, f.TxHash, len(spent))
+	}
+	return spent[0], nil
+}
+
 // outcome finds what finalized under an intent's nonce. Only this account's
 // own recorded attempts are considered: a transaction hash commits to its
 // nonce, its destination and its calldata, so a receipt for a recorded hash is

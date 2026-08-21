@@ -10,6 +10,7 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
@@ -304,6 +305,29 @@ func signPermit(key *ecdsa.PrivateKey, separator common.Hash, owner, spender com
 	copy(s[:], sig[32:64])
 	// crypto.Sign reports recovery as 0 or 1; Ethereum signatures carry 27 or 28.
 	return sig[64] + 27, r, s, nil
+}
+
+// sentTransferValues returns the value of every transfer of this token that
+// `from` sent, among these logs.
+//
+// The recipient is deliberately not matched. A swap pays the pool directly,
+// through the router's callback, so where the money lands depends on the route
+// — the sender is what identifies the payment as this account's.
+func sentTransferValues(logs []*types.Log, token, from common.Address) []*big.Int {
+	var found []*big.Int
+	for _, lg := range logs {
+		if lg == nil || lg.Removed {
+			continue
+		}
+		if lg.Address != token || len(lg.Topics) != 3 || lg.Topics[0] != topicTransfer {
+			continue
+		}
+		if common.BytesToAddress(lg.Topics[1].Bytes()) != from || len(lg.Data) < 32 {
+			continue
+		}
+		found = append(found, new(big.Int).SetBytes(lg.Data[len(lg.Data)-32:]))
+	}
+	return found
 }
 
 // transferLog reports whether a log is exactly this token transfer. A token
