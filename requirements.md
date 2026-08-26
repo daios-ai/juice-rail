@@ -235,6 +235,7 @@ nothing else; logic a host has to write is logic missing from the library.
 account   balances (USDT0, ETH reserve)   nonce
 pay (transfer, withdrawal), retry        prepare / send / refill beneath it
 deposit observation   status   finality   refill cost
+finalized balances and outcomes, so a host can audit at a settled block
 domain check   amount parsing and formatting   funding checklist
 ```
 

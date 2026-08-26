@@ -331,3 +331,118 @@ func TestRefillCostRefusesWhatItCannotKnow(t *testing.T) {
 		}
 	})
 }
+
+func TestFinalizedBalancesReadTheSettledBlockNotTheLatest(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	// The two heights disagree: a payment is mined but not finalized, so the
+	// latest balance is already lower.
+	chain.tokenFinal = map[common.Address]*big.Int{r.Account(): big.NewInt(1_000_000_000)}
+	chain.gasFinal = map[common.Address]*big.Int{r.Account(): big.NewInt(77)}
+	chain.token[r.Account()] = big.NewInt(990_000_000)
+	chain.gas[r.Account()] = big.NewInt(55)
+
+	token, gas, block, err := r.FinalizedBalances(ctx)
+	if err != nil {
+		t.Fatalf("finalized balances: %v", err)
+	}
+	if token.Cmp(big.NewInt(1_000_000_000)) != 0 || gas.Cmp(big.NewInt(77)) != 0 {
+		t.Fatalf("read %s and %s, which is the latest state, not the settled one", token, gas)
+	}
+	if block != chain.finalized {
+		t.Fatalf("reports block %d, the finalized head is %d", block, chain.finalized)
+	}
+	// The present-moment read is unchanged and still sees the latest.
+	nowToken, nowGas, err := r.Balances(ctx)
+	if err != nil {
+		t.Fatalf("balances: %v", err)
+	}
+	if nowToken.Cmp(big.NewInt(990_000_000)) != 0 || nowGas.Cmp(big.NewInt(55)) != 0 {
+		t.Fatalf("Balances read %s and %s, want the latest state", nowToken, nowGas)
+	}
+}
+
+func TestOutcomePlacesASettledOperation(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+	hash, err := r.Send(ctx, id(1))
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// Unknown identifier: refused, as everywhere else.
+	if _, _, err := r.Outcome(ctx, id(9)); !errors.Is(err, ErrNoIntent) {
+		t.Fatalf("outcome of nothing: %v, want a refusal", err)
+	}
+	// Pending: no fact yet, and no error.
+	if _, settled, err := r.Outcome(ctx, id(1)); err != nil || settled {
+		t.Fatalf("outcome while pending: settled=%v err=%v", settled, err)
+	}
+
+	chain.include(t, hash, true, transferLogOf(r.Domain(), r.Account(), bob, big.NewInt(10_000_000)))
+	chain.finalize()
+
+	f, settled, err := r.Outcome(ctx, id(1))
+	if err != nil || !settled {
+		t.Fatalf("outcome after finality: settled=%v err=%v", settled, err)
+	}
+	if f.TxHash != hash {
+		t.Fatalf("the outcome names %s, the payment was %s", f.TxHash, hash)
+	}
+	receipt, _ := chain.TransactionReceipt(ctx, hash)
+	if f.BlockNumber != receipt.BlockNumber.Uint64() {
+		t.Fatalf("the outcome places it at block %d, the receipt says %d", f.BlockNumber, receipt.BlockNumber)
+	}
+	if !f.Executed {
+		t.Fatal("a confirmed payment reported as not executed")
+	}
+}
+
+func TestOutcomeOfAFailureAndOfTheUnobserved(t *testing.T) {
+	ctx := context.Background()
+	r, chain, store := newTestRail(t)
+	mustPrepare(t, r, id(1), bob, 10_000_000)
+	hash, err := r.Send(ctx, id(1))
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	chain.include(t, hash, false)
+	chain.finalize()
+
+	// A fresh instance over the same records, having never asked for a status:
+	// no fact is cached, and the failure must still be found and reported.
+	restarted, err := New(r.Domain(), store, chain, testKey(t))
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	f, settled, err := restarted.Outcome(ctx, id(1))
+	if err != nil || !settled {
+		t.Fatalf("outcome of a settled failure: settled=%v err=%v", settled, err)
+	}
+	if f.Executed {
+		t.Fatal("a reverted payment reported as executed")
+	}
+	if f.TxHash != hash {
+		t.Fatalf("the outcome names %s, the attempt was %s", f.TxHash, hash)
+	}
+}
+
+func TestDepositsScannedToReportsTheCursor(t *testing.T) {
+	ctx := context.Background()
+	r, chain, _ := newTestRail(t)
+
+	if _, ok, err := r.DepositsScannedTo(); ok || err != nil {
+		t.Fatalf("a cursor before any scan: ok=%v err=%v", ok, err)
+	}
+	if _, err := r.ScanDeposits(ctx); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	scanned, ok, err := r.DepositsScannedTo()
+	if err != nil || !ok {
+		t.Fatalf("cursor after a scan: ok=%v err=%v", ok, err)
+	}
+	if scanned != chain.finalized {
+		t.Fatalf("scanned to %d, the finalized head is %d", scanned, chain.finalized)
+	}
+}

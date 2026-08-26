@@ -148,20 +148,23 @@ type quoteParams struct {
 
 // --- reads ---
 
-func call(ctx context.Context, chain Chain, to common.Address, a abi.ABI, method string, args ...any) ([]byte, error) {
+// call reads a contract at the given block; nil means the latest. Every read
+// in the library goes through here, so there is one place that decides which
+// state is being asked about.
+func call(ctx context.Context, chain Chain, block *big.Int, to common.Address, a abi.ABI, method string, args ...any) ([]byte, error) {
 	in, err := a.Pack(method, args...)
 	if err != nil {
 		return nil, err
 	}
-	out, err := chain.CallContract(ctx, ethereum.CallMsg{To: &to, Data: in}, nil)
+	out, err := chain.CallContract(ctx, ethereum.CallMsg{To: &to, Data: in}, block)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", method, err)
 	}
 	return out, nil
 }
 
-func callWord(ctx context.Context, chain Chain, to common.Address, a abi.ABI, method string, args ...any) ([]byte, error) {
-	out, err := call(ctx, chain, to, a, method, args...)
+func callWord(ctx context.Context, chain Chain, block *big.Int, to common.Address, a abi.ABI, method string, args ...any) ([]byte, error) {
+	out, err := call(ctx, chain, block, to, a, method, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -171,8 +174,8 @@ func callWord(ctx context.Context, chain Chain, to common.Address, a abi.ABI, me
 	return out, nil
 }
 
-func tokenUint(ctx context.Context, chain Chain, token common.Address, method string, args ...any) (*big.Int, error) {
-	out, err := callWord(ctx, chain, token, tokenABI, method, args...)
+func tokenUint(ctx context.Context, chain Chain, block *big.Int, token common.Address, method string, args ...any) (*big.Int, error) {
+	out, err := callWord(ctx, chain, block, token, tokenABI, method, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +189,7 @@ func transferCalldata(to common.Address, amount *big.Int) ([]byte, error) {
 
 // quoteRefill asks the venue what buying delta of native currency costs.
 func quoteRefill(ctx context.Context, chain Chain, d Domain, delta *big.Int) (*big.Int, error) {
-	out, err := call(ctx, chain, d.Venue.Quoter, quoterABI, "quoteExactOutputSingle", quoteParams{
+	out, err := call(ctx, chain, nil, d.Venue.Quoter, quoterABI, "quoteExactOutputSingle", quoteParams{
 		TokenIn:           d.Token,
 		TokenOut:          d.Venue.WETH,
 		Amount:            delta,
@@ -261,11 +264,11 @@ func refillCalldata(ctx context.Context, chain Chain, d Domain, key *ecdsa.Priva
 // consumes at most that, and the next refill's permit replaces whatever is
 // left over.
 func permitCall(ctx context.Context, chain Chain, d Domain, key *ecdsa.PrivateKey, account common.Address, value *big.Int, deadline uint64) ([]byte, error) {
-	separator, err := callWord(ctx, chain, d.Token, tokenABI, "DOMAIN_SEPARATOR")
+	separator, err := callWord(ctx, chain, nil, d.Token, tokenABI, "DOMAIN_SEPARATOR")
 	if err != nil {
 		return nil, fmt.Errorf("token %s does not implement EIP-2612: %w", d.Token, err)
 	}
-	nonce, err := tokenUint(ctx, chain, d.Token, "nonces", account)
+	nonce, err := tokenUint(ctx, chain, nil, d.Token, "nonces", account)
 	if err != nil {
 		return nil, fmt.Errorf("token %s does not implement EIP-2612: %w", d.Token, err)
 	}

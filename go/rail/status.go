@@ -161,6 +161,79 @@ func (r *Rail) RefillCost(ctx context.Context, id ID) (*big.Int, error) {
 	return spent[0], nil
 }
 
+// FinalizedBalances reports the account's money and reserve at the finalized
+// head, and the block that head was at.
+//
+// Balances reads the present moment, which an audit cannot use: a payment
+// that is mined but not finalized has already left that figure while a
+// host's ledger still counts it, so the two disagree with nothing wrong. At
+// a settled block both sides describe the same instant, so a difference is a
+// real discrepancy. The block is returned because the comparison is only
+// meaningful once the host has brought its ledger to the same cut.
+//
+// The read is always at the current finalized head, never at a chosen block:
+// past state is served only by archive nodes, and the endpoints this library
+// is documented against prune unevenly, so historical reads fail
+// intermittently rather than cleanly.
+func (r *Rail) FinalizedBalances(ctx context.Context) (token, gas *big.Int, block uint64, err error) {
+	head, err := r.finalizedHeader(ctx)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	if token, err = tokenUint(ctx, r.chain, head.Number, r.domain.Token, "balanceOf", r.address); err != nil {
+		return nil, nil, 0, err
+	}
+	if gas, err = r.chain.BalanceAt(ctx, r.address, head.Number); err != nil {
+		return nil, nil, 0, fmt.Errorf("read reserve: %w", err)
+	}
+	return token, gas, head.Number.Uint64(), nil
+}
+
+// Outcome reports what finalized under an operation: the transaction that
+// carried it, the block it settled in, and whether it executed. The block is
+// what lets a host place the operation at the right point in its own ledger.
+//
+// The answer is resolved by asking what finalized, never by reading the
+// cached fact alone: a fact is derived when somebody looks, so its absence
+// means nobody has looked, not that nothing has happened.
+func (r *Rail) Outcome(ctx context.Context, id ID) (Fact, bool, error) {
+	in, ok, err := r.store.Intent(r.address, id)
+	if err != nil {
+		return Fact{}, false, err
+	}
+	if !ok {
+		return Fact{}, false, fmt.Errorf("%w: %s", ErrNoIntent, id)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	status, err := r.status(ctx, in)
+	if err != nil {
+		return Fact{}, false, err
+	}
+	if status == StatusPending {
+		return Fact{}, false, nil
+	}
+	// Confirmed or failed: status just derived and cached the fact.
+	f, cached, err := r.store.Fact(r.address, id)
+	if err != nil {
+		return Fact{}, false, err
+	}
+	if !cached {
+		return Fact{}, false, fmt.Errorf("%w: %s settled with no fact recorded", ErrUnreconciled, id)
+	}
+	return f, true, nil
+}
+
+// DepositsScannedTo reports the block up to which incoming money has been
+// observed, and false if no scan has run. A host auditing at block N must see
+// a cursor at or past N, or deposits between the two are on the chain and not
+// yet in its ledger.
+func (r *Rail) DepositsScannedTo() (uint64, bool, error) {
+	return r.store.Cursor(r.address)
+}
+
 // outcome finds what finalized under an intent's nonce. Only this account's
 // own recorded attempts are considered: a transaction hash commits to its
 // nonce, its destination and its calldata, so a receipt for a recorded hash is

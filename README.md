@@ -328,7 +328,10 @@ r.Pay(ctx, id, rail.KindTransfer, to, amount)   // the whole payment flow
 r.WithdrawAll(ctx, id, to)                      // send the whole balance out
 r.Retry(ctx, id)                                // same nonce, higher fee
 r.Status(ctx, id)                               // from finalized facts only
+r.Outcome(ctx, id)                              // the settled tx, and its block
 r.RefillCost(ctx, refillID)                     // what buying gas actually cost
+r.FinalizedBalances(ctx)                        // balances at a settled block N
+r.DepositsScannedTo()                           // deposits observed through ...
 ```
 
 `Pay` returns an `Outcome`. Either the payment went out, or the reserve was
@@ -348,6 +351,28 @@ them, but no host has to reimplement the flow, and none should.
 A refill's recorded amount is the most it was allowed to spend, not what it
 spent. If you keep your own ledger and need to book the cost of gas against a
 user, ask `RefillCost` — it reads the winning transaction and answers exactly.
+
+### Checking your books against the chain
+
+If you keep a ledger of your own, check it against a settled block, never
+against the present moment: money in flight makes the present moment wrong
+with nothing amiss. The procedure:
+
+```text
+1. ScanDeposits          advance your view of incoming money
+2. FinalizedBalances     the chain's answer at block N
+3. DepositsScannedTo     below N? repeat step 1
+4. Outcome, per operation you have not yet settled
+5. compare               chain balance at N == your ledger at N
+```
+
+Count only what settled at or before N — deposits and outcomes both carry
+their block. Deduct settled refills at their `RefillCost`, or the books will
+be off by the price of gas. After a restart, ask `Pending()` too, so a refill
+you never saw recorded is not missed.
+
+This audits the present, promptly. Asking what the balance was at some past
+block needs an archive node, which the public endpoints here do not provide.
 
 Amounts are the domain's business, not yours: `domain.ParseAmount("12.50")`,
 `domain.FormatAmount(v)` and `rail.FormatNative(v)` handle units, and every

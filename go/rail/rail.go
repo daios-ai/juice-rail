@@ -85,7 +85,7 @@ func (r *Rail) Account() common.Address { return r.address }
 
 // Balances reports the account's money and its operating reserve.
 func (r *Rail) Balances(ctx context.Context) (token, gas *big.Int, err error) {
-	if token, err = tokenUint(ctx, r.chain, r.domain.Token, "balanceOf", r.address); err != nil {
+	if token, err = tokenUint(ctx, r.chain, nil, r.domain.Token, "balanceOf", r.address); err != nil {
 		return nil, nil, err
 	}
 	if gas, err = r.chain.BalanceAt(ctx, r.address, nil); err != nil {
@@ -107,18 +107,18 @@ func CheckDomain(ctx context.Context, d Domain, chain Chain, account common.Addr
 	if err := checkChain(ctx, d, chain); err != nil {
 		return err
 	}
-	if _, err := tokenUint(ctx, chain, d.Token, "balanceOf", account); err != nil {
+	if _, err := tokenUint(ctx, chain, nil, d.Token, "balanceOf", account); err != nil {
 		return fmt.Errorf("token %s is not an ERC-20 here: %w", d.Token, err)
 	}
-	if _, err := callWord(ctx, chain, d.Token, tokenABI, "DOMAIN_SEPARATOR"); err != nil {
+	if _, err := callWord(ctx, chain, nil, d.Token, tokenABI, "DOMAIN_SEPARATOR"); err != nil {
 		return fmt.Errorf("token %s does not implement EIP-2612: %w", d.Token, err)
 	}
-	if _, err := tokenUint(ctx, chain, d.Token, "nonces", account); err != nil {
+	if _, err := tokenUint(ctx, chain, nil, d.Token, "nonces", account); err != nil {
 		return fmt.Errorf("token %s does not implement EIP-2612: %w", d.Token, err)
 	}
 	// Units are worth one read: mistaking six decimals for eighteen misstates
 	// every amount this domain will ever handle, by a factor of a trillion.
-	decimals, err := tokenUint(ctx, chain, d.Token, "decimals")
+	decimals, err := tokenUint(ctx, chain, nil, d.Token, "decimals")
 	if err != nil {
 		return fmt.Errorf("token %s does not report its decimals: %w", d.Token, err)
 	}

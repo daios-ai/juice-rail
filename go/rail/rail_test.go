@@ -40,8 +40,13 @@ type fakeChain struct {
 	price    *big.Int
 	decimals byte
 	chainID  *big.Int
-	sendErr  error
-	callErr  error
+	// tokenFinal and gasFinal, when set, are the balances at the finalized
+	// block, distinct from the latest ones above. A settled read must see
+	// these, never the latest.
+	tokenFinal map[common.Address]*big.Int
+	gasFinal   map[common.Address]*big.Int
+	sendErr    error
+	callErr    error
 	// receiptErr stands in for a node that cannot answer, as distinct from one
 	// answering "no such transaction".
 	receiptErr error
@@ -104,9 +109,12 @@ func (c *fakeChain) BlockNumber(context.Context) (uint64, error) {
 	return c.head, nil
 }
 
-func (c *fakeChain) BalanceAt(_ context.Context, account common.Address, _ *big.Int) (*big.Int, error) {
+func (c *fakeChain) BalanceAt(_ context.Context, account common.Address, block *big.Int) (*big.Int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if block != nil && block.Uint64() == c.finalized && c.gasFinal != nil {
+		return orZero(c.gasFinal[account]), nil
+	}
 	return orZero(c.gas[account]), nil
 }
 
@@ -192,7 +200,7 @@ func (c *fakeChain) FilterLogs(_ context.Context, q ethereum.FilterQuery) ([]typ
 
 // CallContract answers the reads the rail makes, decoding the real calldata so
 // the encoding is under test too.
-func (c *fakeChain) CallContract(_ context.Context, msg ethereum.CallMsg, _ *big.Int) ([]byte, error) {
+func (c *fakeChain) CallContract(_ context.Context, msg ethereum.CallMsg, block *big.Int) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.callErr != nil {
@@ -213,7 +221,11 @@ func (c *fakeChain) CallContract(_ context.Context, msg ethereum.CallMsg, _ *big
 			if err != nil {
 				return nil, err
 			}
-			return common.LeftPadBytes(orZero(c.token[args[0].(common.Address)]).Bytes(), 32), nil
+			who := args[0].(common.Address)
+			if block != nil && block.Uint64() == c.finalized && c.tokenFinal != nil {
+				return common.LeftPadBytes(orZero(c.tokenFinal[who]).Bytes(), 32), nil
+			}
+			return common.LeftPadBytes(orZero(c.token[who]).Bytes(), 32), nil
 		case string(tokenABI.Methods["nonces"].ID):
 			return common.LeftPadBytes(nil, 32), nil
 		case string(tokenABI.Methods["decimals"].ID):
