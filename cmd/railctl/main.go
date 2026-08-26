@@ -632,10 +632,19 @@ func (a *app) account() error {
 	return a.emit(map[string]any{"account": addr.Hex()}, addr.Hex())
 }
 
-// balance shows the money, and the reserve separately. The reserve is fuel,
-// never spendable balance.
+// balance shows the money and the reserve, at the present moment and again at
+// the last settled block. The reserve is fuel, never spendable balance.
+//
+// Both are shown because the difference between them is the money in flight.
+// Checking books against the present moment is what makes an honest account
+// look wrong, so the settled figures are the ones to reconcile against, and
+// the block they were read at is what a ledger has to be brought to.
 func (a *app) balance(ctx context.Context) error {
 	token, gas, err := a.rail.Balances(ctx)
+	if err != nil {
+		return err
+	}
+	settledToken, settledGas, block, err := a.rail.FinalizedBalances(ctx)
 	if err != nil {
 		return err
 	}
@@ -645,8 +654,16 @@ func (a *app) balance(ctx context.Context) error {
 			"balance": a.domain.FormatAmount(token),
 			"units":   token.String(),
 			"reserve": rail.FormatNative(gas),
+			"settled": map[string]any{
+				"balance": a.domain.FormatAmount(settledToken),
+				"units":   settledToken.String(),
+				"reserve": rail.FormatNative(settledGas),
+				"block":   block,
+			},
 		},
-		fmt.Sprintf("balance %s  reserve %s", a.domain.FormatAmount(token), rail.FormatNative(gas)),
+		fmt.Sprintf("balance %s  reserve %s\nsettled %s  reserve %s  at block %d",
+			a.domain.FormatAmount(token), rail.FormatNative(gas),
+			a.domain.FormatAmount(settledToken), rail.FormatNative(settledGas), block),
 	)
 }
 
@@ -670,12 +687,16 @@ func (a *app) deposits(ctx context.Context) error {
 		lines = append(lines, fmt.Sprintf("%s from %s (%s#%d)",
 			a.domain.FormatAmount(d.Amount), d.From.Hex(), d.TxHash.Hex(), d.LogIndex))
 	}
+	// How far the search reached, so that no deposits means none arrived up to
+	// here, rather than that nothing was looked for.
+	scanned, _, err := a.rail.DepositsScannedTo()
+	if err != nil {
+		return err
+	}
 	if a.opt.asJSON {
-		return a.emit(map[string]any{"deposits": rows}, "")
+		return a.emit(map[string]any{"deposits": rows, "scannedTo": scanned}, "")
 	}
-	if len(lines) == 0 {
-		return a.emit(nil, "no deposits")
-	}
+	lines = append(lines, fmt.Sprintf("scanned to block %d", scanned))
 	_, err = fmt.Fprintln(os.Stdout, strings.Join(lines, "\n"))
 	return err
 }
@@ -783,6 +804,10 @@ func (a *app) retry(ctx context.Context, args []string) error {
 	return a.report(ctx, id, note)
 }
 
+// status reports where an operation stands, and once it has settled, which
+// transaction carried it and in which block. A payment command ends with
+// report, which prints the status word alone; asking for a status explicitly
+// is where the detail belongs, and where the extra reads are worth making.
 func (a *app) status(ctx context.Context, args []string) error {
 	if len(args) != 1 {
 		return errors.New("status: want <id>")
@@ -791,7 +816,46 @@ func (a *app) status(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return a.report(ctx, id, "")
+	status, err := a.rail.Status(ctx, id)
+	if err != nil {
+		return err
+	}
+	out := map[string]any{"id": id.String(), "status": string(status)}
+	lines := []string{fmt.Sprintf("%s %s", id, status)}
+
+	// Nothing to settle for an identifier the rail has never recorded, and
+	// asking would be refused.
+	if status == rail.StatusUnknown {
+		return a.emit(out, strings.Join(lines, "\n"))
+	}
+	fact, settled, err := a.rail.Outcome(ctx, id)
+	if err != nil {
+		return err
+	}
+	if settled {
+		out["tx"], out["block"] = fact.TxHash.Hex(), fact.BlockNumber
+		lines = append(lines, fmt.Sprintf("  settled in %s at block %d", fact.TxHash, fact.BlockNumber))
+		cost, err := a.refillCost(ctx, id, fact)
+		if err != nil {
+			return err
+		}
+		if cost != nil {
+			out["cost"] = a.domain.FormatAmount(cost)
+			lines = append(lines, fmt.Sprintf("  cost %s", a.domain.FormatAmount(cost)))
+		}
+	}
+	return a.emit(out, strings.Join(lines, "\n"))
+}
+
+// refillCost is what buying gas actually consumed, or nil if this operation
+// was not a refill that executed. The recorded amount is the most it was
+// allowed to spend, which is not the same figure.
+func (a *app) refillCost(ctx context.Context, id rail.ID, fact rail.Fact) (*big.Int, error) {
+	in, ok, err := a.rail.Intent(id)
+	if err != nil || !ok || in.Kind != rail.KindRefill || !fact.Executed {
+		return nil, err
+	}
+	return a.rail.RefillCost(ctx, id)
 }
 
 // report prints the intent's status. Status is a property of the intent, so

@@ -105,6 +105,12 @@ func TestStory2Deposit(t *testing.T) {
 	if again := alice.deposits(); len(again) != 2 {
 		t.Fatalf("rescanning turned 2 deposits into %d", len(again))
 	}
+	// And it says how far it looked, so an empty list would mean none arrived
+	// rather than that nothing was searched.
+	seen := alice.deposited()
+	if seen.ScannedTo < got[1].Block {
+		t.Fatalf("scanned to block %d, but a deposit sits at %d", seen.ScannedTo, got[1].Block)
+	}
 	if h.tokenBalance(account).Cmp(tokens(150)) != 0 {
 		t.Fatalf("the account holds %s", h.tokenBalance(account))
 	}
@@ -129,8 +135,14 @@ func TestStory3Transfer(t *testing.T) {
 	alice.pay("transfer", id, to, "250.00")
 	h.settleAndFinalise()
 
-	if status := alice.status(id); status != "confirmed" {
-		t.Fatalf("payment is %s, want confirmed", status)
+	settled := alice.settlement(id)
+	if settled.Status != "confirmed" {
+		t.Fatalf("payment is %s, want confirmed", settled.Status)
+	}
+	// A confirmed payment says which transaction carried it and where it
+	// settled, which is what a host books it against.
+	if settled.Tx == "" || settled.Block == 0 {
+		t.Fatalf("a confirmed payment reports no settlement: %+v", settled)
 	}
 	if h.tokenBalance(to).Cmp(tokens(250)) != 0 {
 		t.Fatalf("the recipient holds %s", h.tokenBalance(to))
@@ -217,10 +229,23 @@ func TestStory5Refill(t *testing.T) {
 	if first.Refill == "" || first.Tx == "" {
 		t.Fatalf("a low reserve did not produce a refill: %+v", first)
 	}
+	// An identifier the rail never recorded reports unknown, and reports it
+	// rather than failing.
 	if alice.status(id) != "unknown" {
 		t.Fatal("a payment that never ran left a record behind")
 	}
 	h.settleAndFinalise()
+
+	// The refill reports what it actually spent, which is below the ceiling it
+	// was allowed and equals the money that left the account.
+	refill := alice.settlement(first.Refill)
+	if refill.Status != "confirmed" || refill.Cost == "" {
+		t.Fatalf("the refill reports %+v, want a confirmed cost", refill)
+	}
+	spentByBalance := new(big.Int).Sub(before, h.tokenBalance(account))
+	if want := formatUSDT(spentByBalance); refill.Cost != want {
+		t.Fatalf("the refill says it cost %s, the balance fell by %s", refill.Cost, want)
+	}
 
 	reserve := h.reserve(account)
 	if reserve.Cmp(wei(reserveMin)) <= 0 {

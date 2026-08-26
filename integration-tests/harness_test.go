@@ -491,15 +491,20 @@ func (p *participant) account() common.Address {
 
 // status reads the intent's status through the binary.
 func (p *participant) status(id string) string {
+	return p.settlement(id).Status
+}
+
+// settlement reads everything the binary reports about an intent: the status,
+// and once settled, the transaction that carried it, its block, and what a
+// refill cost.
+func (p *participant) settlement(id string) outcome {
 	p.h.t.Helper()
-	var reply struct {
-		Status string `json:"status"`
-	}
+	var reply outcome
 	out := p.mustRun("-json", "status", id)
 	if err := json.Unmarshal([]byte(out), &reply); err != nil {
 		p.h.t.Fatalf("status output %q: %v", out, err)
 	}
-	return reply.Status
+	return reply
 }
 
 // pay runs a payment and reports what happened: whether it was submitted, and
@@ -509,6 +514,8 @@ type outcome struct {
 	Status    string `json:"status"`
 	Note      string `json:"note"`
 	Refill    string `json:"refill"`
+	Block     uint64 `json:"block"`
+	Cost      string `json:"cost"`
 	Tx        string `json:"tx"`
 	Submitted bool   `json:"submitted"`
 }
@@ -526,26 +533,31 @@ func (p *participant) pay(kind, id string, to common.Address, amount string, ext
 }
 
 // deposits lists the finalized incoming transfers the account has recorded.
-func (p *participant) deposits() []struct {
+type incoming struct {
 	Tx       string `json:"tx"`
 	LogIndex uint   `json:"logIndex"`
 	From     string `json:"from"`
 	Amount   string `json:"amount"`
+	Block    uint64 `json:"block"`
+}
+
+func (p *participant) deposits() []incoming { return p.deposited().Deposits }
+
+// deposited also reports how far the search for incoming money has reached.
+func (p *participant) deposited() struct {
+	Deposits  []incoming `json:"deposits"`
+	ScannedTo uint64     `json:"scannedTo"`
 } {
 	p.h.t.Helper()
 	var reply struct {
-		Deposits []struct {
-			Tx       string `json:"tx"`
-			LogIndex uint   `json:"logIndex"`
-			From     string `json:"from"`
-			Amount   string `json:"amount"`
-		} `json:"deposits"`
+		Deposits  []incoming `json:"deposits"`
+		ScannedTo uint64     `json:"scannedTo"`
 	}
 	out := p.mustRun("-json", "deposits")
 	if err := json.Unmarshal([]byte(out), &reply); err != nil {
 		p.h.t.Fatalf("deposits output %q: %v", out, err)
 	}
-	return reply.Deposits
+	return reply
 }
 
 // --- shared ABIs ---
@@ -599,6 +611,17 @@ func wordOfInt(v *big.Int) []byte {
 }
 
 func tokens(n int64) *big.Int { return big.NewInt(n * tokenScale) }
+
+// formatUSDT renders base units the way railctl does, so an assertion can
+// compare against what the binary printed.
+func formatUSDT(v *big.Int) string {
+	whole, frac := new(big.Int).QuoRem(v, big.NewInt(tokenScale), new(big.Int))
+	digits := strings.TrimRight(fmt.Sprintf("%06d", frac.Int64()), "0")
+	for len(digits) < 2 {
+		digits += "0"
+	}
+	return whole.String() + "." + digits
+}
 
 func ether(n int64) *big.Int {
 	return new(big.Int).Mul(big.NewInt(n), big.NewInt(1_000_000_000_000_000_000))

@@ -216,6 +216,27 @@ railctl retry <id>                    # if a payment is stuck
 
 Identifiers are yours to pick; `openssl rand -hex 32` is fine.
 
+`balance` shows the money twice: as it is now, and as it stood at the last
+settled block. The difference between the two lines is money in flight.
+
+```text
+balance 48.78  reserve 0.000456589
+settled 48.78  reserve 0.000456589  at block 302237886
+```
+
+`status` adds, once an operation has settled, which transaction carried it
+and where — and for a refill, what buying the gas actually cost, which is
+less than the amount it was allowed to spend.
+
+```text
+0x0abf…35da confirmed
+  settled in 0x3222b8ec…a7b73b at block 297406682
+  cost 1.2194
+```
+
+`deposits` ends with the block it searched up to, so an empty list means no
+money arrived rather than that nothing was looked for.
+
 Amounts are written the way you say them: `25.00`, `0.50`, `1250`. There is no
 floating point anywhere inside — amounts are whole numbers of the token's
 smallest unit throughout.
