@@ -9,17 +9,18 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
-func TestClassifyReadsOnlyFinalizedFacts(t *testing.T) {
+func TestClassifyReadsOnlySettledFacts(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		fact *Fact
 		want Status
 	}{
-		{"nothing finalized yet", nil, StatusPending},
-		{"finalized and executed", &Fact{Executed: true}, StatusConfirmed},
-		{"finalized and not executed", &Fact{Executed: false}, StatusFailed},
+		{"nothing settled yet", nil, StatusPending},
+		{"settled and executed", &Fact{Executed: true}, StatusConfirmed},
+		{"settled and not executed", &Fact{Executed: false}, StatusFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := classify(tc.fact); got != tc.want {
@@ -150,6 +151,62 @@ func TestScanDepositsRecordsIncomingMoneyOnce(t *testing.T) {
 	all, _ := r.Deposits()
 	if len(all) != 2 {
 		t.Fatalf("recorded %d deposits, want 2", len(all))
+	}
+}
+
+// TestTheSettlementTagIsTheDomainsChoice is the property this library
+// promises about settlement: a fact is settled by the domain's tag and by
+// nothing else. The same payment and the same deposit are confirmed as soon
+// as they are mined on a domain that trusts the sequencer, and only after
+// finality on one that does not.
+func TestTheSettlementTagIsTheDomainsChoice(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		tag           rpc.BlockNumber
+		settledByHead bool
+	}{
+		{rpc.LatestBlockNumber, true},
+		{rpc.SafeBlockNumber, false},
+		{rpc.FinalizedBlockNumber, false},
+	} {
+		t.Run(tc.tag.String(), func(t *testing.T) {
+			d := testDomain()
+			d.Finality = tc.tag
+			r, chain, _ := newTestRailOn(t, d)
+			chain.addTransferLog(chain.head, 0, d.Token, bob, r.Account(), big.NewInt(5))
+			mustPrepare(t, r, id(1), bob, 10_000_000)
+			hash, err := r.Send(ctx, id(1))
+			if err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			chain.include(t, hash, true, transferLogOf(d, r.Account(), bob, big.NewInt(10_000_000)))
+
+			want := StatusPending
+			if tc.settledByHead {
+				want = StatusConfirmed
+			}
+			if status, _ := r.Status(ctx, id(1)); status != want {
+				t.Fatalf("mined payment is %s under %s, want %s", status, tc.tag, want)
+			}
+			found, err := r.ScanDeposits(ctx)
+			if err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if (len(found) == 1) != tc.settledByHead {
+				t.Fatalf("mined deposit: found %d under %s", len(found), tc.tag)
+			}
+
+			chain.finalize()
+			if status, _ := r.Status(ctx, id(1)); status != StatusConfirmed {
+				t.Fatalf("after finality the payment is %s under %s", status, tc.tag)
+			}
+			if _, err := r.ScanDeposits(ctx); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if all, _ := r.Deposits(); len(all) != 1 {
+				t.Fatalf("after finality %d deposits under %s, want 1", len(all), tc.tag)
+			}
+		})
 	}
 }
 
@@ -332,7 +389,7 @@ func TestRefillCostRefusesWhatItCannotKnow(t *testing.T) {
 	})
 }
 
-func TestFinalizedBalancesReadTheSettledBlockNotTheLatest(t *testing.T) {
+func TestSettledBalancesReadTheSettledBlockNotTheLatest(t *testing.T) {
 	ctx := context.Background()
 	r, chain, _ := newTestRail(t)
 	// The two heights disagree: a payment is mined but not finalized, so the
@@ -342,9 +399,9 @@ func TestFinalizedBalancesReadTheSettledBlockNotTheLatest(t *testing.T) {
 	chain.token[r.Account()] = big.NewInt(990_000_000)
 	chain.gas[r.Account()] = big.NewInt(55)
 
-	token, gas, block, err := r.FinalizedBalances(ctx)
+	token, gas, block, err := r.SettledBalances(ctx)
 	if err != nil {
-		t.Fatalf("finalized balances: %v", err)
+		t.Fatalf("settled balances: %v", err)
 	}
 	if token.Cmp(big.NewInt(1_000_000_000)) != 0 || gas.Cmp(big.NewInt(77)) != 0 {
 		t.Fatalf("read %s and %s, which is the latest state, not the settled one", token, gas)

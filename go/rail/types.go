@@ -1,7 +1,7 @@
 // Package rail is the money rail: an ordinary account that holds a stablecoin
 // as money and the chain's native currency as an operating reserve, pays with
 // plain token transfers, keeps its own reserve topped up, and reports
-// finalized facts.
+// settled facts.
 //
 // There is no rail contract, no relayer and no operator. The token's own
 // ledger is the ledger; the account's own transaction nonce serialises its
@@ -18,6 +18,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 // Kind is what an operation is for. Transfer and withdraw are the same token
@@ -145,18 +146,18 @@ type Submission struct {
 	FeeCap *big.Int
 }
 
-// Fact records a finalized outcome. Finalized facts cannot change, so this is
-// a cache rather than authority.
+// Fact records a settled outcome. Settled facts cannot change, so this is a
+// cache rather than authority.
 type Fact struct {
 	TxHash      common.Hash
 	BlockNumber uint64
-	// Executed is false when the intent's nonce was finalized without the
+	// Executed is false when the intent's nonce was settled without the
 	// intent executing: a reverted transaction, or one this account never
 	// recorded.
 	Executed bool
 }
 
-// Deposit is one finalized incoming token transfer. Its identity is the log
+// Deposit is one settled incoming token transfer. Its identity is the log
 // that carried it, so one transfer is recognised exactly once.
 type Deposit struct {
 	TxHash      common.Hash
@@ -252,9 +253,9 @@ type Domain struct {
 	// property of the token, so amounts are the domain's business and not the
 	// app's.
 	Decimals uint8
-	// Finality names the mechanism that makes a fact permanent. Only true
-	// finality is supported, because a confirmed fact must never revert.
-	Finality string
+	// Finality is the block tag treated as settled: latest, safe or finalized.
+	// Below true finality a fact is the sequencer's word; the host decides its trust.
+	Finality rpc.BlockNumber
 	// FromBlock is where deposit observation starts: the block before which
 	// this account had no history.
 	FromBlock uint64
@@ -273,8 +274,8 @@ func (d Domain) Validate() error {
 	if d.Decimals == 0 || d.Decimals > 36 {
 		return fmt.Errorf("%w: domain %q: token decimals must be set", ErrBadInput, d.Name)
 	}
-	if d.Finality != "finalized" {
-		return fmt.Errorf("%w: domain %q: finality %q unsupported: only true finality (\"finalized\") is safe here",
+	if d.Finality != rpc.LatestBlockNumber && d.Finality != rpc.SafeBlockNumber && d.Finality != rpc.FinalizedBlockNumber {
+		return fmt.Errorf("%w: domain %q: finality %s unsupported: one of latest, safe, finalized",
 			ErrBadInput, d.Name, d.Finality)
 	}
 	if d.Venue.Router == (common.Address{}) || d.Venue.Quoter == (common.Address{}) || d.Venue.WETH == (common.Address{}) {
@@ -309,7 +310,7 @@ func (d Domain) FundingChecklist(account common.Address) string {
 	return fmt.Sprintf(`to make this account operational, fund it:
   1. send the stablecoin to %s
   2. send at least %s of the native currency to the same address
-  3. wait for finality
+  3. wait until the chain settles it
 
 after that the account keeps its own gas: it buys more with its own
 stablecoin whenever the reserve runs low.`, account, FormatNative(d.Gas.Min))
@@ -409,7 +410,7 @@ var (
 	// projecting the same reserve twice.
 	ErrInFlight = errors.New("rail: an operation is still in flight")
 	// ErrNeedRefill is returned when the reserve is too low for the payment.
-	// Nothing was signed: refill, wait for finality, then ask again.
+	// Nothing was signed: refill, wait for it to settle, then ask again.
 	ErrNeedRefill = errors.New("rail: reserve too low, refill first")
 	// ErrNoRefillNeeded is returned when a refill is asked for and the reserve
 	// is already sufficient.
@@ -424,7 +425,7 @@ var (
 	// ErrFeesAboveBound is returned when a refill would cost more than the
 	// configured bound. The account waits for cheaper gas.
 	ErrFeesAboveBound = errors.New("rail: gas costs more than the configured bound")
-	// ErrUnreconciled is returned when a finalized account nonce cannot be
+	// ErrUnreconciled is returned when a settled account nonce cannot be
 	// matched to a recorded intent: something else signed with this key.
-	ErrUnreconciled = errors.New("rail: a finalized nonce does not match any recorded intent; one signer per key")
+	ErrUnreconciled = errors.New("rail: a settled nonce does not match any recorded intent; one signer per key")
 )

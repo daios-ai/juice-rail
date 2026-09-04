@@ -21,6 +21,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 
 	"github.com/daios-ai/juice-rail/go/rail"
 	"github.com/daios-ai/juice-rail/go/sqlite"
@@ -66,15 +67,15 @@ stderr, data to stdout.
 // where to buy gas and how much gas to keep. Every address is configuration,
 // never code.
 type config struct {
-	Name      string      `json:"name"`
-	ChainID   uint64      `json:"chainId"`
-	RPC       string      `json:"rpc"`
-	Token     string      `json:"token"`
-	Decimals  uint8       `json:"decimals"`
-	Finality  string      `json:"finality"`
-	FromBlock uint64      `json:"fromBlock"`
-	Venue     venueConfig `json:"venue"`
-	Gas       gasConfig   `json:"gas"`
+	Name      string          `json:"name"`
+	ChainID   uint64          `json:"chainId"`
+	RPC       string          `json:"rpc"`
+	Token     string          `json:"token"`
+	Decimals  uint8           `json:"decimals"`
+	Finality  rpc.BlockNumber `json:"finality"`
+	FromBlock uint64          `json:"fromBlock"`
+	Venue     venueConfig     `json:"venue"`
+	Gas       gasConfig       `json:"gas"`
 }
 
 type venueConfig struct {
@@ -110,10 +111,6 @@ func loadConfig(path string) (config, error) {
 
 // domain turns the configuration into the domain the rail binds to.
 func (c config) domain() (rail.Domain, error) {
-	finality := c.Finality
-	if finality == "" {
-		finality = "finalized"
-	}
 	gas := rail.GasPolicy{
 		SlippageBps: c.Gas.SlippageBps,
 		PaymentGas:  c.Gas.PaymentGas,
@@ -134,7 +131,7 @@ func (c config) domain() (rail.Domain, error) {
 		ChainID:   new(big.Int).SetUint64(c.ChainID),
 		Token:     common.HexToAddress(c.Token),
 		Decimals:  c.decimals(),
-		Finality:  finality,
+		Finality:  c.Finality,
 		FromBlock: c.FromBlock,
 		Venue: rail.Venue{
 			Router:   common.HexToAddress(c.Venue.Router),
@@ -644,7 +641,7 @@ func (a *app) balance(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	settledToken, settledGas, block, err := a.rail.FinalizedBalances(ctx)
+	settledToken, settledGas, block, err := a.rail.SettledBalances(ctx)
 	if err != nil {
 		return err
 	}
@@ -667,7 +664,7 @@ func (a *app) balance(ctx context.Context) error {
 	)
 }
 
-// deposits catches up with finalized incoming transfers and lists them.
+// deposits catches up with settled incoming transfers and lists them.
 // Receiving needs no transaction from this account at all.
 func (a *app) deposits(ctx context.Context) error {
 	if _, err := a.rail.ScanDeposits(ctx); err != nil {

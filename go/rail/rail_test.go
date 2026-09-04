@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 // fakeChain is a node small enough to reason about: blocks are made by the
@@ -90,10 +91,14 @@ func (c *fakeChain) ChainID(context.Context) (*big.Int, error) {
 func (c *fakeChain) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The tags are told apart: latest is the head, safe and finalized are
+	// the settled height the test controls.
 	n := c.head
-	if number != nil && number.Sign() < 0 {
+	switch {
+	case number == nil || number.Int64() == int64(rpc.LatestBlockNumber):
+	case number.Sign() < 0:
 		n = c.finalized
-	} else if number != nil {
+	default:
 		n = number.Uint64()
 	}
 	return &types.Header{
@@ -124,8 +129,11 @@ func (c *fakeChain) NonceAt(_ context.Context, account common.Address, block *bi
 	if block == nil {
 		return c.nextNonce[account], nil
 	}
-	// A nonce is only spent, as far as anyone may rely on it, once the block
-	// that spent it has finalized.
+	// At the head a nonce is spent once mined; below the head only once the
+	// block that spent it has finalized.
+	if block.Uint64() >= c.head {
+		return c.minedNonce[account], nil
+	}
 	return c.finalNonce[account], nil
 }
 
@@ -349,7 +357,7 @@ func testDomain() Domain {
 		ChainID:  big.NewInt(31337),
 		Token:    common.HexToAddress("0x00000000000000000000000000000000000000a0"),
 		Decimals: 6,
-		Finality: "finalized",
+		Finality: rpc.FinalizedBlockNumber,
 		Venue: Venue{
 			Router:  common.HexToAddress("0x00000000000000000000000000000000000000b0"),
 			Quoter:  common.HexToAddress("0x00000000000000000000000000000000000000c0"),
@@ -369,7 +377,12 @@ func testDomain() Domain {
 
 func newTestRail(t *testing.T) (*Rail, *fakeChain, *memStore) {
 	t.Helper()
-	d := testDomain()
+	return newTestRailOn(t, testDomain())
+}
+
+// newTestRailOn is newTestRail on a domain the test has adjusted.
+func newTestRailOn(t *testing.T, d Domain) (*Rail, *fakeChain, *memStore) {
+	t.Helper()
 	chain := newFakeChain(d)
 	store := newMemStore()
 	key, err := crypto.HexToECDSA("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
@@ -643,7 +656,8 @@ func TestNewRefusesAnIncompleteDomain(t *testing.T) {
 		name  string
 		spoil func(*Domain)
 	}{
-		{"no finality", func(d *Domain) { d.Finality = "12 confirmations" }},
+		{"no finality", func(d *Domain) { d.Finality = 0 }},
+		{"a tag that is not settled", func(d *Domain) { d.Finality = rpc.PendingBlockNumber }},
 		{"no token", func(d *Domain) { d.Token = common.Address{} }},
 		{"no venue", func(d *Domain) { d.Venue.Router = common.Address{} }},
 		{"reserve below its own fee bound", func(d *Domain) { d.Gas.Min = big.NewInt(1) }},

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 func testConfig() config {
@@ -15,7 +17,7 @@ func testConfig() config {
 		RPC:      "http://127.0.0.1:8545",
 		Token:    "0x00000000000000000000000000000000000000a0",
 		Decimals: 6,
-		Finality: "finalized",
+		Finality: rpc.FinalizedBlockNumber,
 		Venue: venueConfig{
 			Router:  "0x00000000000000000000000000000000000000b0",
 			Quoter:  "0x00000000000000000000000000000000000000c0",
@@ -41,6 +43,24 @@ func TestConfigBecomesAUsableDomain(t *testing.T) {
 	}
 	if d.Gas.Min.String() != "20000000000000000" || d.Venue.FeeTier != 500 {
 		t.Fatalf("domain came out as %+v", d)
+	}
+}
+
+// The settlement tag is a trust decision, so a file that leaves it out is
+// refused rather than given a default nobody chose.
+func TestConfigWithoutASettlementTagIsRefused(t *testing.T) {
+	var c config
+	if err := json.Unmarshal([]byte(`{"finality": "latest"}`), &c); err != nil || c.Finality != rpc.LatestBlockNumber {
+		t.Fatalf("the tag does not decode from its name: %v %v", c.Finality, err)
+	}
+	c = testConfig()
+	c.Finality = 0
+	d, err := c.domain()
+	if err != nil {
+		t.Fatalf("domain: %v", err)
+	}
+	if err := d.Validate(); err == nil {
+		t.Fatal("a domain with no settlement tag was accepted")
 	}
 }
 

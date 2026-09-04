@@ -34,7 +34,7 @@ func TestStory1Onboard(t *testing.T) {
 		t.Fatalf("init said %q", out)
 	}
 	// Onboarding is a checklist, and it says both things that must be sent.
-	for _, want := range []string{"send the stablecoin", "native currency", "wait for finality"} {
+	for _, want := range []string{"send the stablecoin", "native currency", "wait until the chain settles it"} {
 		if !strings.Contains(checklist.String(), want) {
 			t.Fatalf("the funding checklist does not mention %q:\n%s", want, checklist.String())
 		}
@@ -49,7 +49,7 @@ func TestStory1Onboard(t *testing.T) {
 
 	h.mintTo(account, tokens(1000))
 	h.fund(account, wei(reserveMax))
-	h.settleAndFinalise()
+	h.settle()
 
 	balance := alice.mustRun("balance")
 	if !strings.Contains(balance, "balance 1000.00") || !strings.Contains(balance, "reserve 0.05") {
@@ -62,14 +62,14 @@ func TestStory1Onboard(t *testing.T) {
 	if !strings.Contains(got.Note, "submitted") {
 		t.Fatalf("a funded account could not pay: %+v", got)
 	}
-	h.settleAndFinalise()
+	h.settle()
 	if status := alice.status(id); status != "confirmed" {
 		t.Fatalf("the first payment is %s, want confirmed", status)
 	}
 }
 
 // 2. deposit: money arrives with no transaction from this account at all, and
-// each finalized transfer is recognised exactly once.
+// each settled transfer is recognised exactly once.
 func TestStory2Deposit(t *testing.T) {
 	h := newHarness(t)
 	alice := h.participant("alice", aliceKeyHex)
@@ -78,22 +78,21 @@ func TestStory2Deposit(t *testing.T) {
 	payer := addressOf(t, payerKeyHex)
 	h.mintTo(payer, tokens(500))
 	h.fund(payer, ether(1))
-	h.settleAndFinalise()
+	h.settle()
 
 	// Two payments in from outside: an exchange and a wallet, say.
 	h.transferFrom(payerKeyHex, account, tokens(120))
 	h.transferFrom(payerKeyHex, account, tokens(30))
-	h.mine(1)
 
-	// Inclusion is not confirmation.
+	// Nothing is recorded before the transfers are mined.
 	if got := alice.deposits(); len(got) != 0 {
-		t.Fatalf("%d deposits before finality", len(got))
+		t.Fatalf("%d deposits before inclusion", len(got))
 	}
-	h.finalise()
+	h.settle()
 
 	got := alice.deposits()
 	if len(got) != 2 {
-		t.Fatalf("%d deposits after finality, want 2", len(got))
+		t.Fatalf("%d deposits after settlement, want 2", len(got))
 	}
 	if got[0].Amount != "120.00" || got[1].Amount != "30.00" {
 		t.Fatalf("deposits read %+v", got)
@@ -129,11 +128,11 @@ func TestStory3Transfer(t *testing.T) {
 
 	h.mintTo(from, tokens(1000))
 	h.fund(from, wei(reserveMax))
-	h.settleAndFinalise()
+	h.settle()
 
 	id := freshID(t)
 	alice.pay("transfer", id, to, "250.00")
-	h.settleAndFinalise()
+	h.settle()
 
 	settled := alice.settlement(id)
 	if settled.Status != "confirmed" {
@@ -157,7 +156,7 @@ func TestStory3Transfer(t *testing.T) {
 
 	// Repeating the command is a replay, not a second payment.
 	alice.pay("transfer", id, to, "250.00")
-	h.settleAndFinalise()
+	h.settle()
 	if n := h.transfers(from, to); n != 1 {
 		t.Fatalf("the money moved %d times", n)
 	}
@@ -168,10 +167,10 @@ func TestStory3Transfer(t *testing.T) {
 	}
 	// And the recipient can spend what it received, once it has gas of its own.
 	h.fund(to, wei(reserveMax))
-	h.settleAndFinalise()
+	h.settle()
 	back := freshID(t)
 	bob.pay("transfer", back, from, "10.00")
-	h.settleAndFinalise()
+	h.settle()
 	if bob.status(back) != "confirmed" {
 		t.Fatal("the recipient could not spend what it received")
 	}
@@ -187,11 +186,11 @@ func TestStory4Withdraw(t *testing.T) {
 
 	h.mintTo(account, tokens(1000))
 	h.fund(account, wei(reserveMax))
-	h.settleAndFinalise()
+	h.settle()
 
 	id := freshID(t)
 	alice.pay("withdraw", id, exchange, "300.00")
-	h.settleAndFinalise()
+	h.settle()
 
 	if status := alice.status(id); status != "confirmed" {
 		t.Fatalf("withdrawal is %s, want confirmed", status)
@@ -218,7 +217,7 @@ func TestStory5Refill(t *testing.T) {
 	h.mintTo(account, tokens(1000))
 	// Enough gas to buy gas, not enough to pay from.
 	h.setReserve(account, wei("15000000000000000")) // 0.015
-	h.settleAndFinalise()
+	h.settle()
 
 	before := h.tokenBalance(account)
 	id := freshID(t)
@@ -234,7 +233,7 @@ func TestStory5Refill(t *testing.T) {
 	if alice.status(id) != "unknown" {
 		t.Fatal("a payment that never ran left a record behind")
 	}
-	h.settleAndFinalise()
+	h.settle()
 
 	// The refill reports what it actually spent, which is below the ceiling it
 	// was allowed and equals the money that left the account.
@@ -271,7 +270,7 @@ func TestStory5Refill(t *testing.T) {
 	if second.Refill != "" {
 		t.Fatalf("the payment asked for a second refill: %+v", second)
 	}
-	h.settleAndFinalise()
+	h.settle()
 	if status := alice.status(id); status != "confirmed" {
 		t.Fatalf("the payment after a refill is %s, want confirmed", status)
 	}
@@ -285,7 +284,7 @@ func TestStory5Refill(t *testing.T) {
 	poorAccount := poor.account()
 	h.mintTo(poorAccount, tokens(100))
 	h.setReserve(poorAccount, wei("15000000000000000"))
-	h.settleAndFinalise()
+	h.settle()
 
 	refusal := poor.mustFail("transfer", freshID(t), to.Hex(), "5.00")
 	if !strings.Contains(refusal, "stablecoin too low") {
@@ -306,7 +305,7 @@ func TestStory6Recovery(t *testing.T) {
 
 	h.mintTo(account, tokens(1000))
 	h.fund(account, wei(reserveMax))
-	h.settleAndFinalise()
+	h.settle()
 
 	// Killed after the write-ahead record and before anything was signed.
 	first := freshID(t)
@@ -319,7 +318,7 @@ func TestStory6Recovery(t *testing.T) {
 	}
 	// A fresh process finishes it, on the nonce the record already owns.
 	alice.mustRun("retry", first)
-	h.settleAndFinalise()
+	h.settle()
 	if status := alice.status(first); status != "confirmed" {
 		t.Fatalf("the resumed payment is %s, want confirmed", status)
 	}
@@ -327,14 +326,14 @@ func TestStory6Recovery(t *testing.T) {
 		t.Fatalf("the resumed payment moved money %d times", n)
 	}
 
-	// Killed after broadcasting, before anything finalized.
+	// Killed after broadcasting, before anything settled.
 	second := freshID(t)
 	alice.mustRun("-halt-after", "submit", "transfer", second, to.Hex(), "60.00")
 	h.mine(1)
 	// A fresh process retries what it does not yet know the outcome of. The
 	// nonce is the same, so at most one of the two can ever execute.
 	alice.mustRun("retry", second)
-	h.settleAndFinalise()
+	h.settle()
 
 	if status := alice.status(second); status != "confirmed" {
 		t.Fatalf("after a crash and a retry the payment is %s, want confirmed", status)
@@ -347,7 +346,7 @@ func TestStory6Recovery(t *testing.T) {
 	}
 	// Repeating the whole command changes nothing.
 	alice.pay("transfer", second, to, "60.00")
-	h.settleAndFinalise()
+	h.settle()
 	if n := h.transfers(account, to); n != 2 {
 		t.Fatalf("a repeated command moved money %d times", n)
 	}
@@ -360,11 +359,11 @@ func TestDomainsAreIndependent(t *testing.T) {
 	account := alice.account()
 	first.mintTo(account, tokens(100))
 	first.fund(account, wei(reserveMax))
-	first.settleAndFinalise()
+	first.settle()
 
 	id := freshID(t)
 	alice.pay("transfer", id, addressOf(t, bobKeyHex), "10.00")
-	first.settleAndFinalise()
+	first.settle()
 
 	second := newHarnessOn(t, defaultChainID+1)
 	crossed := &participant{h: second, name: "alice", key: aliceKeyHex, store: alice.store}
@@ -384,10 +383,10 @@ func TestStory7WithdrawAll(t *testing.T) {
 
 	h.mintTo(account, tokens(500))
 	h.fund(account, wei(reserveMax))
-	h.settleAndFinalise()
+	h.settle()
 
 	alice.pay("transfer", freshID(t), addressOf(t, bobKeyHex), "5.00")
-	h.settleAndFinalise()
+	h.settle()
 
 	whole := h.tokenBalance(account)
 	id := freshID(t)
@@ -395,7 +394,7 @@ func TestStory7WithdrawAll(t *testing.T) {
 	if out.Refill != "" {
 		t.Fatalf("leaving bought gas on the way out: %+v", out)
 	}
-	h.settleAndFinalise()
+	h.settle()
 
 	if status := alice.status(id); status != "confirmed" {
 		t.Fatalf("leaving is %s, want confirmed", status)

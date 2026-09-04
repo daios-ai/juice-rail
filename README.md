@@ -47,10 +47,12 @@ domain = (chain, token address)
 Two domains are two separate worlds. Money on one is not money on the other,
 and there is no bridge here.
 
-**Finality.** A chain can briefly reorganise: a block that looked settled can
-disappear. Finality is the point past which it cannot. juice-rail treats
-nothing as real before finality — not a submitted transaction, not one already
-included in a block.
+**Settlement.** Each domain names the block tag past which juice-rail treats a
+fact as real: `latest`, `safe` or `finalized`. Nothing is real before that —
+not a submitted transaction, not one already included in a block. The Arbitrum
+domains say `latest`: the sequencer's confirmation is trusted, which is what
+choosing Arbitrum means, and a fact settles in about a second. A domain that
+wants Ethereum finality says `finalized` and waits for it.
 
 ---
 
@@ -58,7 +60,7 @@ included in a block.
 
 **Deposit** is money arriving. Someone — an exchange, a wallet, another
 participant — sends the stablecoin to your address. You do nothing. You send no
-transaction and you need no gas. Once it finalizes, juice-rail records it.
+transaction and you need no gas. Once it settles, juice-rail records it.
 
 **Transfer** is paying another participant. Your account sends the stablecoin
 to theirs. You pay the gas; they pay nothing and need nothing.
@@ -148,7 +150,7 @@ is how the network is meant to replace a stuck transaction.
 ```text
 unknown    never heard of it
 pending    it may still happen
-confirmed  it happened, and finality says so
+confirmed  it happened, and the settled chain says so
 failed     it can never happen
 ```
 
@@ -197,7 +199,7 @@ profile alice on domain arbitrum-sepolia, account 0x3B06...E4fD
 to make this account operational, fund it:
   1. send the stablecoin to 0x3B06...E4fD
   2. send at least 0.0004 of the native currency to the same address
-  3. wait for finality
+  3. wait until the chain settles it
 ```
 
 Step 2 is the only time you handle gas currency by hand.
@@ -206,7 +208,7 @@ Step 2 is the only time you handle gas currency by hand.
 
 ```sh
 railctl balance                       # money, and the reserve, separately
-railctl deposits                      # money that arrived and finalized
+railctl deposits                      # money that arrived and settled
 railctl transfer <id> <address> 25.00
 railctl withdraw <id> <address> 25.00
 railctl withdraw <id> <address> all   # send the whole balance out
@@ -249,7 +251,7 @@ reserve low: refill 0x82295988... submitted 0x5eb29983...;
 run the payment again once it is confirmed
 ```
 
-Run the same command again after finality and it goes through. Add
+Run the same command again once the refill has settled and it goes through. Add
 `-no-refill` if you would rather it just refused.
 
 Add `-json` to any command for machine-readable output.
@@ -278,7 +280,7 @@ A domain file, field by field:
   "rpc": "https://...",
   "token": "0x8e87...d568",
   "decimals": 6,
-  "finality": "finalized",
+  "finality": "latest",
   "fromBlock": 297184700,
   "venue": {
     "router":   "0x101F...663E",
@@ -301,8 +303,9 @@ A domain file, field by field:
 - `decimals` is how many base units make one token. It is checked against the
   token itself at `init`, because mistaking six for eighteen would misstate
   every amount by a factor of a trillion.
-- `finality` must be `finalized`. Counting confirmations is not supported,
-  because something reported as confirmed must never come undone.
+- `finality` is the block tag treated as settled: `latest`, `safe` or
+  `finalized`. The Arbitrum files say `latest`. Counting confirmations is not
+  supported.
 - `fromBlock` is where the search for deposits starts. Set it to the block your
   account was created in; there is nothing before that to find.
 - `venue.router02` says which version of the Uniswap router is deployed. The
@@ -344,14 +347,14 @@ addresses to put in the domain file.
 r, err := rail.New(domain, store, chainClient, key)
 
 r.Balances(ctx)                                 // money, reserve
-r.ScanDeposits(ctx)                             // newly finalized money in
+r.ScanDeposits(ctx)                             // newly settled money in
 r.Pay(ctx, id, rail.KindTransfer, to, amount)   // the whole payment flow
 r.WithdrawAll(ctx, id, to)                      // send the whole balance out
 r.Retry(ctx, id)                                // same nonce, higher fee
-r.Status(ctx, id)                               // from finalized facts only
+r.Status(ctx, id)                               // from settled facts only
 r.Outcome(ctx, id)                              // the settled tx, and its block
 r.RefillCost(ctx, refillID)                     // what buying gas actually cost
-r.FinalizedBalances(ctx)                        // balances at a settled block N
+r.SettledBalances(ctx)                          // balances at a settled block N
 r.DepositsScannedTo()                           // deposits observed through ...
 ```
 
@@ -360,7 +363,7 @@ too low and the account bought gas instead:
 
 ```go
 if out.Refilled() {
-    // out.RefillTx is buying gas. Wait for it to finalize, then call Pay
+    // out.RefillTx is buying gas. Wait for it to settle, then call Pay
     // again with the same identifier.
 }
 ```
@@ -381,7 +384,7 @@ with nothing amiss. The procedure:
 
 ```text
 1. ScanDeposits          advance your view of incoming money
-2. FinalizedBalances     the chain's answer at block N
+2. SettledBalances       the chain's answer at block N
 3. DepositsScannedTo     below N? repeat step 1
 4. Outcome, per operation you have not yet settled
 5. compare               chain balance at N == your ledger at N
@@ -409,8 +412,8 @@ over your own database — a SQLite one ships:
 ```text
 intents      which payment owns which nonce, written before signing
 submissions  each signed attempt, written before broadcasting
-facts        finalized outcomes, cached because they cannot change
-deposits     finalized money in, one record per log
+facts        settled outcomes, cached because they cannot change
+deposits     settled money in, one record per log
 ```
 
 One rule the library cannot enforce for you: **one signer per key.** Nonces are
@@ -431,7 +434,7 @@ rather than guessing.
 - The whole flow has been run on Arbitrum Sepolia against a real Uniswap V3
   pool, including a refill.
 
-What is assumed, and not checked here: finality is final, the token is a
+What is assumed, and not checked here: the domain's settlement tag is final, the token is a
 correct ERC-20 with EIP-2612 permits, the venue delivers what it quotes or
 reverts, gas stays below the configured bound, one signer per key, and the RPC
 tells the truth.

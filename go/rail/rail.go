@@ -157,7 +157,7 @@ func checkChain(ctx context.Context, d Domain, chain Chain) error {
 // and no transaction exists yet.
 //
 // If the reserve is too low it returns ErrNeedRefill and records nothing: call
-// Refill, wait for it to finalize, then Prepare again. If money is short it
+// Refill, wait for it to settle, then Prepare again. If money is short it
 // returns a shortage error, also having recorded nothing. Blocked is not lost.
 //
 // Preparing the same identifier twice with the same terms is a no-op, so a
@@ -285,7 +285,7 @@ type Outcome struct {
 	// TxHash is the payment. Zero if it did not run, or had already settled.
 	TxHash common.Hash
 	// RefillID and RefillTx are set when the reserve was too low and gas was
-	// bought instead. Ask again once that has finalized.
+	// bought instead. Ask again once that has settled.
 	RefillID ID
 	RefillTx common.Hash
 }
@@ -298,7 +298,7 @@ func (o Outcome) Refilled() bool { return o.RefillTx != (common.Hash{}) }
 // place and Pay does not second-guess it.
 //
 // Repeating a Pay with the same identifier is safe. Once the refill it
-// reports has finalized, call it again and the payment goes out.
+// reports has settled, call it again and the payment goes out.
 func (r *Rail) Pay(ctx context.Context, id ID, kind Kind, to common.Address, amount *big.Int) (Outcome, error) {
 	err := r.Prepare(ctx, id, kind, to, amount)
 	switch {
@@ -437,7 +437,7 @@ func (r *Rail) Retry(ctx context.Context, id ID) (common.Hash, error) {
 	return r.submit(ctx, in, next)
 }
 
-// Pending lists intents with no finalized outcome, oldest first.
+// Pending lists intents with no settled outcome, oldest first.
 func (r *Rail) Pending() ([]Intent, error) { return r.store.Pending(r.address) }
 
 // Intent returns a recorded intent.
@@ -472,7 +472,7 @@ func (r *Rail) ready(ctx context.Context) error {
 }
 
 // unresolved loads an intent that still needs sending. An intent that has
-// already finalized is reported as not live, so callers read its outcome
+// already settled is reported as not live, so callers read its outcome
 // instead of acting on it again.
 func (r *Rail) unresolved(id ID) (Intent, bool, error) {
 	in, ok, err := r.store.Intent(r.address, id)
@@ -553,12 +553,16 @@ func (r *Rail) nextNonce(ctx context.Context) (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("read nonce: %w", err)
 	}
-	finalized, err := r.chain.NonceAt(ctx, r.address, finalizedBlockArg)
+	head, err := r.settledHeader(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("read finalized nonce: %w", err)
+		return 0, err
 	}
-	if pending != finalized {
-		return 0, fmt.Errorf("%w: nonce %d is finalized but %d is already in use", ErrUnreconciled, finalized, pending)
+	settled, err := r.chain.NonceAt(ctx, r.address, head.Number)
+	if err != nil {
+		return 0, fmt.Errorf("read settled nonce: %w", err)
+	}
+	if pending != settled {
+		return 0, fmt.Errorf("%w: nonce %d is settled but %d is already in use", ErrUnreconciled, settled, pending)
 	}
 	return pending, nil
 }

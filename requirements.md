@@ -1,6 +1,6 @@
 # JUICE-RAIL
 
-Version: 0.3 (only MAJOR.MINOR)
+Version: 0.4 (only MAJOR.MINOR)
 
 INSTRUCTIONS: THIS FILE CONTAINS THE JUICE-RAIL REQUIREMENTS.
 BEFORE ADDING ANYTHING, ALWAYS CHECK WHETHER THE EXISTING TEXT CAN BE REWRITTEN.
@@ -16,7 +16,7 @@ host applications, plus a tiny standalone app as test and operations
 harness. Juice is one host among others.
 
 * The host is authoritative for its own ledger; the rail moves external
-  money and reports finalized facts.
+  money and reports settled facts.
 * A rail account is an EOA holding the stablecoin (money) and the native gas
   asset (operating reserve). Each account is its own vault.
 * Money movement uses ordinary EVM mechanisms — ERC-20 balances and
@@ -28,7 +28,7 @@ harness. Juice is one host among others.
 * Every operation is at-most-once; retry never duplicates.
 * On any shortage nothing is signed or submitted; the account waits. Blocked
   is not lost. Every failure is loud.
-* No stored observation of the chain is authoritative; only finalized facts
+* No stored observation of the chain is authoritative; only settled facts
   may be cached. Write-ahead records are authoritative commitments.
 * No floating-point accounting or stored exchange-rate state exists inside
   the rail.
@@ -41,9 +41,13 @@ A domain is one settlement environment:
 domain = (chain ID, stablecoin token address)
 ```
 
-Per-domain configuration: RPC, finality mechanism, first block to observe,
-swap venue, gas policy (MIN, MAX, slippage bound s in basis points, refill
-fee bound B, and the gas bounds of a payment and of a refill).
+Per-domain configuration: RPC, settlement tag (`latest`, `safe` or
+`finalized`), first block to observe, swap venue, gas policy (MIN, MAX,
+slippage bound s in basis points, refill fee bound B, and the gas bounds of a
+payment and of a refill).
+
+Settled means at or below the head at that tag. Below true finality a settled
+fact is the sequencer's word; the host prices that risk, the rail does not.
 
 Domains have independent balances and state. No bridging or cross-domain
 netting. The configured stablecoin (USDT0) is the accounting asset; amounts
@@ -71,7 +75,7 @@ Onboarding:
 1. create the EOA
 2. fund it with USDT0
 3. fund it with ETH >= the reserve minimum
-4. wait for finality
+4. wait for settlement
 ```
 
 This is the only point where ETH is normally acquired explicitly.
@@ -168,14 +172,14 @@ deploys an EIP-2612 MockUSDT0 and creates and seeds a real pool for it.
 4. Deposit
 
 A deposit is passive: any external party transfers USDT0 to the account
-address and pays its own gas. The rail watches finalized ERC-20 `Transfer`
+address and pays its own gas. The rail watches settled ERC-20 `Transfer`
 events. Deposit identity is
 
 ```text
 (domain, transaction hash, log index)
 ```
 
-so one finalized transfer is recognized exactly once. An exchange
+so one settled transfer is recognized exactly once. An exchange
 withdrawal to the account address is a deposit; no second hop exists.
 
 5. Transfer
@@ -208,17 +212,17 @@ replacement mechanism). The chain admits one transaction per nonce, so an
 intent executes at most once.
 
 ```text
-confirmed   a finalized successful transaction matching the intent
-failed      a finalized revert, or finalized state proves the nonce can no
+confirmed   a settled successful transaction matching the intent
+failed      a settled revert, or settled state proves the nonce can no
             longer carry the intent
 pending     otherwise
 ```
 
 An ERC-20 `Transfer` carries no intent ID: the sender reports the
-transaction hash to the host, which confirms against the finalized event.
+transaction hash to the host, which confirms against the settled event.
 
 After a crash or restore, the client assigns no new nonce until every nonce
-below the finalized account nonce is matched to an intent by calldata. One signer per key; concurrent signers are excluded by
+below the settled account nonce is matched to an intent by calldata. One signer per key; concurrent signers are excluded by
 assumption.
 
 8. Library
@@ -234,8 +238,8 @@ nothing else; logic a host has to write is logic missing from the library.
 ```text
 account   balances (USDT0, ETH reserve)   nonce
 pay (transfer, withdrawal), retry        prepare / send / refill beneath it
-deposit observation   status   finality   refill cost
-finalized balances and outcomes, so a host can audit at a settled block
+deposit observation   status   settlement   refill cost
+settled balances and outcomes, so a host can audit at a settled block
 domain check   amount parsing and formatting   funding checklist
 ```
 
@@ -244,7 +248,7 @@ Durable state, write-once or append-only, nothing else:
 ```text
 1. write-ahead intent records: which operation owns which nonce
 2. signed submissions, appended before broadcast
-3. cache of finalized facts, including observed deposits
+3. cache of settled facts, including observed deposits
 4. observation cursors: deposits scanned, nonces reconciled
 ```
 
@@ -299,14 +303,14 @@ and the whole sequence is also driven once on a staging domain against a
 real venue.
 
 ```text
-1. onboard      create, fund USDT0 + ETH, finality, operational
+1. onboard      create, fund USDT0 + ETH, settlement, operational
 2. deposit      external transfer credits exactly once by (tx, log index)
 3. transfer     A pays B; B needs nothing; amounts move exactly once
 4. withdraw     to an external destination
 5. refill       reserve dips below MIN; sized refill executes; insufficient
                 USDT0 blocks loudly with nothing signed
 6. recovery     killed after signing; restart reconciles nonces from
-                finalized history; retry duplicates nothing
+                settled history; retry duplicates nothing
 7. leave        the whole balance goes out in one transfer, buying no gas
 ```
 
@@ -322,7 +326,8 @@ library is conventionally tested and exercised by the seven stories.
 Trust base:
 
 ```text
-finality is final
+the domain's settlement tag is final (on Arbitrum, `latest`: the sequencer
+keeps its word)
 the pinned token is a correct ERC-20 with EIP-2612 permit
 the pinned venue delivers exact output or reverts atomically
 refill transaction cost <= B for liveness; beyond B, external top-up

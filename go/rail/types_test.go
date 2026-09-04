@@ -223,7 +223,7 @@ func TestTheFundingChecklistNamesBothAssetsAndTheAddress(t *testing.T) {
 		"send the stablecoin",
 		"native currency",
 		FormatNative(d.Gas.Min), // the minimum is what makes an account operational
-		"wait for finality",
+		"wait until the chain settles it",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("the checklist does not mention %q:\n%s", want, got)

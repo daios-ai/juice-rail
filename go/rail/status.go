@@ -18,27 +18,23 @@ const (
 	// StatusUnknown means no record of the intent.
 	StatusUnknown Status = "unknown"
 	// StatusPending means the intent may still execute: its nonce is not yet
-	// spent at finality. A transaction that stalls is pending, not failed.
+	// spent at the settled head. A transaction that stalls is pending, not failed.
 	StatusPending Status = "pending"
-	// StatusConfirmed means a finalized transaction carried out the intent.
+	// StatusConfirmed means a settled transaction carried out the intent.
 	StatusConfirmed Status = "confirmed"
 	// StatusFailed means the intent can never execute: its nonce is spent at
-	// finality by a reverted transaction, or by one this account never
+	// the settled head by a reverted transaction, or by one this account never
 	// recorded.
 	StatusFailed Status = "failed"
 )
-
-// finalizedBlockArg selects the "finalized" tag; go-ethereum encodes the RPC
-// block tags as negative numbers.
-var finalizedBlockArg = big.NewInt(-3)
 
 // maxScanSpan is how many blocks one deposit query may cover. Nodes commonly
 // refuse wider ranges, and the limit is theirs rather than any one provider's.
 const maxScanSpan = 10_000
 
 // classify is the whole decision, over a fact the caller has already gathered.
-// A fact only exists once the chain has finalized, so confirmed and failed are
-// both permanent.
+// A fact only exists once the chain has settled it, so confirmed and failed
+// are both permanent.
 func classify(f *Fact) Status {
 	switch {
 	case f == nil:
@@ -50,7 +46,7 @@ func classify(f *Fact) Status {
 	}
 }
 
-// Status reports where an intent stands, from finalized chain facts only.
+// Status reports where an intent stands, from settled chain facts only.
 func (r *Rail) Status(ctx context.Context, id ID) (Status, error) {
 	in, ok, err := r.store.Intent(r.address, id)
 	if err != nil {
@@ -70,16 +66,16 @@ func (r *Rail) status(ctx context.Context, in Intent) (Status, error) {
 	} else if cached {
 		return classify(&f), nil
 	}
-	head, err := r.finalizedHeader(ctx)
+	head, err := r.settledHeader(ctx)
 	if err != nil {
 		return StatusUnknown, err
 	}
 	spent, err := r.chain.NonceAt(ctx, r.address, head.Number)
 	if err != nil {
-		return StatusUnknown, fmt.Errorf("read finalized nonce: %w", err)
+		return StatusUnknown, fmt.Errorf("read settled nonce: %w", err)
 	}
-	// While the nonce is unspent at finality the intent may still execute, and
-	// nothing about it is durable yet.
+	// While the nonce is unspent at the settled head the intent may still
+	// execute, and nothing about it is durable yet.
 	if in.Nonce >= spent {
 		return StatusPending, nil
 	}
@@ -93,7 +89,7 @@ func (r *Rail) status(ctx context.Context, in Intent) (Status, error) {
 	return classify(&f), nil
 }
 
-// RefillCost reports the stablecoin a finalized refill actually consumed.
+// RefillCost reports the stablecoin a settled refill actually consumed.
 //
 // The intent records the most it was allowed to spend — the venue's quote plus
 // the slippage margin. This is what it did spend, read from the transaction
@@ -119,7 +115,7 @@ func (r *Rail) RefillCost(ctx context.Context, id ID) (*big.Int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Ask what finalized rather than reading the cache. A fact is derived when
+	// Ask what settled rather than reading the cache. A fact is derived when
 	// somebody looks, so its absence means nobody has looked — not that
 	// nothing has happened.
 	status, err := r.status(ctx, in)
@@ -129,7 +125,7 @@ func (r *Rail) RefillCost(ctx context.Context, id ID) (*big.Int, error) {
 	switch status {
 	case StatusConfirmed:
 	case StatusPending:
-		return nil, fmt.Errorf("%w: refill %s has not finalized", ErrInFlight, id)
+		return nil, fmt.Errorf("%w: refill %s has not settled", ErrInFlight, id)
 	case StatusFailed:
 		// A refill that reverted moved no stablecoin. It burned native
 		// currency, which is fuel rather than money and shows in the reserve.
@@ -161,22 +157,22 @@ func (r *Rail) RefillCost(ctx context.Context, id ID) (*big.Int, error) {
 	return spent[0], nil
 }
 
-// FinalizedBalances reports the account's money and reserve at the finalized
+// SettledBalances reports the account's money and reserve at the settled
 // head, and the block that head was at.
 //
 // Balances reads the present moment, which an audit cannot use: a payment
-// that is mined but not finalized has already left that figure while a
+// that is mined but not settled has already left that figure while a
 // host's ledger still counts it, so the two disagree with nothing wrong. At
 // a settled block both sides describe the same instant, so a difference is a
 // real discrepancy. The block is returned because the comparison is only
 // meaningful once the host has brought its ledger to the same cut.
 //
-// The read is always at the current finalized head, never at a chosen block:
+// The read is always at the current settled head, never at a chosen block:
 // past state is served only by archive nodes, and the endpoints this library
 // is documented against prune unevenly, so historical reads fail
 // intermittently rather than cleanly.
-func (r *Rail) FinalizedBalances(ctx context.Context) (token, gas *big.Int, block uint64, err error) {
-	head, err := r.finalizedHeader(ctx)
+func (r *Rail) SettledBalances(ctx context.Context) (token, gas *big.Int, block uint64, err error) {
+	head, err := r.settledHeader(ctx)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -189,11 +185,11 @@ func (r *Rail) FinalizedBalances(ctx context.Context) (token, gas *big.Int, bloc
 	return token, gas, head.Number.Uint64(), nil
 }
 
-// Outcome reports what finalized under an operation: the transaction that
+// Outcome reports what settled under an operation: the transaction that
 // carried it, the block it settled in, and whether it executed. The block is
 // what lets a host place the operation at the right point in its own ledger.
 //
-// The answer is resolved by asking what finalized, never by reading the
+// The answer is resolved by asking what settled, never by reading the
 // cached fact alone: a fact is derived when somebody looks, so its absence
 // means nobody has looked, not that nothing has happened.
 func (r *Rail) Outcome(ctx context.Context, id ID) (Fact, bool, error) {
@@ -234,14 +230,14 @@ func (r *Rail) DepositsScannedTo() (uint64, bool, error) {
 	return r.store.Cursor(r.address)
 }
 
-// outcome finds what finalized under an intent's nonce. Only this account's
+// outcome finds what settled under an intent's nonce. Only this account's
 // own recorded attempts are considered: a transaction hash commits to its
 // nonce, its destination and its calldata, so a receipt for a recorded hash is
 // proof that this exact intent was mined.
 //
 // A zero transaction hash means the nonce was spent by something this account
 // never recorded, which the intent can never recover from.
-func (r *Rail) outcome(ctx context.Context, in Intent, finalized *big.Int) (Fact, error) {
+func (r *Rail) outcome(ctx context.Context, in Intent, settled *big.Int) (Fact, error) {
 	subs, err := r.store.Submissions(r.address, in.ID)
 	if err != nil {
 		return Fact{}, err
@@ -256,8 +252,8 @@ func (r *Rail) outcome(ctx context.Context, in Intent, finalized *big.Int) (Fact
 			// a fact written from it would be permanent. Ask again later.
 			return Fact{}, fmt.Errorf("read receipt %s: %w", subs[i].TxHash, err)
 		}
-		if receipt.BlockNumber == nil || receipt.BlockNumber.Cmp(finalized) > 0 {
-			continue // included but not yet final
+		if receipt.BlockNumber == nil || receipt.BlockNumber.Cmp(settled) > 0 {
+			continue // included but not yet settled
 		}
 		return Fact{
 			TxHash:      subs[i].TxHash,
@@ -268,7 +264,7 @@ func (r *Rail) outcome(ctx context.Context, in Intent, finalized *big.Int) (Fact
 	return Fact{}, nil
 }
 
-// executed reports whether a finalized receipt really carried the intent out.
+// executed reports whether a settled receipt really carried the intent out.
 // A payment must also show its transfer: a token that reports failure by
 // returning false instead of reverting would otherwise look like success.
 func (r *Rail) executed(in Intent, receipt *types.Receipt) bool {
@@ -289,7 +285,7 @@ func (r *Rail) executed(in Intent, receipt *types.Receipt) bool {
 	return false
 }
 
-// settle brings every unresolved intent up to date against finality, so the
+// settle brings every unresolved intent up to date against the settled head, so the
 // records agree with the chain before anything new is decided.
 func (r *Rail) settle(ctx context.Context) error {
 	pending, err := r.store.Pending(r.address)
@@ -306,7 +302,7 @@ func (r *Rail) settle(ctx context.Context) error {
 
 // Reconcile matches every spent nonce back to a recorded intent. It is the
 // restart procedure: a crash may have left a signed transaction that this
-// process never saw finalize, and the chain is what says which one won.
+// process never saw settle, and the chain is what says which one won.
 //
 // A spent nonce with no recorded attempt behind it means something else signed
 // with this key. That cannot be repaired here, so it is reported rather than
@@ -318,13 +314,13 @@ func (r *Rail) Reconcile(ctx context.Context) error {
 }
 
 func (r *Rail) reconcile(ctx context.Context) error {
-	head, err := r.finalizedHeader(ctx)
+	head, err := r.settledHeader(ctx)
 	if err != nil {
 		return err
 	}
 	spent, err := r.chain.NonceAt(ctx, r.address, head.Number)
 	if err != nil {
-		return fmt.Errorf("read finalized nonce: %w", err)
+		return fmt.Errorf("read settled nonce: %w", err)
 	}
 	floor, ok, err := r.store.NonceFloor(r.address)
 	if err != nil {
@@ -362,20 +358,20 @@ func (r *Rail) reconcile(ctx context.Context) error {
 	return r.store.PutNonceFloor(r.address, spent)
 }
 
-// finalizedHeader reads the head under the domain's finality mechanism. Only
-// true finality qualifies, so a confirmed fact can never revert.
-func (r *Rail) finalizedHeader(ctx context.Context) (*types.Header, error) {
-	h, err := r.chain.HeaderByNumber(ctx, finalizedBlockArg)
+// settledHeader reads the head under the domain's settlement tag: the one
+// place the tag becomes a chain read, so every fact settles by the same rule.
+func (r *Rail) settledHeader(ctx context.Context) (*types.Header, error) {
+	h, err := r.chain.HeaderByNumber(ctx, big.NewInt(int64(r.domain.Finality)))
 	if err != nil {
-		return nil, fmt.Errorf("read finalized head: %w", err)
+		return nil, fmt.Errorf("read settled head: %w", err)
 	}
 	if h == nil {
-		return nil, fmt.Errorf("read finalized head: no header")
+		return nil, fmt.Errorf("read settled head: no header")
 	}
 	return h, nil
 }
 
-// ScanDeposits records incoming money that has finalized since the last scan
+// ScanDeposits records incoming money that has settled since the last scan
 // and returns what it found. A deposit needs no transaction from this account:
 // somebody sent it a token transfer, and the log that carried it is its
 // identity, so one transfer is recognised exactly once.
@@ -383,7 +379,7 @@ func (r *Rail) ScanDeposits(ctx context.Context) ([]Deposit, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	head, err := r.finalizedHeader(ctx)
+	head, err := r.settledHeader(ctx)
 	if err != nil {
 		return nil, err
 	}

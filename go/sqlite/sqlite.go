@@ -200,7 +200,7 @@ func (s *Store) IntentByNonce(account common.Address, nonce uint64) (rail.Intent
 	return in, true, nil
 }
 
-// Pending lists intents with no finalized outcome yet, so a restart knows what
+// Pending lists intents with no settled outcome yet, so a restart knows what
 // it still has to resolve.
 func (s *Store) Pending(account common.Address) ([]rail.Intent, error) {
 	rows, err := s.db.Query(
@@ -285,7 +285,7 @@ func (s *Store) Submissions(account common.Address, id rail.ID) ([]rail.Submissi
 	return out, rows.Err()
 }
 
-// PutFact caches a finalized outcome. Finalized facts cannot change, so a
+// PutFact caches a settled outcome. Settled facts cannot change, so a
 // repeat write is ignored rather than applied.
 func (s *Store) PutFact(account common.Address, id rail.ID, f rail.Fact) error {
 	executed := 0
@@ -323,7 +323,7 @@ func (s *Store) Fact(account common.Address, id rail.ID) (rail.Fact, bool, error
 	}, true, nil
 }
 
-// PutDeposit records one finalized incoming transfer. The log that carried it
+// PutDeposit records one settled incoming transfer. The log that carried it
 // is its identity, so recording it twice changes nothing.
 func (s *Store) PutDeposit(account common.Address, d rail.Deposit) error {
 	if _, err := s.db.Exec(

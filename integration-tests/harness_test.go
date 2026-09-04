@@ -36,9 +36,7 @@ const (
 	bobKeyHex      = "2222222222222222222222222222222222222222222222222222222222222222"
 	payerKeyHex    = "3333333333333333333333333333333333333333333333333333333333333333"
 
-	defaultChainID   = 31337
-	slotsInAnEpoch   = 1
-	blocksToFinalise = 3 // finalized lags the head by two blocks
+	defaultChainID = 31337
 
 	tokenScale = 1_000_000 // the token has six decimals
 
@@ -105,7 +103,6 @@ func (h *harness) startAnvil() {
 	cmd := exec.Command("anvil",
 		"--port", fmt.Sprint(port),
 		"--chain-id", h.chainID.String(),
-		"--slots-in-an-epoch", fmt.Sprint(slotsInAnEpoch),
 		"--silent",
 	)
 	cmd.Stderr = os.Stderr
@@ -159,18 +156,12 @@ func (h *harness) mine(n int) {
 	}
 }
 
-// finalise mines until the head at call time is finalized, which is the only
-// point at which the rail may report a confirmed fact.
-func (h *harness) finalise() {
-	h.t.Helper()
-	h.mine(blocksToFinalise)
-}
-
-// settleAndFinalise mines the pending work and pushes it past finality.
-func (h *harness) settleAndFinalise() {
+// settle mines the pending work. The stories run on the latest tag, as the
+// Arbitrum domains do, so one block is the point at which the rail may
+// report a settled fact.
+func (h *harness) settle() {
 	h.t.Helper()
 	h.mine(1)
-	h.finalise()
 }
 
 // setReserve puts an account's native balance at an exact figure, which is how
@@ -271,7 +262,7 @@ func (h *harness) sendTx(to *common.Address, data []byte, value *big.Int) *types
 		h.t.Fatalf("send transaction: %v", err)
 	}
 	// Setup transactions land immediately; the stories control everything after
-	// that with mine and finalise.
+	// that with mine and settle.
 	h.rpcCall("evm_mine")
 
 	deadline := time.Now().Add(20 * time.Second)
@@ -387,7 +378,7 @@ func (h *harness) writeConfig() {
 		"rpc":       h.rpcURL,
 		"token":     h.addr["MockUSDT0"].Hex(),
 		"decimals":  6,
-		"finality":  "finalized",
+		"finality":  "latest",
 		"fromBlock": 0,
 		"venue": map[string]any{
 			"router":  h.addr["MockRouter"].Hex(),

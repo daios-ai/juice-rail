@@ -8,7 +8,7 @@ import "github.com/ethereum/go-ethereum/common"
 //
 // The rail's own decisions — which intent owns which nonce — are
 // authoritative. Facts, deposits and the two cursors are cached observations
-// of a chain that has already finalized.
+// of a chain that has already settled.
 //
 // A store serves exactly one domain. Identifiers are unique only within a
 // domain, so a store shared between two would alias their intents. An
@@ -21,9 +21,9 @@ type Store interface {
 	PutIntent(account common.Address, in Intent) error
 	Intent(account common.Address, id ID) (Intent, bool, error)
 	// IntentByNonce finds the intent that owns a nonce, which is how a
-	// finalized nonce is matched back to a decision.
+	// settled nonce is matched back to a decision.
 	IntentByNonce(account common.Address, nonce uint64) (Intent, bool, error)
-	// Pending lists intents with no finalized fact, oldest first.
+	// Pending lists intents with no settled fact, oldest first.
 	Pending(account common.Address) ([]Intent, error)
 
 	// AppendSubmission records a signed attempt before it is broadcast, so no
@@ -31,11 +31,11 @@ type Store interface {
 	AppendSubmission(account common.Address, id ID, s Submission) error
 	Submissions(account common.Address, id ID) ([]Submission, error)
 
-	// PutFact caches a finalized outcome. Idempotent: facts cannot change.
+	// PutFact caches a settled outcome. Idempotent: facts cannot change.
 	PutFact(account common.Address, id ID, f Fact) error
 	Fact(account common.Address, id ID) (Fact, bool, error)
 
-	// PutDeposit records one finalized incoming transfer, identified by the log
+	// PutDeposit records one settled incoming transfer, identified by the log
 	// that carried it. Idempotent.
 	PutDeposit(account common.Address, d Deposit) error
 	Deposits(account common.Address) ([]Deposit, error)

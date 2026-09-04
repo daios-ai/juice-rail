@@ -12,8 +12,11 @@ serve another.
 Fill in `rpc` before use; it is the one field that is yours rather than the
 chain's. Everything else is fixed by the deployment.
 
-`finalized` is the only supported finality. Confirmation counting is not
-supported: something reported as confirmed must never come undone.
+`finality` is the block tag the rail treats as settled: `latest`, `safe` or
+`finalized`. Both Arbitrum files say `latest`: the sequencer's confirmation is
+trusted, which is what choosing Arbitrum means. A domain that wants Ethereum
+finality says `finalized` and waits for it. Confirmation counting is not
+supported.
 
 `fromBlock` is where the search for money coming in starts. Set it to the
 block your account was created in: there is nothing before that to find, and
