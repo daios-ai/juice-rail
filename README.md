@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/juice-logo.svg" alt="Juice logo" width="110" />
+</p>
+
 # juice-rail
 
 A small money rail. Each participant has one ordinary blockchain account that
