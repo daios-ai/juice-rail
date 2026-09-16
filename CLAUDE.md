@@ -7,6 +7,7 @@ This is the money rail repo for juice.
 - Never commit before passing ALL unit tests and user flows!
 - Never split work into phases, stages, or separate commits; deliver the full scope in one pass.
 - Native actions should be encapsulated, never hardwired into the kernel.
+- Never add a Claude-Session trailer or any session identifier to commit messages.
 
 Answering questions
 ===================
