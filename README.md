@@ -452,3 +452,38 @@ deployments/      one file per domain
 integration-tests/ the seven stories
 requirements.md   what this is meant to be, and why
 ```
+
+---
+
+## 11. Licence, and use at your own risk
+
+Apache License 2.0. The full text is in `LICENSE`. Copyright 2026
+Pedro A. Ortega.
+
+**Use at your own risk.** This software moves money. It has not been
+audited. It is provided as is, without warranty of any kind, and neither the
+author nor any contributor is liable for any loss arising from its use,
+including loss of funds. Sections 7 and 8 of the licence say this in the
+words that bind; it is repeated here so that nobody has to reach section 7
+to find it out. If you run this, the keys, the configuration and the money
+are yours to look after.
+
+Section 9 lists what is checked and what is assumed. Read it before trusting
+this with anything you mind losing.
+
+### Third-party code
+
+The Go module links `github.com/ethereum/go-ethereum`, whose library
+packages are LGPL-3.0-or-later. Everything else that compiles in is
+permissive: MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0, and one package in
+the public domain. Distributing source carries no LGPL obligation;
+distributing a compiled binary carries those in LGPL-3.0 section 4, which
+shipping the source satisfies.
+
+`contracts/` builds against OpenZeppelin (MIT) and forge-std (MIT or
+Apache-2.0), both git submodules, both used only for tests and the staging
+bootstrap. Neither is part of the Go module and neither is on any production
+path.
+
+Apache-2.0 flows one way into GPL-3.0 and AGPL-3.0, so a copyleft host may
+embed this library. It is not compatible with GPL-2.0-only.
