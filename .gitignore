@@ -7,3 +7,8 @@ contracts/broadcast/
 *.db
 *.db-wal
 *.db-shm
+
+# Design scratch and kernel docs copied from ../juice: not ours to publish
+idea.md
+new-idea.md
+juicedocs/
